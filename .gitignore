@@ -1,6 +1,10 @@
 # build output
 build/
 bin/
+build-mpi/
+bin-mpi/
+build-*clang/
+bin-*clang/
 *.o
 *.a
 *.so

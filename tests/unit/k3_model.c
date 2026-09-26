@@ -29,6 +29,7 @@
 #include "json.h"
 #include "k3.h"
 #include "k3_cfg.h"   /* one config reader for both shapes; never defaults a field */
+#include "k3_mpi.h"   /* no-ops unless built with MPI=1 */
 
 /* ------------------------------------------------------------ weight store ---- */
 typedef struct {
@@ -224,7 +225,8 @@ static void forward(Model *m, const K3Cfg *c, const int *ids, int T, float *logi
     float *nrm = scratch;
     for (int t = 0; t < T; t++) {
         k3_rmsnorm(nrm, h + (size_t)t * E, m->final_norm, E, c->rms_eps);
-        k3_matmul(logits + (size_t)t * (size_t)c->vocab, nrm, m->lm_head, E, c->vocab);
+        k3_mmw_tp(logits + (size_t)t * (size_t)c->vocab, nrm, m->lm_head, K3_WF32,
+                  E, c->vocab);
     }
 }
 
@@ -240,6 +242,9 @@ static int argmax_(const float *v, int n)
 
 int main(int argc, char **argv)
 {
+    if (k3_mpi_init(&argc, &argv) != 0) return 2;
+    /* Every rank runs the gates; only rank 0 speaks. */
+    if (k3_tp.rank != 0 && !freopen("/dev/null", "w", stdout)) return 2;
     const char *dir = (argc > 1) ? argv[1] : "../fixtures";
 
     /* Open BEFORE printing the banner. Printing it first made a failed run look like a
@@ -419,7 +424,7 @@ int main(int argc, char **argv)
                 float *nrm = sc_i;
                 k3_rmsnorm(nrm, h_i + (size_t)lastt * c.hidden, m->final_norm,
                            c.hidden, c.rms_eps);
-                k3_matmul(lg_i, nrm, m->lm_head, c.hidden, c.vocab);
+                k3_mmw_tp(lg_i, nrm, m->lm_head, K3_WF32, c.hidden, c.vocab);
 
                 cached = base + nT;
                 if (cached >= T) break;
@@ -433,7 +438,8 @@ int main(int argc, char **argv)
         free(kvc); free(rpc); free(sc_i); free(h_i); free(br_i); free(ks_i); free(lg_i); free(gi);
     }
 
-    const int pass = (tf_gen_ok == tf_gen) && reuse_ok && (gok == T - np);
+    const int pass = !k3_mpi_max_int(!((tf_gen_ok == tf_gen) && reuse_ok && (gok == T - np)));
+    if (k3_tp.size > 1) printf("\ntensor parallel: %d ranks\n", k3_tp.size);
     printf("\nVERDICT: %s\n", pass ? "ENGINE MATCHES THE REFERENCE EXACTLY"
                                    : "MISMATCH, see the counts above");
     if (!pass) {
@@ -459,5 +465,6 @@ int main(int argc, char **argv)
      * `gok = (iok == T - np) ? gok : -1;`, existed only to poison a value that was then
      * discarded. Both sibling harnesses already propagated (test_ops.c and
      * scale_test.c); this one was left out. */
+    k3_mpi_finalize();
     return pass ? 0 : 1;
 }

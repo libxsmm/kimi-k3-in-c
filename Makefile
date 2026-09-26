@@ -22,6 +22,14 @@
 # -lpsapi (below) are load-bearing rather than stylistic on this platform.
 
 # ---------------------------------------------------------------------------- config --
+# MPI=1 builds the tensor-parallel engine with mpicc into its own build-mpi/ and bin-mpi/,
+# so the two builds never share objects. See src/par/k3_mpi.h.
+MPI      ?= 0
+ifeq ($(MPI),1)
+  CC     := mpicc
+  BUILD  ?= build-mpi
+  BIN    ?= bin-mpi
+endif
 CC       ?= cc
 PYTHON   ?= python3
 BUILD    ?= build
@@ -142,13 +150,18 @@ LDFLAGS  ?= -lm $(OMP_LDFLAGS) -pthread
 # Flat include search across the module dirs: sources use "k3.h", "k3_cache.h" etc
 # rather than path-qualified includes, which keeps them relocatable.
 INCLUDES := -Iinclude -Iinclude/k3 -Ithird_party \
-            -Isrc/core -Isrc/io -Isrc/cache -Isrc/model -Isrc/tokenizer -Isrc/chat
+            -Isrc/core -Isrc/io -Isrc/cache -Isrc/model -Isrc/tokenizer -Isrc/chat \
+            -Isrc/par
 
 # ----------------------------------------------------------------------------- files --
 ENGINE_SRC := src/core/k3_ops.c \
               src/io/k3_st.c src/io/k3_load.c src/io/k3_trunk.c \
-              src/cache/k3_cache.c \
+              src/cache/k3_cache.c src/cache/k3_resident.c \
               src/model/k3_bind.c
+ifeq ($(MPI),1)
+  ENGINE_SRC += src/par/k3_mpi.c
+  CFLAGS     += -DK3_MPI
+endif
 ENGINE_OBJ := $(patsubst %.c,$(BUILD)/%.o,$(ENGINE_SRC))
 
 CLI_SRC    := src/cli/k3_run.c
@@ -171,14 +184,18 @@ TOK_FILES  ?= $(HOME)/k3model
 # two concurrent `make test` runs cannot race on one filename and `make clean` removes it.
 
 # ---------------------------------------------------------------------------- targets --
-.PHONY: all test test-all bench portable debug asan ubsan format clean install help \
+.PHONY: all test test-all mpitest bench portable debug asan ubsan format clean install help \
         tok cfg ops cache st oracle weights-test
 
 all: $(CLI_BIN)
 
+# -MMD: an object depends on the headers it includes, so a changed struct in k3.h can
+# never leave a stale object linked against a new layout.
 $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+	$(CC) $(CFLAGS) -MMD -MP $(INCLUDES) -c $< -o $@
+
+-include $(ENGINE_OBJ:.o=.d)
 
 $(CLI_BIN): $(CLI_SRC) $(CHAT_SRC) $(ENGINE_OBJ) | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $(CLI_SRC) $(CHAT_SRC) $(ENGINE_OBJ) -o $@ $(LDFLAGS)
@@ -191,6 +208,7 @@ $(BIN)/test_ops: tests/unit/test_ops.c $(BUILD)/src/core/k3_ops.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 $(BIN)/test_cache: tests/unit/test_cache.c $(BUILD)/src/cache/k3_cache.o \
+                   $(BUILD)/src/cache/k3_resident.o \
                    $(BUILD)/src/io/k3_load.o $(BUILD)/src/io/k3_st.o \
                    $(BUILD)/src/core/k3_ops.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
@@ -221,7 +239,7 @@ $(BIN)/test_cfg: tests/unit/test_cfg.c src/core/k3_ops.c | $(BIN)
 $(BIN)/scale_test: tests/unit/scale_test.c $(BUILD)/src/core/k3_ops.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
-$(BIN)/k3_model: tests/unit/k3_model.c $(BUILD)/src/core/k3_ops.o | $(BIN)
+$(BIN)/k3_model: tests/unit/k3_model.c $(ENGINE_OBJ) | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 $(BIN)/test_trunk: tests/unit/test_trunk.c $(BUILD)/src/io/k3_trunk.o \
@@ -231,6 +249,11 @@ $(BIN)/test_trunk: tests/unit/test_trunk.c $(BUILD)/src/io/k3_trunk.o \
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 $(BIN)/bench_kernels: benchmarks/bench_kernels.c $(BUILD)/src/core/k3_ops.o | $(BIN)
+	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
+
+# MPI builds only: latency of the collective shapes tensor parallelism uses.
+$(BIN)/bench_allgather: benchmarks/bench_allgather.c $(BUILD)/src/par/k3_mpi.o \
+                        $(BUILD)/src/core/k3_ops.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 ## test: everything that needs no model weights
@@ -318,6 +341,17 @@ $(BIN)/test_expert: tests/unit/test_expert.c $(BUILD)/src/io/k3_load.o \
 
 $(BIN)/test_real_layer: tests/unit/test_real_layer.c $(ENGINE_OBJ) | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
+
+## mpitest: the full-model oracle under tensor parallelism at 1-4 ranks (needs MPI=1)
+MPIRUN   ?= mpirun
+MPIRUN_FLAGS ?= --map-by :OVERSUBSCRIBE --bind-to none
+mpitest: $(BIN)/k3_model
+	@test "$(MPI)" = 1 || { echo "mpitest needs MPI=1"; exit 1; }
+	@for n in 1 2 3 4; do \
+	    echo "== oracle at $$n rank(s)"; \
+	    OMP_NUM_THREADS=2 $(MPIRUN) -np $$n $(MPIRUN_FLAGS) ./$(BIN)/k3_model $(FIXTURES) \
+	        | grep -E "GATE|VERDICT" || exit 1; \
+	done
 
 ## tok: tokenizer parity against the reference implementation
 tok: $(BIN)/test_tok

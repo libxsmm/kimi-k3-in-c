@@ -10,8 +10,9 @@
  * of the same operation agree exactly:
  *
  *   - the scalar C99 path, which is the reference,
- *   - the OpenMP path (guarded by _OPENMP), which parallelises only over independent
- *     output rows, so it introduces no reduction and changes no arithmetic,
+ *   - the OpenMP path (guarded by _OPENMP), which splits independent output rows across
+ *     threads and forms every norm statistic in the fixed chunk order of the canonical
+ *     reductions below, so no result depends on the thread or rank count,
  *   - the AVX2 path (guarded by __AVX2__), which reproduces the scalar code's
  *     four-accumulator partition and reduction tree exactly rather than choosing a
  *     more natural one,
@@ -24,15 +25,350 @@
  * them to the obvious form and the paths diverge in the last bits, which shows up as
  * a fixture failure on one machine and a pass on another.
  *
- * Accumulators are double throughout. Hidden size is 7168 and expert rows are 2048
- * wide; a float32 accumulator loses precision the reference comparisons can see.
+ * Accumulators are double in the scalar, AVX2 and NEON paths. The AVX-512 GEMVs
+ * accumulate in fp32 instead (see K3_AVX512): they are bandwidth bound, and fp32 holds
+ * the model's precision with room to spare.
  */
+#define _POSIX_C_SOURCE 200809L   /* clock_gettime under -std=c99 */
+
 #include "k3.h"
 
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+#define K3_AVX512 1
+#include <immintrin.h>
+
+/* The fp32 GEMV row scheme shared by the fp32, bf16 and MXFP4 kernels: element i goes
+ * to lane i%16 of accumulator (i/16)%4, the tail is a masked chunk that leaves the
+ * other lanes alone, and a row reduces as (a0+a1)+(a2+a3) and then this fixed lane
+ * tree. So the same weight values give the same bits whatever their storage, which
+ * keeps bf16 == fp32 and fused MXFP4 == dequantise-then-matmul exact. */
+static inline float v512_sum(const __m512 a[4])
+{
+    const __m512 s = _mm512_add_ps(_mm512_add_ps(a[0], a[1]), _mm512_add_ps(a[2], a[3]));
+    const __m256 h = _mm256_add_ps(_mm512_castps512_ps256(s),
+        _mm256_castpd_ps(_mm512_extractf64x4_pd(_mm512_castps_pd(s), 1)));
+    __m128 q = _mm_add_ps(_mm256_castps256_ps128(h), _mm256_extractf128_ps(h, 1));
+    q = _mm_add_ps(q, _mm_movehl_ps(q, q));
+    q = _mm_add_ss(q, _mm_shuffle_ps(q, q, 1));
+    return _mm_cvtss_f32(q);
+}
+
+static inline __mmask16 v512_tail(int n) { return n >= 16 ? 0xFFFF : (__mmask16)((1u << n) - 1); }
+#endif
+
+int    k3_prof_on = 0;
+double k3_prof_s[K3P_N];
+const char *const k3_prof_name[K3P_N] = {
+    "embed", "kda proj", "kda core", "kda out",
+    "mla proj", "mla core", "mla out", "attnres+norms",
+    "router", "moe down", "experts", "moe up", "shared",
+    "dense mlp", "head", "tp comm", "tp wait"
+};
+
+double k3_prof_now(void)
+{
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec * 1e-9;
+}
+
+K3Tp k3_tp = { .rank = 0, .size = 1 };
+
+#if defined(K3_AVX512) && defined(__AVX512BF16__)
+#define K3_DPBF16 1
+#endif
+
+int k3_act_bf16 = 0;
+
+int k3_act_bf16_supported(void)
+{
+#if defined(K3_DPBF16)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+/* fp32 -> bf16, round to nearest even: the one rounding every bf16 path uses */
+static inline uint16_t k3_f2bf(float f)
+{
+    uint32_t u;
+    memcpy(&u, &f, 4);
+    return (uint16_t)((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
+}
+
+static inline int seg_lp(const K3Seg *s) { return (k3_act_bf16 & K3_BF16_TP) && !s->exact; }
+
+
+#ifdef _OPENMP
+/* Dissemination barrier: in round r thread i raises the flag of thread (i + 2^r) mod n
+ * and waits for its own, so log2(n) one-line handoffs replace a central counter.
+ * 0.9 us at 64 threads against 3.8 us for GOMP's barrier. Epochs only grow, so a flag
+ * left from an earlier barrier never releases a later one. That needs every full-size
+ * team to call it the same number of times per thread, which SPMD code does; a team of
+ * any other size uses the OpenMP barrier instead. */
+#define K3_BAR_MAXT   512
+#define K3_BAR_ROUNDS 9
+typedef struct { unsigned v; char pad[60]; } k3_bar_line;
+static k3_bar_line k3_bar_flag[K3_BAR_MAXT][K3_BAR_ROUNDS];
+static k3_bar_line k3_bar_epoch[K3_BAR_MAXT];
+
+void k3_team_barrier(void)
+{
+    const int n = omp_get_num_threads();
+    if (n <= 1) return;
+    if (n > K3_BAR_MAXT || n != omp_get_max_threads()) {
+#pragma omp barrier
+        return;
+    }
+    const int me = omp_get_thread_num();
+    const unsigned e = ++k3_bar_epoch[me].v;
+    for (int r = 0, d = 1; d < n; r++, d <<= 1) {
+        __atomic_store_n(&k3_bar_flag[(me + d) % n][r].v, e, __ATOMIC_RELEASE);
+        while ((int)(__atomic_load_n(&k3_bar_flag[me][r].v, __ATOMIC_ACQUIRE) - e) < 0) {
+#if defined(__x86_64__)
+            __builtin_ia32_pause();
+#endif
+        }
+    }
+}
+#endif
+
+static void k3_fatal_oom(const char *what, size_t bytes);
+
+/* Packed exchange layout, rank-major: rank r's parts of every segment, in segment order.
+ * The pack buffer, counts and send state belong to thread 0. */
+static float *tp_pack;
+static size_t tp_pack_cap;
+static int   *tp_cnt;
+#define TP_MAXSEG (K3_MAX_TOPK + 2)
+static int      tp_open;                   /* a gather is outstanding */
+static uint32_t tp_seq;                    /* one-sided sequence number, set before a barrier */
+static int      tp_slot;                   /* position in the one-sided send ring */
+
+static void tp_send(const K3Seg *seg, int nseg, int total, int ll);
+static void tp_recv(const K3Seg *seg, int nseg, int total, int ll);
+
+static int tp_total(const K3Seg *seg, int nseg)
+{
+    long n = 0;
+    for (int s = 0; s < nseg; s++) n += seg[s].n;
+    return (int)n;
+}
+
+/* Rank r's block of segment s in transport units: floats, or one-sided words holding a
+ * bf16 pair each. *nf gets its length in floats. */
+static inline int tp_blk(const K3Seg *s, int r, int ll, int *nf)
+{
+    const int nu = s->n / s->unit, P = k3_tp.size;
+    const int len = ((int)((long)nu * (r + 1) / P) - (int)((long)nu * r / P)) * s->unit;
+    if (nf) *nf = len;
+    return ll && seg_lp(s) ? (len + 1) >> 1 : len;
+}
+
+static int tp_is_ll(int total) { return k3_tp.ll_put && total <= k3_tp.ll_maxw; }
+
+/* Transport units of a gather, and whether it goes one-sided. */
+static int tp_units(const K3Seg *seg, int nseg, int *ll)
+{
+    long w = 0;
+    for (int r = 0; r < k3_tp.size; r++)
+        for (int s = 0; s < nseg; s++) w += tp_blk(&seg[s], r, 1, NULL);
+    *ll = tp_is_ll((int)w);
+    return *ll ? (int)w : tp_total(seg, nseg);
+}
+
+/* One rank: round this thread's share of every bf16 segment, as a gather would. */
+static void tp_round_local(const K3Seg *seg, int nseg)
+{
+    for (int s = 0; s < nseg; s++) {
+        if (!seg_lp(&seg[s])) continue;
+        int lo, hi;
+        k3_split(seg[s].n, &lo, &hi);
+        for (int i = lo; i < hi; i++) seg[s].p[i] = k3_bf16f(k3_f2bf(seg[s].p[i]));
+    }
+}
+
+/* Team collectives. begin: a barrier makes every thread's rows visible, then thread 0
+ * sends (MPI_THREAD_FUNNELED) while the others go on with independent work. end: every
+ * thread receives its share straight into the segments, then a barrier publishes them.
+ * One-sided words carry their own readiness, so receiving needs no barrier with thread 0;
+ * allgatherv has to wait for it to come back from MPI. With one rank a gather is still
+ * the team barrier callers rely on between producing and consuming a vector. */
+void k3_tp_gather_begin(const K3Seg *seg, int nseg)
+{
+    if (k3_tp.size <= 1) {
+        k3_sync();
+        if (k3_act_bf16 & K3_BF16_TP) tp_round_local(seg, nseg);
+        return;
+    }
+    int ll;
+    const int total = tp_units(seg, nseg, &ll);
+    if (ll && k3_tid() == 0 && ++tp_seq == 0) tp_seq = 1;   /* 0 is what a fresh window holds */
+    k3_sync();
+    if (k3_tid() == 0) tp_send(seg, nseg, total, ll);
+}
+
+void k3_tp_gather_end(const K3Seg *seg, int nseg)
+{
+    if (k3_tp.size <= 1) { if (k3_act_bf16 & K3_BF16_TP) k3_sync(); return; }
+    int ll;
+    const int total = tp_units(seg, nseg, &ll);
+    if (!ll) k3_sync();
+    const double t0 = k3_prof_on && k3_tid() == 0 ? k3_prof_now() : 0.0;
+    tp_recv(seg, nseg, total, ll);
+    if (k3_prof_on && k3_tid() == 0) k3_prof_s[K3P_COMM] += k3_prof_now() - t0;
+    k3_sync();
+    if (k3_tid() == 0) tp_open = 0;
+}
+
+void k3_tp_gather(const K3Seg *seg, int nseg)
+{
+    k3_tp_gather_begin(seg, nseg);
+    k3_tp_gather_end(seg, nseg);
+}
+
+/* Spin until each of n one-sided words carries this call's sequence number; store the
+ * payloads to d unless d is NULL (a flag word). lp: each word is a bf16 pair, stored as
+ * two floats, of which nf are wanted. */
+static void ll_wait(float *d, const volatile uint64_t *w, int n, uint32_t seq, int lp, int nf)
+{
+    for (int i = 0; i < n; i++) {
+        uint64_t v;
+        long spins = 0;
+        while (((v = w[i]) >> 32) != seq) {
+#if defined(__x86_64__)
+            __builtin_ia32_pause();
+#endif
+            /* only thread 0 may call MPI; a flush costs a round trip, so rarely */
+            if (++spins % (1L << 20) == 0 && k3_tid() == 0) k3_tp.ll_flush();
+        }
+        if (!d) continue;
+        const uint32_t u = (uint32_t)v;
+        if (lp) {
+            d[2 * i] = k3_bf16f((uint16_t)u);
+            if (2 * i + 1 < nf) d[2 * i + 1] = k3_bf16f((uint16_t)(u >> 16));
+        } else {
+            memcpy(d + i, &u, 4);
+        }
+    }
+}
+
+static void tp_send(const K3Seg *seg, int nseg, int total, int ll)
+{
+    if (tp_open || nseg > TP_MAXSEG) {
+        fprintf(stderr, "k3_tp_gather_begin: %s\n",
+                tp_open ? "a gather is already outstanding" : "too many segments");
+        abort();
+    }
+    tp_open = 1;
+    if (k3_tp.skew && k3_tp.barrier) {
+        const double tw = k3_prof_on ? k3_prof_now() : 0.0;
+        k3_tp.barrier(k3_tp.ctx);
+        if (k3_prof_on) k3_prof_s[K3P_WAIT] += k3_prof_now() - tw;
+    }
+    const double t0 = k3_prof_on ? k3_prof_now() : 0.0;
+    const int P = k3_tp.size, me = k3_tp.rank;
+    if (!tp_cnt) {
+        tp_cnt = (int *)malloc((size_t)2 * P * sizeof(int));
+        if (!tp_cnt) k3_fatal_oom("TP gather counts", (size_t)2 * P * sizeof(int));
+    }
+    int *cnt = tp_cnt, *dsp = tp_cnt + P;
+    int off = 0;
+    for (int r = 0; r < P; r++) {
+        dsp[r] = off;
+        for (int s = 0; s < nseg; s++) off += tp_blk(&seg[s], r, ll, NULL);
+        cnt[r] = off - dsp[r];
+    }
+    if (ll) {
+        /* see k3_mpi.c: the ring lets one flush per lap cover every buffer's puts */
+        if (++tp_slot == k3_tp.ll_nsend) { tp_slot = 0; k3_tp.ll_flush(); }
+        uint64_t *snd = k3_tp.ll_send + (size_t)tp_slot * k3_tp.ll_hw, *o = snd;
+        const uint64_t tag = (uint64_t)tp_seq << 32;
+        for (int s = 0; s < nseg; s++) {
+            int lo, hi; k3_tp_part(seg[s].n / seg[s].unit, &lo, &hi);
+            float *p = seg[s].p + (size_t)lo * seg[s].unit;
+            const int n = (hi - lo) * seg[s].unit;
+            if (seg_lp(&seg[s])) {
+                /* the owner keeps exactly what its peers receive */
+                for (int i = 0; i < n; i += 2) {
+                    const uint16_t b0 = k3_f2bf(p[i]), b1 = i + 1 < n ? k3_f2bf(p[i + 1]) : 0;
+                    p[i] = k3_bf16f(b0);
+                    if (i + 1 < n) p[i + 1] = k3_bf16f(b1);
+                    *o++ = tag | (uint32_t)b1 << 16 | b0;
+                }
+            } else {
+                for (int i = 0; i < n; i++) {
+                    uint32_t u;
+                    memcpy(&u, p + i, 4);
+                    *o++ = tag | u;
+                }
+            }
+        }
+        const long half = (long)(tp_seq & 1) * k3_tp.ll_hw;
+        /* an empty block sends its flag word, so every call orders every pair of ranks */
+        if (cnt[me] > 0) k3_tp.ll_put(snd, cnt[me], half + dsp[me]);
+        else { snd[0] = tag; k3_tp.ll_put(snd, 1, half + k3_tp.ll_maxw + me); }
+    } else {
+        if ((size_t)total > tp_pack_cap) {
+            free(tp_pack);
+            tp_pack = (float *)malloc((size_t)total * sizeof(float));
+            if (!tp_pack) k3_fatal_oom("TP gather buffer", (size_t)total * sizeof(float));
+            tp_pack_cap = (size_t)total;
+        }
+        float *mine = tp_pack + dsp[me];
+        for (int s = 0; s < nseg; s++) {
+            int lo, hi; k3_tp_part(seg[s].n / seg[s].unit, &lo, &hi);
+            const int n = (hi - lo) * seg[s].unit;
+            float *p = seg[s].p + (size_t)lo * seg[s].unit;
+            if (seg_lp(&seg[s]))
+                for (int i = 0; i < n; i++) p[i] = k3_bf16f(k3_f2bf(p[i]));
+            memcpy(mine, p, (size_t)n * sizeof(float));
+            mine += n;
+        }
+        k3_tp.allgatherv(tp_pack, cnt, dsp, k3_tp.ctx);
+    }
+    k3_tp.calls++;
+    k3_tp.floats += (double)tp_total(seg, nseg);
+    if (k3_prof_on) k3_prof_s[K3P_COMM] += k3_prof_now() - t0;
+}
+
+/* This thread's share of the packed words, other ranks' blocks only, into the segments. */
+static void tp_recv(const K3Seg *seg, int nseg, int total, int ll)
+{
+    const int P = k3_tp.size, me = k3_tp.rank;
+    const uint32_t seq = tp_seq;
+    const volatile uint64_t *rcv =
+        ll ? k3_tp.ll_recv + (size_t)(seq & 1) * k3_tp.ll_hw : NULL;
+    int a, b;
+    k3_split(total, &a, &b);
+    int off = 0;
+    for (int r = 0; r < P && off < b; r++)
+        for (int s = 0; s < nseg; s++) {
+            int nf;
+            const int len = tp_blk(&seg[s], r, ll, &nf), lp = ll && seg_lp(&seg[s]);
+            const int nu = seg[s].n / seg[s].unit;
+            const int lo = (int)((long)nu * r / P);
+            const int x0 = off > a ? off : a, x1 = off + len < b ? off + len : b;
+            if (r != me && x1 > x0) {
+                float *d = seg[s].p + (size_t)lo * seg[s].unit + (size_t)(x0 - off) * (lp ? 2 : 1);
+                if (ll) ll_wait(d, rcv + x0, x1 - x0, seq, lp, nf - 2 * (x0 - off));
+                else    memcpy(d, tp_pack + x0, (size_t)(x1 - x0) * sizeof(float));
+            }
+            off += len;
+        }
+    if (ll && k3_tid() == 0)
+        for (int r = 0; r < P; r++) {
+            int len = 0;
+            for (int s = 0; s < nseg; s++) len += tp_blk(&seg[s], r, 1, NULL);
+            if (r != me && len == 0) ll_wait(NULL, rcv + k3_tp.ll_maxw + r, 1, seq, 0, 0);
+        }
+}
 
 /* --------------------------------------------------------- fatal errors ---- */
 /* Several kernels here need a small temporary that cannot be hoisted into caller-owned
@@ -77,6 +413,104 @@ static void k3_fatal_bound(const char *what, long value, long limit)
     abort();
 }
 
+/* -------------------------------------------------------- thread scratch ---- */
+/* Persistent per-thread temporaries, so the forward pass does not allocate once the
+ * buffers have grown to their working size. Slot s of team thread t grows (doubling,
+ * 64-byte aligned) and is never freed. The main thread is tid 0 both inside and outside
+ * a team, so a slot must not be live across a call that uses the same slot. */
+enum { K3S_MLA_SC, K3S_MOE_AN, K3S_ROUTER_CHOICE, K3S_ROUTER_SCORE, K3S_MOE_SCORE,
+       K3S_MXFP4_XD, K3S_PREFILL, K3S_SEGS, K3S_KDA_STATE, K3S_XBF, K3S_QKV, K3S_N };
+#define K3S_MAXT 1024
+static void  *k3s_buf[K3S_MAXT][K3S_N];
+static size_t k3s_cap[K3S_MAXT][K3S_N];
+
+static void *k3_scratch(int slot, size_t bytes, const char *what)
+{
+    const int t = k3_tid();
+    if (t >= K3S_MAXT) k3_fatal_bound("threads per team", t + 1, K3S_MAXT);
+    if (bytes > k3s_cap[t][slot]) {
+        size_t cap = k3s_cap[t][slot] * 2;
+        if (cap < bytes) cap = bytes;
+        cap = (cap + 63) & ~(size_t)63;
+        free(k3s_buf[t][slot]);
+        void *p = NULL;
+        if (posix_memalign(&p, 64, cap) != 0) k3_fatal_oom(what, cap);
+        k3s_buf[t][slot] = p;
+        k3s_cap[t][slot] = cap;
+    }
+    return k3s_buf[t][slot];
+}
+
+/* --------------------------------------------------- canonical reductions ---- */
+/* Every sum of squares and every AttnRes dot product is formed over fixed K3_RC-element
+ * chunks, sequentially in double within a chunk, and the chunk sums are then added in
+ * chunk order. The order depends on n alone, never on the thread or rank count, so the
+ * results are bit-identical at any team or TP size while the chunks run in parallel or
+ * come out of the epilogue of the op writing the vector. Norms are split in three: chunk
+ * sums (parallel, or fused into the producer), statistics (combined by every thread,
+ * which needs no broadcast), and the scale (fused into writing the consumer's input). */
+#define K3_RC 128
+#define K3_RC_MAXPART 32768
+static inline int rc_n(int n) { return (n + K3_RC - 1) / K3_RC; }
+
+static double rc_sq(const float *x, int c, int n)       /* chunk c: sum of x^2 */
+{
+    const int i0 = c * K3_RC, i1 = i0 + K3_RC < n ? i0 + K3_RC : n;
+    double s = 0.0;
+    for (int i = i0; i < i1; i++) s += (double)x[i] * (double)x[i];
+    return s;
+}
+
+static double rc_total(const double *part, int nc)
+{
+    double s = 0.0;
+    for (int c = 0; c < nc; c++) s += part[c];
+    return s;
+}
+
+static double rc_sumsq(const float *x, int n)            /* one thread, same order */
+{
+    double s = 0.0;
+    for (int c = 0; c < rc_n(n); c++) s += rc_sq(x, c, n);
+    return s;
+}
+
+/* Team-shared chunk sums for one reduction: written, barrier, read. A ring of four with
+ * every thread on the same turn, so a buffer is rewritten only after two later barriers.
+ * A one-thread team has its own ring, which keeps the team threads' turns in step. */
+static double   rc_ring[4][K3_RC_MAXPART];
+static double   rc_solo[4][K3_RC_MAXPART];
+static struct { unsigned v; char pad[60]; } rc_turn[K3S_MAXT];
+static unsigned rc_solo_turn;
+
+static double *rc_parts(int need)
+{
+    if (need > K3_RC_MAXPART) k3_fatal_bound("reduction chunks", need, K3_RC_MAXPART);
+    if (k3_nth() == 1) return rc_solo[rc_solo_turn++ & 3];
+    return rc_ring[rc_turn[k3_tid()].v++ & 3];
+}
+
+/* this thread's chunks of the sum of squares of x */
+static void rc_sq_team(double *part, const float *x, int n)
+{
+    int lo, hi;
+    k3_split(rc_n(n), &lo, &hi);
+    for (int c = lo; c < hi; c++) part[c] = rc_sq(x, c, n);
+}
+
+static float rms_inv(const double *part, int n, float eps)
+{
+    return (float)(1.0 / sqrt(rc_total(part, rc_n(n)) / (double)n + (double)eps));
+}
+
+/* this thread's slice of y = w * x * inv */
+static void rms_scale(float *y, const float *x, const float *w, int n, float inv)
+{
+    int lo, hi;
+    k3_split(n, &lo, &hi);
+    for (int i = lo; i < hi; i++) y[i] = w[i] * x[i] * inv;
+}
+
 /* ------------------------------------------------------------- layer map ---- */
 /* The released config lists full_attn_layers ONE-BASED, and
  * configuration_kimi_k3.py:152-156 tests (layer_idx + 1) in kda_layers. Getting this
@@ -91,26 +525,116 @@ int k3_is_kda(const K3Cfg *c, int layer)   { return !k3_is_mla(c, layer); }
 int k3_is_dense(const K3Cfg *c, int layer) { return layer < c->first_dense; }
 
 /* --------------------------------------------------------------- rmsnorm ---- */
-void k3_rmsnorm(float *y, const float *x, const float *w, int n, float eps)
+static void rmsnorm_serial(float *y, const float *x, const float *w, int n, float eps)
 {
     /* double accumulator: 7168 squared terms in float32 loses real precision, and
      * every downstream comparison against the reference depends on this. */
-    double ss = 0.0;
-    for (int i = 0; i < n; i++) ss += (double)x[i] * (double)x[i];
-    const float inv = (float)(1.0 / sqrt(ss / (double)n + (double)eps));
+    const float inv = (float)(1.0 / sqrt(rc_sumsq(x, n) / (double)n + (double)eps));
     for (int i = 0; i < n; i++) y[i] = w[i] * x[i] * inv;
+}
+
+/* Team form, in the three parts: chunk sums split over the team, one barrier, then every
+ * thread forms the statistic itself and scales its own slice. In place is safe because
+ * every read of x for the sums precedes the barrier. */
+void k3_rmsnorm(float *y, const float *x, const float *w, int n, float eps)
+{
+    double *part = rc_parts(rc_n(n));
+    rc_sq_team(part, x, n);
+    k3_sync();
+    rms_scale(y, x, w, n, rms_inv(part, n, eps));
 }
 
 /* -------------------------------------------------------------- SiTU-GLU ---- */
 static inline float sigmoidf_(float x) { return 1.0f / (1.0f + expf(-x)); }
 
+static void situ_range(float *y, const float *gate, const float *up, int n,
+                       float b1, float b2);
+static void mxfp4_check(int in, int group);
+static void mxfp4_rows(float *y, const float *x, const double *xd,
+                       const unsigned char *packed, const unsigned char *scales,
+                       int in, int r0, int r1, int rbase, int group, int ilv);
+static void matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
+                         const unsigned char *scales, int in, int rows, int group, int ilv);
+
 /* See k3.h. Incremented whenever a streamed expert cannot be fetched. */
 long k3_expert_drops = 0;
 
+/* Rows [r0, r1) of y = W x. W holds every row, or under k3_tp.local only this rank's
+ * rows, in which case r0 is by construction where the slice starts. Per row this IS
+ * k3_mmw. */
+static inline void mmw_rows(float *y, const float *x, const void *W, int wdt, int in,
+                            int r0, int r1)
+{
+    if (r1 > r0)
+        k3_mmw(y + r0, x, (const unsigned char *)W
+                              + (k3_tp.local ? 0 : (size_t)r0 * k3_row_bytes(wdt, in)),
+               wdt, in, r1 - r0);
+}
+
+static void matmul_f32_rows(float *y, const float *x, const float *W, int in, int o0, int o1);
+static void matmul_bf16_rows(float *y, const float *x, const uint16_t *W, int in,
+                             int o0, int o1);
+static void matmul_q8_rows(float *y, const float *x, const void *W, int in, int o0, int o1);
+
+/* Rows [r0, r1) of y = W x by the CALLING thread alone, no team split; `base` is where
+ * this rank's slice starts when W holds only that slice (k3_tp.local). Lets a thread
+ * produce and then consume its own rows with no barrier in between. */
+static void mmw_part(float *y, const float *x, const void *W, int wdt, int in,
+                     int base, int r0, int r1)
+{
+    if (r1 <= r0) return;
+    const unsigned char *Wr = (const unsigned char *)W
+        + (size_t)(k3_tp.local ? r0 - base : r0) * k3_row_bytes(wdt, in);
+    if (wdt == K3_WBF16)    matmul_bf16_rows(y + r0, x, (const uint16_t *)Wr, in, 0, r1 - r0);
+    else if (wdt == K3_WI8) matmul_q8_rows(y + r0, x, Wr, in, 0, r1 - r0);
+    else                    matmul_f32_rows(y + r0, x, (const float *)Wr, in, 0, r1 - r0);
+}
+
+/* This thread's k3_split share of rows [r0, r1) of q, k and v, the split mmw_rows uses,
+ * read from the row-interleaved bf16 qkv matrix as one contiguous run. */
+static void qkv_rows(float *q, float *k, float *v, const float *x, const void *W, int in,
+                     int r0, int r1)
+{
+    int lo, hi;
+    k3_split(r1 - r0, &lo, &hi);
+    if (hi <= lo) return;
+    const int n = 3 * (hi - lo);
+    float *y = (float *)k3_scratch(K3S_QKV, (size_t)n * sizeof(float), "qkv rows");
+    const size_t row0 = (size_t)3 * (k3_tp.local ? lo : r0 + lo);
+    matmul_bf16_rows(y, x, (const uint16_t *)W + row0 * in, in, 0, n);
+    for (int i = 0; i < hi - lo; i++) {
+        q[r0 + lo + i] = y[3 * i]; k[r0 + lo + i] = y[3 * i + 1]; v[r0 + lo + i] = y[3 * i + 2];
+    }
+}
+
+void k3_mmw_tp(float *y, const float *x, const void *W, int wdt, int in, int out)
+{
+    int r0, r1;
+    k3_tp_part(out, &r0, &r1);
+    mmw_rows(y, x, W, wdt, in, r0, r1);
+    const K3Seg s = { y, out, 1, 0 };
+    k3_tp_gather(&s, 1);
+}
+
+/* Gather `rows` consecutive vectors of n floats, each partitioned in blocks of unit. */
+static void tp_gather_rows(float *p, int rows, int n, int unit)
+{
+    if ((k3_tp.size <= 1 && !(k3_act_bf16 & K3_BF16_TP)) || rows <= 0) { k3_sync(); return; }
+    K3Seg *s = (K3Seg *)k3_scratch(K3S_SEGS, (size_t)rows * sizeof(K3Seg), "TP gather segments");
+    for (int r = 0; r < rows; r++) {
+        s[r].p = p + (size_t)r * n; s[r].n = n; s[r].unit = unit; s[r].exact = 0;
+    }
+    k3_tp_gather(s, rows);
+}
+
 void k3_situ_glu(float *y, const float *x, int n, float b1, float b2)
 {
-    const float *gate = x;
-    const float *up   = x + n;
+    situ_range(y, x, x + n, n, b1, b2);
+}
+
+static void situ_range(float *y, const float *gate, const float *up, int n,
+                       float b1, float b2)
+{
     for (int i = 0; i < n; i++) {
         const float g = gate[i];
         /* The sigmoid takes the UNCAPPED gate. Feeding it the capped value instead
@@ -122,104 +646,117 @@ void k3_situ_glu(float *y, const float *x, int n, float b1, float b2)
     }
 }
 
-/* Automatic-storage bound for the k3_kda_step temporary. K3 uses kda_head_dim 128; the
- * heap fallback keeps a larger configuration slower, never wrong. */
+/* Widest column block k3_kda_step works on at once; wider heads are walked in blocks. */
 #define K3_KDA_STEP_DV 256
+#define K3_CONV_HIST_MAX 16
 
 /* ------------------------------------------------------------- ShortConv ---- */
 /* Causal depthwise conv, SiLU fused, exactly as ShortConvolution(activation='silu').
  * state[c*(k-1) + j] holds the previous inputs for channel c, oldest first.
- * Updated in place so a decode loop can carry it forward. */
+ * Updated in place so a decode loop can carry it forward. Channels are independent, so
+ * they are split across threads with no change to any channel's arithmetic.
+ * Channels [c0, c1) only; x and y advance by `stride` floats per time step. */
+static void shortconv_part(float *y, const float *x, const float *w, float *state,
+                           int c0, int c1, int stride, int k, int T)
+{
+    const int hist = k - 1;
+    {
+        /* hist can be 0 when k == 1; every use of buf below is guarded on hist. */
+        float lbuf[K3_CONV_HIST_MAX];
+        float *buf = lbuf;
+        if (hist > K3_CONV_HIST_MAX) {
+            buf = (float *)malloc((size_t)hist * sizeof(float));
+            if (!buf) k3_fatal_oom("ShortConv history", (size_t)hist * sizeof(float));
+        }
+        int lo, hi;
+        k3_split(c1 - c0, &lo, &hi);
+        for (int c = c0 + lo; c < c0 + hi; c++) {
+            if (hist) {   /* memcpy/memset with a NULL pointer is UB even at length 0 */
+                if (state) memcpy(buf, state + (size_t)c * hist, (size_t)hist * sizeof(float));
+                else       memset(buf, 0, (size_t)hist * sizeof(float));
+            }
+
+            for (int t = 0; t < T; t++) {
+                const float cur = x[(size_t)t * stride + c];
+                /* taps are ordered oldest..newest, matching conv1d over a left-padded
+                 * sequence: w[k-1] multiplies the CURRENT input. */
+                float acc = w[(size_t)c * k + hist] * cur;
+                for (int j = 0; j < hist; j++)
+                    acc += w[(size_t)c * k + j] * buf[j];
+
+                for (int j = 0; j + 1 < hist; j++) buf[j] = buf[j + 1];
+                if (hist > 0) buf[hist - 1] = cur;
+
+                y[(size_t)t * stride + c] = acc * sigmoidf_(acc);     /* SiLU, fused */
+            }
+            if (state && hist) memcpy(state + (size_t)c * hist, buf, (size_t)hist * sizeof(float));
+        }
+        if (buf != lbuf) free(buf);
+    }
+}
+
+/* Channels [c0, c1); in a team, this thread's share of them, with no barrier. */
+static void shortconv_range(float *y, const float *x, const float *w, float *state,
+                            int c0, int c1, int stride, int k, int T)
+{
+    K3_TEAM_IF((long)(c1 - c0) * T > 4096,
+               shortconv_part(y, x, w, state, c0, c1, stride, k, T));
+}
+
 void k3_shortconv(float *y, const float *x, const float *w, float *state,
                   int channels, int k, int T)
 {
-    const int hist = k - 1;
-    /* hist can be 0 when k == 1, and malloc(0) is permitted to return NULL. Guard on
-     * hist rather than on buf, or a legitimate k == 1 configuration silently skips the
-     * whole convolution and leaves y untouched. */
-    float *buf = hist ? (float *)malloc((size_t)hist * sizeof(float)) : NULL;
-    if (hist && !buf) k3_fatal_oom("ShortConv history", (size_t)hist * sizeof(float));
-
-    for (int c = 0; c < channels; c++) {
-        if (hist) {   /* memcpy/memset with a NULL pointer is UB even at length 0 */
-            if (state) memcpy(buf, state + (size_t)c * hist, (size_t)hist * sizeof(float));
-            else       memset(buf, 0, (size_t)hist * sizeof(float));
-        }
-
-        for (int t = 0; t < T; t++) {
-            const float cur = x[(size_t)t * channels + c];
-            /* taps are ordered oldest..newest, matching conv1d over a left-padded
-             * sequence: w[k-1] multiplies the CURRENT input. */
-            float acc = w[(size_t)c * k + hist] * cur;
-            for (int j = 0; j < hist; j++)
-                acc += w[(size_t)c * k + j] * buf[j];
-
-            for (int j = 0; j + 1 < hist; j++) buf[j] = buf[j + 1];
-            if (hist > 0) buf[hist - 1] = cur;
-
-            y[(size_t)t * channels + c] = acc * sigmoidf_(acc);   /* SiLU, fused */
-        }
-        if (state && hist) memcpy(state + (size_t)c * hist, buf, (size_t)hist * sizeof(float));
-    }
-    free(buf);
+    shortconv_range(y, x, w, state, 0, channels, channels, k, T);
 }
 
 /* ------------------------------------------------------------ KDA decay ----- */
-void k3_kda_decay(float *g, float *alpha, const float *z, const float *A_log,
-                  const float *dt_bias, int H, int D, float lb)
+static void kda_decay_part(float *g, float *alpha, const float *z, const float *A_log,
+                           const float *dt_bias, int H, int D, float lb)
 {
-    for (int h = 0; h < H; h++) {
+    int lo, hi;
+    k3_split(H * D, &lo, &hi);
+    for (int i = lo; i < hi; i++) {
         /* PER HEAD. The checkpoint stores head_dim floats but only the first H are
          * nonzero. Indexing this per channel is a silent, fatal error. */
-        const float a = expf(A_log[h]);
-        for (int d = 0; d < D; d++) {
-            const int i = h * D + d;
-            const float u  = a * (z[i] + dt_bias[i]);
-            const float gi = lb * sigmoidf_(u);   /* in (lb, 0] */
-            g[i] = gi;
-            alpha[i] = expf(gi);                  /* in (e^lb, 1] */
-        }
+        const float a = expf(A_log[i / D]);
+        const float u  = a * (z[i] + dt_bias[i]);
+        const float gi = lb * sigmoidf_(u);   /* in (lb, 0] */
+        g[i] = gi;
+        alpha[i] = expf(gi);                  /* in (e^lb, 1] */
     }
 }
 
+void k3_kda_decay(float *g, float *alpha, const float *z, const float *A_log,
+                  const float *dt_bias, int H, int D, float lb)
+{
+    K3_TEAM_IF((long)H * D > 4096, kda_decay_part(g, alpha, z, A_log, dt_bias, H, D, lb));
+}
+
 /* -------------------------------------------------------- KDA recurrence ---- */
-void k3_kda_step(float *S, float *o, const float *q, const float *k,
-                 const float *v, const float *alpha, float beta, int dk, int dv)
+/* Columns [j0, j1) of one step; j1 - j0 <= K3_KDA_STEP_DV. Every step below touches
+ * column j only through S[.][j], u[j], v[j] and o[j], so column blocks are independent
+ * and a caller may run them on different threads with bit-identical results. */
+static void kda_step_cols(float *S, float *o, const float *q, const float *k,
+                          const float *v, const float *alpha, float beta,
+                          int dk, int dv, int j0, int j1)
 {
     /* 1. channel-wise decay: scale ROW i of S by alpha[i]. The gate is per key
      *    channel, not a scalar, which is what "channel-wise forget gate" means. */
     for (int i = 0; i < dk; i++) {
         float *row = S + (size_t)i * dv;
         const float a = alpha[i];
-        for (int j = 0; j < dv; j++) row[j] *= a;
+        for (int j = j0; j < j1; j++) row[j] *= a;
     }
 
-    /* 2. read the state along k:  u = S^T k */
-    /* Allocated AFTER the decay above has already modified S. Returning early here
-     * would leave the recurrent state permanently scaled but never updated -- silent,
-     * unrecoverable corruption of every subsequent token.
-     *
-     * AUTOMATIC STORAGE at the sizes that occur. This is the innermost call in the
-     * engine: once per head per token per KDA layer, which at K3 scale is 96 x 69 =
-     * 6,624 calls per token, and k3_kda_layer runs them from an OpenMP loop, so a heap
-     * temporary here is 6,624 malloc/free pairs per token with sixteen threads
-     * contending for the allocator. dv is 128 for K3, so the array below covers it and
-     * the heap path is dead code in practice. */
-    float  ubuf[K3_KDA_STEP_DV];
-    float *uheap = NULL;
-    float *u = ubuf;
-    if (dv > K3_KDA_STEP_DV) {
-        uheap = (float *)calloc((size_t)dv, sizeof(float));
-        if (!uheap) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * sizeof(float));
-        u = uheap;
-    } else {
-        for (int j = 0; j < dv; j++) u[j] = 0.0f;   /* calloc's zeroing, explicitly */
-    }
+    /* 2. read the state along k:  u = S^T k. Automatic storage: this runs once per head
+     *    per token per KDA layer from inside an OpenMP loop. */
+    float u[K3_KDA_STEP_DV];
+    for (int j = j0; j < j1; j++) u[j - j0] = 0.0f;
     for (int i = 0; i < dk; i++) {
         const float ki = k[i];
         if (ki == 0.0f) continue;
         const float *row = S + (size_t)i * dv;
-        for (int j = 0; j < dv; j++) u[j] += ki * row[j];
+        for (int j = j0; j < j1; j++) u[j - j0] += ki * row[j];
     }
 
     /* 3. rank-one delta write. (v - u) is the prediction error: this is what makes
@@ -228,18 +765,26 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
         const float ki = k[i];
         if (ki == 0.0f) continue;
         float *row = S + (size_t)i * dv;
-        for (int j = 0; j < dv; j++) row[j] += ki * beta * (v[j] - u[j]);
+        for (int j = j0; j < j1; j++) row[j] += ki * beta * (v[j] - u[j - j0]);
     }
 
     /* 4. output from the ALREADY UPDATED state: o = S^T q */
-    for (int j = 0; j < dv; j++) o[j] = 0.0f;
+    for (int j = j0; j < j1; j++) o[j] = 0.0f;
     for (int i = 0; i < dk; i++) {
         const float qi = q[i];
         if (qi == 0.0f) continue;
         const float *row = S + (size_t)i * dv;
-        for (int j = 0; j < dv; j++) o[j] += qi * row[j];
+        for (int j = j0; j < j1; j++) o[j] += qi * row[j];
     }
-    free(uheap);                                  /* free(NULL) is a no-op */
+}
+
+void k3_kda_step(float *S, float *o, const float *q, const float *k,
+                 const float *v, const float *alpha, float beta, int dk, int dv)
+{
+    for (int j0 = 0; j0 < dv; j0 += K3_KDA_STEP_DV) {
+        const int j1 = (dv - j0 < K3_KDA_STEP_DV) ? dv : j0 + K3_KDA_STEP_DV;
+        kda_step_cols(S, o, q, k, v, alpha, beta, dk, dv, j0, j1);
+    }
 }
 
 /* ---------------------------------------------------------------- matmul ---- */
@@ -262,12 +807,28 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
  * to the arithmetic relative to a sequential sum. Keeping the accumulators in double
  * bounds the difference far below fp32 output precision; making them float would not.
  */
-void k3_matmul(float *y, const float *x, const float *W, int in, int out)
+static void matmul_f32_rows(float *y, const float *x, const float *W, int in, int o0, int o1)
 {
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) if (out > 64)
+#if defined(K3_AVX512)
+    for (int o = o0; o < o1; o++) {
+        const float *row = W + (size_t)o * in;
+        __m512 a[4] = { _mm512_setzero_ps(), _mm512_setzero_ps(),
+                        _mm512_setzero_ps(), _mm512_setzero_ps() };
+        int i = 0;
+        for (; i + 63 < in; i += 64)
+            for (int k = 0; k < 4; k++)
+                a[k] = _mm512_fmadd_ps(_mm512_loadu_ps(row + i + 16 * k),
+                                       _mm512_loadu_ps(x + i + 16 * k), a[k]);
+        for (int k = 0; i < in; i += 16, k++) {
+            const __mmask16 m = v512_tail(in - i);
+            a[k] = _mm512_mask3_fmadd_ps(_mm512_maskz_loadu_ps(m, row + i),
+                                         _mm512_maskz_loadu_ps(m, x + i), a[k], m);
+        }
+        y[o] = v512_sum(a);
+    }
+    return;
 #endif
-    for (int o = 0; o < out; o++) {
+    for (int o = o0; o < o1; o++) {
         const float *row = W + (size_t)o * in;
         /* Sixteen accumulators, EXPLICITLY fused products. fma() in double is the
          * same IEEE operation as _mm256_fmadd_pd per lane, so the scalar and vector
@@ -288,6 +849,12 @@ void k3_matmul(float *y, const float *x, const float *W, int in, int out)
         for (; i < in; i++) acc = fma((double)row[i], (double)x[i], acc);
         y[o] = (float)acc;
     }
+}
+
+void k3_matmul(float *y, const float *x, const float *W, int in, int out)
+{
+    K3_TEAM_IF(out > 64, int lo, hi; k3_split(out, &lo, &hi);
+               matmul_f32_rows(y, x, W, in, lo, hi));
 }
 
 /* ------------------------------------------------------------- Gated MLA ---- */
@@ -318,9 +885,9 @@ void k3_matmul(float *y, const float *x, const float *W, int in, int out)
  * from x and caches nothing. Both paths must produce identical output; the op fixtures
  * gate the uncached path and tests/unit/k3_model.c gates them against each other.
  */
-void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
-                   int T, float *scratch,
-                   float *kvc, float *ropec, int cached, int cap)
+static void mla_team(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
+                     int T, float *scratch,
+                     float *kvc, float *ropec, int cached, int cap)
 {
     const int E  = c->hidden, H = c->n_heads;
     const int qn = c->qk_nope, qr = c->qk_rope, vh = c->v_head;
@@ -351,26 +918,55 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
     #define K3_KV_AT(p)   (kvc   ? kvc   + (size_t)(p) * H * kvd : kvs + (size_t)(p) * H * kvd)
     #define K3_ROPE_AT(p) (ropec ? ropec + (size_t)(p) * qr      : rps + (size_t)(p) * qr)
 
+    /* Tensor parallel: rows of q_a/kv_a are split and gathered (their outputs are
+     * normalised as a whole); heads [h0, h1) own q_b, kv_b, their KV slots, attention and
+     * the gate; rows [e0, e1) of o_proj. */
+    int h0, h1, a0, a1, b0, b1, e0, e1;
+    k3_tp_part(H, &h0, &h1);
+    k3_tp_part(c->q_lora, &a0, &a1);
+    k3_tp_part(kvw, &b0, &b1);
+    k3_tp_part(E, &e0, &e1);
+
     /* ---- per-token projections ---- */
+    double tp = k3_prof_t0();
     for (int t = 0; t < T; t++) {
         const int p = cached + t;
         const float *xt = x + (size_t)t * E;
-        k3_mmw(ql, xt, w->q_a, w->wdt, E, c->q_lora);
-        k3_rmsnorm(ql, ql, w->q_a_norm, c->q_lora, c->rms_eps);
-        k3_mmw(q + (size_t)t * H * qh, ql, w->q_b, w->wdt, c->q_lora, H * qh);
-
+        mmw_rows(ql, xt, w->q_a, w->wdt, E, a0, a1);
         /* ONE projection emits the compressed latent AND the shared rope slot */
-        k3_mmw(ct, xt, w->kv_a, w->wdt, E, kvw);
-        /* the norm covers the latent only, never the rope slot */
-        k3_rmsnorm(ct, ct, w->kv_a_norm, c->kv_lora, c->rms_eps);
-        memcpy(K3_ROPE_AT(p), ct + c->kv_lora, (size_t)qr * sizeof(float));
-        k3_mmw(K3_KV_AT(p), ct, w->kv_b, w->wdt, c->kv_lora, H * kvd);
-    }
+        mmw_rows(ct, xt, w->kv_a, w->wdt, E, b0, b1);
+        const K3Seg sg[2] = { { ql, c->q_lora, 1, 0 }, { ct, kvw, 1, 0 } };
+        k3_tp_gather_begin(sg, 2);
+        /* decode: the gate reads only x, so it runs while the latents are in flight */
+        if (T == 1 && w->g) mmw_rows(gbuf, xt, w->g, w->wdt, E, h0 * vh, h1 * vh);
+        k3_tp_gather_end(sg, 2);
 
-    /* ---- attention, per head, causal ---- */
+        /* both norms in three parts under one barrier; the norm covers the latent
+         * only, never the rope slot */
+        double *qp = rc_parts(rc_n(c->q_lora)), *kp = rc_parts(rc_n(c->kv_lora));
+        rc_sq_team(qp, ql, c->q_lora);
+        rc_sq_team(kp, ct, c->kv_lora);
+        k3_sync();
+        rms_scale(ql, ql, w->q_a_norm, c->q_lora, rms_inv(qp, c->q_lora, c->rms_eps));
+        rms_scale(ct, ct, w->kv_a_norm, c->kv_lora, rms_inv(kp, c->kv_lora, c->rms_eps));
+        if (k3_tid() == 0) memcpy(K3_ROPE_AT(p), ct + c->kv_lora, (size_t)qr * sizeof(float));
+        k3_sync();
+        mmw_rows(q + (size_t)t * H * qh, ql, w->q_b, w->wdt, c->q_lora, h0 * qh, h1 * qh);
+        mmw_rows(K3_KV_AT(p), ct, w->kv_b, w->wdt, c->kv_lora, h0 * kvd, h1 * kvd);
+        k3_sync();                          /* ql/ct are rewritten by the next token */
+    }
+    k3_prof_add(K3P_MLA_PROJ, tp);
+
+    /* ---- attention, per head, causal; heads split over the team ---- */
     for (int t = 0; t < T; t++) {
         const int p = cached + t;
-        for (int h = 0; h < H; h++) {
+        tp = k3_prof_t0();
+        int hl, hh;
+        k3_split(h1 - h0, &hl, &hh);
+        float *scp = sc;
+        if (hh > hl && k3_nth() > 1)
+            scp = (float *)k3_scratch(K3S_MLA_SC, (size_t)(p + 1) * sizeof(float), "MLA scores");
+        for (int h = h0 + hl; h < h0 + hh; h++) {
             const float *qt = q + ((size_t)t * H + h) * qh;
             float m = -INFINITY;
             for (int s = 0; s <= p; s++) {                 /* causal: s <= p */
@@ -381,32 +977,49 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
                 /* the rope slot is UNROTATED but still scored, and the SAME 64
                  * values serve every head. Dropping this term is the silent bug. */
                 for (int i = 0; i < qr; i++) d += (double)qt[qn + i] * (double)kr[i];
-                sc[s] = (float)d * scale;
-                if (sc[s] > m) m = sc[s];
+                scp[s] = (float)d * scale;
+                if (scp[s] > m) m = scp[s];
             }
             double z = 0.0;
-            for (int s = 0; s <= p; s++) { sc[s] = expf(sc[s] - m); z += sc[s]; }
+            for (int s = 0; s <= p; s++) { scp[s] = expf(scp[s] - m); z += scp[s]; }
 
             float *o = acc + (size_t)h * vh;
             for (int j = 0; j < vh; j++) o[j] = 0.0f;
             for (int s = 0; s <= p; s++) {
-                const float pr = (float)(sc[s] / z);
+                const float pr = (float)(scp[s] / z);
                 const float *vs = K3_KV_AT(s) + (size_t)h * kvd + qn;
                 for (int j = 0; j < vh; j++) o[j] += pr * vs[j];
             }
         }
+        k3_prof_add(K3P_MLA_CORE, tp);
 
         /* ---- output gate then projection. Gate BEFORE o_proj, and no norm on it,
          * unlike KDA which norms first. :470-473 ---- */
+        tp = k3_prof_t0();
         if (w->g) {
-            k3_mmw(gbuf, x + (size_t)t * E, w->g, w->wdt, E, H * vh);
-            for (int i = 0; i < H * vh; i++)
+            if (T != 1) mmw_rows(gbuf, x + (size_t)t * E, w->g, w->wdt, E, h0 * vh, h1 * vh);
+            k3_sync();
+            int lo, hi;
+            k3_split((h1 - h0) * vh, &lo, &hi);
+            for (int i = h0 * vh + lo; i < h0 * vh + hi; i++)
                 acc[i] *= 1.0f / (1.0f + expf(-gbuf[i]));
         }
-        k3_mmw(out + (size_t)t * E, acc, w->o, w->wdt, H * vh, E);
+        const K3Seg sa = { acc, H * vh, vh, 0 };
+        k3_tp_gather(&sa, 1);
+        mmw_rows(out + (size_t)t * E, acc, w->o, w->wdt, H * vh, e0, e1);
+        const K3Seg so = { out + (size_t)t * E, E, 1, 0 };
+        k3_tp_gather(&so, 1);
+        k3_prof_add(K3P_MLA_OUT, tp);
     }
     #undef K3_KV_AT
     #undef K3_ROPE_AT
+}
+
+void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
+                   int T, float *scratch,
+                   float *kvc, float *ropec, int cached, int cap)
+{
+    K3_TEAM_IF(1, mla_team(out, x, w, c, T, scratch, kvc, ropec, cached, cap));
 }
 
 void k3_mla(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
@@ -416,17 +1029,14 @@ void k3_mla(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
 }
 
 /* ---------------------------------------------------------------- router ---- */
-void k3_router(int *idx, float *w, const float *x, const float *W,
-               const float *bias, int hidden, int n_experts, int topk,
-               int renorm, float routed_scale)
-{
-    /* Returning early here would leave idx[] and w[] untouched, and k3_moe forms
-     * `w->w1 + idx[j]*I*L` from them one line later -- an arbitrary pointer built from
-     * uninitialised stack. */
-    float *score  = (float *)malloc((size_t)n_experts * sizeof(float));
-    float *choice = (float *)malloc((size_t)n_experts * sizeof(float));
-    if (!score || !choice) k3_fatal_oom("router scores", (size_t)n_experts * sizeof(float) * 2);
+/* Split in two so tensor parallelism can score its own experts, gather the scores, and
+ * then select on every rank. Together they are exactly k3_router. */
+static void router_scores_part(float *score, const float *x, const float *W, int hidden,
+                               int e0, int r0, int r1);
 
+static void router_scores(float *score, const float *x, const float *W, int hidden,
+                          int e0, int e1)
+{
     /* logits in float32 with no bias, then an independent sigmoid per expert. The
      * reference upcasts both operands explicitly; a double accumulator here matches
      * it and costs nothing at this width. */
@@ -437,20 +1047,44 @@ void k3_router(int *idx, float *w, const float *x, const float *W,
      * matmul in the engine was already threaded. It is pure arithmetic with no I/O to
      * hide behind, so it sat squarely on the critical path.
      *
-     * Each iteration writes only its own score[e] and choice[e], and the ACCUMULATION
-     * ORDER INSIDE an expert is untouched: thread t still sums i = 0..hidden-1 in
-     * sequence into its own double. Splitting the outer loop therefore cannot change a
-     * single bit, which is why this needs no tolerance and no re-gating. */
-#ifdef _OPENMP
-#   pragma omp parallel for schedule(static)
+     * Each iteration writes only its own score[e], and the ACCUMULATION ORDER INSIDE an
+     * expert is untouched: thread t still sums i = 0..hidden-1 in sequence into its own
+     * double. Splitting the outer loop therefore cannot change a single bit, which is
+     * why this needs no tolerance and no re-gating. */
+    K3_TEAM_IF(e1 - e0 > 64, int lo, hi; k3_split(e1 - e0, &lo, &hi);
+               router_scores_part(score, x, W, hidden, e0, e0 + lo, e0 + hi));
+}
+
+/* this thread's experts [r0, r1) of the rank's [e0, e1) */
+static void router_scores_part(float *score, const float *x, const float *W, int hidden,
+                               int e0, int r0, int r1)
+{
+#if defined(K3_AVX512)
+    /* the fp32 GEMV scheme, as a serial double chain here was latency bound */
+    if (r1 > r0)
+        matmul_f32_rows(score + r0, x, W + (size_t)(r0 - (k3_tp.local ? e0 : 0)) * hidden,
+                        hidden, 0, r1 - r0);
+    for (int e = r0; e < r1; e++) score[e] = 1.0f / (1.0f + expf(-score[e]));
+    return;
 #endif
-    for (int e = 0; e < n_experts; e++) {
-        const float *row = W + (size_t)e * hidden;
+    for (int e = r0; e < r1; e++) {
+        const float *row = W + (size_t)(e - (k3_tp.local ? e0 : 0)) * hidden;
         double acc = 0.0;
         for (int i = 0; i < hidden; i++) acc += (double)row[i] * (double)x[i];
-        score[e]  = 1.0f / (1.0f + expf(-(float)acc));
-        choice[e] = score[e] + (bias ? bias[e] : 0.0f);   /* selection score only */
+        score[e] = 1.0f / (1.0f + expf(-(float)acc));
     }
+}
+
+static void router_select(int *idx, float *w, const float *score, const float *bias,
+                          int n_experts, int topk, int renorm, float routed_scale)
+{
+    /* Returning early here would leave idx[] and w[] untouched, and k3_moe forms
+     * `w->w1 + idx[j]*I*L` from them one line later -- an arbitrary pointer built from
+     * uninitialised stack. */
+    float *choice = (float *)k3_scratch(K3S_ROUTER_CHOICE, (size_t)n_experts * sizeof(float),
+                                        "router scores");
+    for (int e = 0; e < n_experts; e++)
+        choice[e] = score[e] + (bias ? bias[e] : 0.0f);   /* selection score only */
 
     /* top-k by repeated max. n_experts is 896 and topk is 16, so this is 14k
      * comparisons per token per layer: cheap next to an 18 MB expert read, and it
@@ -473,42 +1107,85 @@ void k3_router(int *idx, float *w, const float *x, const float *W,
         for (int j = 0; j < topk; j++) w[j] *= inv;
     }
     for (int j = 0; j < topk; j++) w[j] *= routed_scale;
+}
 
-    free(score); free(choice);
+void k3_router(int *idx, float *w, const float *x, const float *W,
+               const float *bias, int hidden, int n_experts, int topk,
+               int renorm, float routed_scale)
+{
+    float *score = (float *)k3_scratch(K3S_ROUTER_SCORE, (size_t)n_experts * sizeof(float),
+                                       "router scores");
+    router_scores(score, x, W, hidden, 0, n_experts);
+    router_select(idx, w, score, bias, n_experts, topk, renorm, routed_scale);
 }
 
 /* --------------------------------------------------------------- AttnRes ---- */
+#define K3_AR_MAXSRC 64
+
+/* Team form over source pointers v[0..nsrc). The score of source s is its fold dot
+ * product scaled by its RMS inverse, (float)(inv_s * sum v*fold), both sums in the
+ * canonical chunk order and all (source, chunk) pairs in one parallel pass. The mix is
+ * split by chunk with the sources summed in order; with opart != NULL it also leaves the
+ * chunk sums of squares of out there, part one of the norm that follows. No barrier at
+ * the end: out and opart are complete only after the caller's next k3_sync. */
+static void attn_res_v(float *out, const float *const *v, const float *fold,
+                       int nsrc, int n, float eps, double *opart)
+{
+    if (nsrc > K3_AR_MAXSRC) k3_fatal_bound("AttnRes sources", nsrc, K3_AR_MAXSRC);
+    const int nc = rc_n(n);
+    double *part = rc_parts(2 * nsrc * nc);          /* [s][c] squares, then [s][c] dots */
+    {
+        int lo, hi;
+        k3_split(nsrc * nc, &lo, &hi);
+        for (int task = lo; task < hi; task++) {
+            const int s = task / nc, c = task % nc;
+            const int i0 = c * K3_RC, i1 = i0 + K3_RC < n ? i0 + K3_RC : n;
+            const float *vs = v[s];
+            double q = 0.0, d = 0.0;
+            for (int i = i0; i < i1; i++) {
+                q += (double)vs[i] * (double)vs[i];
+                d += (double)vs[i] * (double)fold[i];
+            }
+            part[task] = q;
+            part[nsrc * nc + task] = d;
+        }
+    }
+    k3_sync();
+
+    float p[K3_AR_MAXSRC];
+    for (int s = 0; s < nsrc; s++) {
+        const float inv = (float)(1.0 / sqrt(rc_total(part + s * nc, nc) / (double)n
+                                             + (double)eps));
+        /* key is the NORMALISED source; fold already carries norm.weight*proj.weight */
+        p[s] = (float)((double)inv * rc_total(part + (nsrc + s) * nc, nc));
+    }
+    float m = p[0];
+    for (int s = 1; s < nsrc; s++) if (p[s] > m) m = p[s];
+    double z = 0.0;
+    for (int s = 0; s < nsrc; s++) { p[s] = expf(p[s] - m); z += p[s]; }
+    for (int s = 0; s < nsrc; s++) p[s] = (float)(p[s] / z);
+
+    int lo, hi;
+    k3_split(nc, &lo, &hi);
+    for (int c = lo; c < hi; c++) {
+        const int i0 = c * K3_RC, i1 = i0 + K3_RC < n ? i0 + K3_RC : n;
+        for (int i = i0; i < i1; i++) {
+            float a = 0.0f;
+            for (int s = 0; s < nsrc; s++) a += p[s] * v[s][i];   /* the RAW source */
+            out[i] = a;
+        }
+        if (opart) opart[c] = rc_sq(out, c, n);
+    }
+}
+
 void k3_attn_res(float *out, const float *src, const float *fold,
                  int nsrc, int n, float eps)
 {
-    /* Returning early would leave `out` holding the previous layer's residual, which
-     * the caller cannot distinguish from a computed one. */
-    float *score = (float *)malloc((size_t)nsrc * sizeof(float));
-    if (!score) k3_fatal_oom("AttnRes scores", (size_t)nsrc * sizeof(float));
-
-    for (int s = 0; s < nsrc; s++) {
-        const float *v = src + (size_t)s * n;
-        double ss = 0.0;
-        for (int i = 0; i < n; i++) ss += (double)v[i] * (double)v[i];
-        const float inv = (float)(1.0 / sqrt(ss / (double)n + (double)eps));
-        /* key is the NORMALISED source; fold already carries norm.weight*proj.weight */
-        double acc = 0.0;
-        for (int i = 0; i < n; i++) acc += (double)(v[i] * inv) * (double)fold[i];
-        score[s] = (float)acc;
-    }
-
-    float m = score[0];
-    for (int s = 1; s < nsrc; s++) if (score[s] > m) m = score[s];
-    double z = 0.0;
-    for (int s = 0; s < nsrc; s++) { score[s] = expf(score[s] - m); z += score[s]; }
-
-    for (int i = 0; i < n; i++) out[i] = 0.0f;
-    for (int s = 0; s < nsrc; s++) {
-        const float p = (float)(score[s] / z);
-        const float *v = src + (size_t)s * n;   /* the RAW source, not the key */
-        for (int i = 0; i < n; i++) out[i] += p * v[i];
-    }
-    free(score);
+    const float *v[K3_AR_MAXSRC];
+    if (nsrc > K3_AR_MAXSRC) k3_fatal_bound("AttnRes sources", nsrc, K3_AR_MAXSRC);
+    for (int s = 0; s < nsrc; s++) v[s] = src + (size_t)s * n;
+    attn_res_v(out, v, fold, nsrc, n, eps, NULL);
+    k3_sync();
 }
 
 /* Exact scratch requirement for k3_mla. Callers should use this rather than
@@ -553,106 +1230,315 @@ size_t k3_mla_scratch(const K3Cfg *c, int T)
  * numbers rather than an invariant, and it is the same class of hazard documented at
  * the scratch layout in k3_mla_cached. Size with k3_moe_scratch().
  */
-void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
-            int T, int *idx, float *wt, float *scratch)
+/* Scratch floats for moe_routed: gate|up, act and down outputs for every selected
+ * expert, then (double-aligned) z and each act widened to double. */
+static size_t moe_batch_floats(const K3Cfg *c)
+{
+    const size_t K = (size_t)c->topk, L = (size_t)c->latent, I = (size_t)c->moe_inter;
+    return K * (3 * I + L) + 2 + 2 * (L + K * I);
+}
+
+/* The selected experts of ONE token, all of them in one parallel region per phase.
+ * Calling k3_matmul_mxfp4 three times per expert opened 48 small parallel regions per
+ * layer, each over 3072-3584 rows, and ran the experts one after another: measured
+ * 58 GB/s against a 305 GB/s socket. Here the work is split over (expert, matrix, row
+ * block) instead. q != NULL selects streamed MXFP4 experts; otherwise the resident fp32
+ * bank w->w1/w3/w2 indexed by eidx.
+ *
+ * Tensor parallel: this rank computes rows [i0, i1) of every gate/up and rows [l0, l1)
+ * of every down projection; act is gathered between the two (together with `extra`, the
+ * shared expert's act, to save a collective) and accL after.
+ *
+ * BIT-IDENTICAL to the per-expert loop: every output row goes through the same row
+ * kernel with the same input, SiTU is the same elementwise function, and accL is summed
+ * per element in the original top-k order j = 0..nq-1. */
+static void moe_routed(float *accL, const float *z, const K3MoeW *w, const K3ExpertQ *q,
+                       const int *eidx, const float *wq, int nq, const K3Cfg *c,
+                       float *buf, K3Seg extra)
+{
+    const int L = c->latent, I = c->moe_inter, G = K3_MXFP4_GROUP;
+    const int sliced = w->src && w->src->sliced;
+    int i0, i1, l0, l1;
+    k3_tp_part(I, &i0, &i1);
+    k3_tp_part(L, &l0, &l1);
+    float  *gu  = buf;                                  /* [nq][2I] */
+    float  *act = gu  + (size_t)nq * 2 * I;             /* [nq][I]  */
+    float  *edn = act + (size_t)nq * I;                 /* [nq][L]  */
+    const size_t used = (size_t)nq * (3 * (size_t)I + L);
+#if defined(K3_AVX512)
+    double *zd = NULL, *ad = NULL;                      /* the fp32 path reads z, act */
+    (void)used;
+#else
+    double *zd  = (double *)(buf + used + (used & 1));  /* [L]      */
+    double *ad  = zd + L;                               /* [nq][I]  */
+#endif
+
+    const int ni = i1 - i0, nl = l1 - l0;
+    if (q) {
+        mxfp4_check(L, G);
+        mxfp4_check(I, G);
+#if !defined(K3_AVX512)
+        int lo, hi;
+        k3_split(L, &lo, &hi);
+        for (int i = lo; i < hi; i++) zd[i] = (double)z[i];
+        k3_sync();
+#endif
+    }
+
+    /* gate|up split over (expert, row block) tasks, about one per thread, so each thread
+     * streams two long contiguous runs rather than a few rows of every expert, and SiTU
+     * on the same rows by the same thread: no barrier between them */
+    {
+        const int nb = ni > 0 ? (k3_nth() + nq - 1) / (nq > 0 ? nq : 1) : 0;
+        int t0, t1;
+        k3_split(nq * nb, &t0, &t1);
+        for (int task = t0; task < t1; task++) {
+            const int j = task / nb, b = task % nb;
+            const int r0 = i0 + (int)((long)ni * b / nb), r1 = i0 + (int)((long)ni * (b + 1) / nb);
+            if (r1 <= r0) continue;
+            float *g = gu + (size_t)j * 2 * I;
+            if (q) {
+                mxfp4_rows(g,     z, zd, q[j].p1, q[j].s1, L, r0, r1, sliced ? i0 : 0, G, q[j].ilv);
+                mxfp4_rows(g + I, z, zd, q[j].p3, q[j].s3, L, r0, r1, sliced ? i0 : 0, G, q[j].ilv);
+            } else {
+                matmul_f32_rows(g,     z, w->w1 + (size_t)eidx[j] * I * L, L, r0, r1);
+                matmul_f32_rows(g + I, z, w->w3 + (size_t)eidx[j] * I * L, L, r0, r1);
+            }
+            situ_range(act + (size_t)j * I + r0, g + r0, g + I + r0, r1 - r0,
+                       c->situ_b1, c->situ_b2);
+        }
+    }
+
+    {
+        K3Seg sg[K3_MAX_TOPK + 1];
+        int ng = 0;
+        for (int j = 0; j < nq; j++) {
+            sg[ng].p = act + (size_t)j * I; sg[ng].n = I; sg[ng].unit = 1; sg[ng].exact = 0; ng++;
+        }
+        if (extra.p) sg[ng++] = extra;
+        k3_tp_gather(sg, ng);
+    }
+
+#if !defined(K3_AVX512)
+    if (q) {
+        int lo, hi;
+        k3_split(nq * I, &lo, &hi);
+        for (int i = lo; i < hi; i++) ad[i] = (double)act[i];
+        k3_sync();
+    }
+#endif
+
+    /* down split over (expert, row block) tasks for long contiguous runs, as for
+     * gate|up; the weighted sum then crosses threads, so it follows a barrier, per
+     * element in top-k order */
+    {
+        const int nb = nl > 0 ? (k3_nth() + nq - 1) / (nq > 0 ? nq : 1) : 0;
+        int t0, t1;
+        k3_split(nq * nb, &t0, &t1);
+        for (int task = t0; task < t1; task++) {
+            const int j = task / nb, b = task % nb;
+            const int r0 = l0 + (int)((long)nl * b / nb), r1 = l0 + (int)((long)nl * (b + 1) / nb);
+            if (r1 <= r0) continue;
+            if (q)
+                mxfp4_rows(edn + (size_t)j * L, act + (size_t)j * I, ad ? ad + (size_t)j * I : NULL,
+                           q[j].p2, q[j].s2, I, r0, r1, sliced ? l0 : 0, G, q[j].ilv);
+            else
+                matmul_f32_rows(edn + (size_t)j * L, act + (size_t)j * I,
+                                w->w2 + (size_t)eidx[j] * L * I, I, r0, r1);
+        }
+        k3_sync();
+        int lo, hi;
+        k3_split(nl, &lo, &hi);
+        for (int i = l0 + lo; i < l0 + hi; i++) {
+            float a = accL[i];
+            for (int j = 0; j < nq; j++) a += wq[j] * edn[(size_t)j * L + i];
+            accL[i] = a;
+        }
+    }
+    const K3Seg sa = { accL, L, 1, 0 };
+    k3_tp_gather_begin(&sa, 1);                /* the caller ends it, after independent work */
+}
+
+/* The token's selection, published by thread 0 to the team. */
+static K3ExpertQ moe_q[K3_MAX_TOPK];
+static float     moe_wq[K3_MAX_TOPK];
+static int       moe_idx[K3_MAX_TOPK];
+static int       moe_nq;
+static float    *moe_score;                /* router scores when they do not fit scratch */
+
+static void moe_team(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
+                     int T, int *idx, float *wt, float *scratch)
 {
     const int E = c->hidden, L = c->latent, I = c->moe_inter;
-    const int SI = I * c->n_shared;
+    const int SI = I * c->n_shared, NE = c->n_experts;
 
     float *z    = scratch;              /* [L]    latent input              */
     float *accL = z    + L;             /* [L]    weighted expert aggregate */
-    float *gu   = accL + L;             /* [2*I]  gate|up, one expert       */
-    float *act  = gu   + 2 * I;         /* [I]    after SiTU                */
-    float *edn  = act  + I;             /* [L]    expert down-projection    */
-    float *sgu  = edn  + L;             /* [2*SI] shared gate|up            */
+    float *rsc  = accL + L;             /* [3I+L] router scores when NE fits */
+    float *sgu  = rsc  + 3 * I + L;     /* [2*SI] shared gate|up            */
     float *sact = sgu  + 2 * SI;        /* [SI]   shared after SiTU         */
     float *sdn  = sact + SI;            /* [E]    shared down-projection    */
+    float *xbuf = sdn  + E;             /* moe_batch_floats                 */
+    if ((size_t)(xbuf - scratch) & 1) xbuf++;
+    float *score = rsc;
+    if (NE > 3 * I + L) {
+        if (k3_tid() == 0)
+            moe_score = (float *)k3_scratch(K3S_MOE_SCORE, (size_t)NE * sizeof(float),
+                                            "router scores");
+        k3_sync();
+        score = moe_score;
+    }
+
+    /* Tensor parallel: experts scored, latent rows of down, shared-expert intermediate
+     * rows, and output rows of up and of the shared down projection. */
+    int x0, x1, l0, l1, s0, s1, o0, o1;
+    k3_tp_part(NE, &x0, &x1);
+    k3_tp_part(L, &l0, &l1);
+    k3_tp_part(SI, &s0, &s1);
+    k3_tp_part(E, &o0, &o1);
 
     for (int t = 0; t < T; t++) {
         const float *xt = x + (size_t)t * E;
         float *ot = out + (size_t)t * E;
 
-        /* 1. route on the FULL width, before the down-projection */
-        k3_router(idx, wt, xt, w->gate, w->bias, E, c->n_experts, c->topk,
-                  c->moe_renorm, c->routed_scale);
+        /* 1. route on the FULL width, before the down-projection, and 2. down-project
+         * into the latent space. Both read xt only, so they share one gather, and it is
+         * in flight while 6a runs: the shared expert's gate|up reads only xt as well. */
+        double tp = k3_prof_t0();
+        router_scores(score, xt, w->gate, E, x0, x1);
+        k3_prof_add(K3P_ROUTER, tp);
+        tp = k3_prof_t0();
+        mmw_rows(z, xt, w->down, w->wdt, E, l0, l1);
+        const K3Seg sg[2] = { { score, NE, 1, 1 }, { z, L, 1, 0 } };   /* scores pick experts: fp32 */
+        k3_tp_gather_begin(sg, 2);
+        k3_prof_add(K3P_MOE_DOWN, tp);
 
-        int nk = c->topk;
-        /* Draft cache-only routing: keep only the top-k experts already resident, and
-         * renormalise their weights so the mixture still sums as intended. This makes a
-         * draft token read ZERO new expert bytes. It is an approximation, which is exactly
-         * what a draft is; the exact model verifies every proposed token. */
-        if (w->cache_only && w->src && w->src->resident) {
-            int m = 0; float wsum = 0.0f;
-            for (int j = 0; j < c->topk; j++) {
-                if (w->src->resident(w->src, w->layer, idx[j], NULL)) {
-                    idx[m] = idx[j]; wt[m] = wt[j]; wsum += wt[j]; m++;
-                }
-            }
-            nk = m;
-            if (wsum > 0.0f) for (int j = 0; j < nk; j++) wt[j] /= wsum;
+        /* 6a. shared expert gate|up on the ORIGINAL full-width input, and SiTU on the
+         * same rows by the same thread. Its act is gathered with the routed experts'. */
+        tp = k3_prof_t0();
+        {
+            int lo, hi;
+            k3_split(s1 - s0, &lo, &hi);
+            const int r0 = s0 + lo, r1 = s0 + hi;
+            mmw_part(sgu,      xt, w->sh1, w->wdt, E, s0, r0, r1);
+            mmw_part(sgu + SI, xt, w->sh3, w->wdt, E, s0, r0, r1);
+            situ_range(sact + r0, sgu + r0, sgu + SI + r0, r1 - r0, c->situ_b1, c->situ_b2);
         }
+        k3_prof_add(K3P_SHARED, tp);
+        k3_tp_gather_end(sg, 2);
 
-        /* 2. down-project into the latent space */
-        k3_mmw(z, xt, w->down, w->wdt, E, L);
+        /* Selection, and resolving experts through the source (which may do I/O and is
+         * not thread safe), on thread 0; the team picks the result up after the barrier. */
+        tp = k3_prof_t0();
+        if (k3_tid() == 0) {
+            router_select(idx, wt, score, w->bias, NE, c->topk, c->moe_renorm, c->routed_scale);
+            int nk = c->topk;
+            /* Draft cache-only routing: keep only the top-k experts already resident, and
+             * renormalise their weights so the mixture still sums as intended. This makes
+             * a draft token read ZERO new expert bytes. It is an approximation, which is
+             * exactly what a draft is; the exact model verifies every proposed token. */
+            if (w->cache_only && w->src && w->src->resident) {
+                int m = 0; float wsum = 0.0f;
+                for (int j = 0; j < c->topk; j++) {
+                    if (w->src->resident(w->src, w->layer, idx[j], NULL)) {
+                        idx[m] = idx[j]; wt[m] = wt[j]; wsum += wt[j]; m++;
+                    }
+                }
+                nk = m;
+                if (wsum > 0.0f) for (int j = 0; j < nk; j++) wt[j] /= wsum;
+            }
+            for (int i = 0; i < L; i++) accL[i] = 0.0f;
+            /* Hand the WHOLE top-k to the source first, so its reads can overlap. Without
+             * this the loop below misses, blocks on a 17.55 MB read, computes, misses
+             * again: a queue depth of one against a drive that needs depth to reach its
+             * rated bandwidth. getmany is optional and may be NULL, in which case nothing
+             * changes and the loop reads them one at a time exactly as before. */
+            if (!w->cache_only && w->src && w->src->getmany)
+                w->src->getmany(w->src, w->layer, idx, nk);
+            if (w->src) {
+                /* Streamed: the experts stay MXFP4 and the matmuls read nibbles. Resolve
+                 * the whole top-k first; the source keeps every pointer valid for the
+                 * token. In cache-only mode every idx[j] is known resident, so resident()
+                 * serves it with no disk read; otherwise get() may read it. */
+                int nq = 0;
+                for (int j = 0; j < nk; j++) {
+                    int miss = w->cache_only
+                        ? !w->src->resident(w->src, w->layer, idx[j], &moe_q[nq])
+                        : (w->src->get(w->src, w->layer, idx[j], &moe_q[nq]) != 0);
+                    if (miss) {
+                        /* A cache-only draft filtered to resident experts already, so a
+                         * miss here is a benign race at worst; skip it, since the draft is
+                         * approximate by construction and the exact model verifies. On
+                         * the exact path a miss is the unacceptable silent-corruption
+                         * case: count it in k3_expert_drops so the caller fails the run
+                         * (see docs/API.md). */
+                        if (w->cache_only) continue;
+                        k3_expert_drops++;
+                        fprintf(stderr, "EXPERT DROP: layer %d expert %d failed to load; "
+                                        "this token is CORRUPT\n", w->layer, idx[j]);
+                        continue;
+                    }
+                    moe_wq[nq++] = wt[j];
+                }
+                moe_nq = nq;
+            } else {
+                for (int j = 0; j < nk; j++) { moe_idx[j] = idx[j]; moe_wq[j] = wt[j]; }
+                moe_nq = nk;
+            }
+        }
+        k3_prof_add(K3P_ROUTER, tp);
+        k3_sync();
 
         /* 3. the selected experts, in latent space, weighted and summed */
-        for (int i = 0; i < L; i++) accL[i] = 0.0f;
-        /* Hand the WHOLE top-k to the source first, so its reads can overlap. Without
-         * this the loop below misses, blocks on a 17.55 MB read, computes, misses
-         * again: a queue depth of one against a drive that needs depth to reach its
-         * rated bandwidth. getmany is optional and may be NULL, in which case nothing
-         * changes and the loop reads them one at a time exactly as before. */
-        if (!w->cache_only && w->src && w->src->getmany)
-            w->src->getmany(w->src, w->layer, idx, nk);
-        for (int j = 0; j < nk; j++) {
-            if (w->src) {
-                /* Streamed: the expert stays MXFP4 and the matmul reads nibbles. In
-                 * cache-only mode every idx[j] is known resident, so resident() serves it
-                 * with no disk read; otherwise get() may read it. */
-                K3ExpertQ q;
-                int miss = w->cache_only
-                    ? !w->src->resident(w->src, w->layer, idx[j], &q)
-                    : (w->src->get(w->src, w->layer, idx[j], &q) != 0);
-                if (miss) {
-                    /* A cache-only draft filtered to resident experts already, so a miss
-                     * here is a benign race at worst; skip it, since the draft is
-                     * approximate by construction and the exact model verifies. On the
-                     * exact path a miss is the unacceptable silent-corruption case: count
-                     * it in k3_expert_drops so the caller fails the run (see docs/API.md). */
-                    if (w->cache_only) continue;
-                    k3_expert_drops++;
-                    fprintf(stderr, "EXPERT DROP: layer %d expert %d failed to load; "
-                                    "this token is CORRUPT\n", w->layer, idx[j]);
-                    continue;
-                }
-                k3_matmul_mxfp4(gu,     z, q.p1, q.s1, L, I, K3_MXFP4_GROUP);
-                k3_matmul_mxfp4(gu + I, z, q.p3, q.s3, L, I, K3_MXFP4_GROUP);
-                k3_situ_glu(act, gu, I, c->situ_b1, c->situ_b2);
-                k3_matmul_mxfp4(edn, act, q.p2, q.s2, I, L, K3_MXFP4_GROUP);
-            } else {
-                const float *e1 = w->w1 + (size_t)idx[j] * I * L;   /* gate */
-                const float *e3 = w->w3 + (size_t)idx[j] * I * L;   /* up   */
-                const float *e2 = w->w2 + (size_t)idx[j] * L * I;   /* down */
-                k3_matmul(gu,     z, e1, L, I);
-                k3_matmul(gu + I, z, e3, L, I);
-                k3_situ_glu(act, gu, I, c->situ_b1, c->situ_b2);
-                k3_matmul(edn, act, e2, I, L);
+        tp = k3_prof_t0();
+        const K3Seg shared_act = { sact, SI, 1, 0 };
+        moe_routed(accL, z, w, w->src ? moe_q : NULL, moe_idx, moe_wq, moe_nq, c, xbuf,
+                   shared_act);
+        k3_prof_add(K3P_EXPERTS, tp);
+
+        /* 6b. the shared expert down-projection needs only the gathered act, so it runs
+         * while the aggregate is in flight; rows split as for 5, so the add below is
+         * thread-local. */
+        tp = k3_prof_t0();
+        int lo, hi;
+        k3_split(o1 - o0, &lo, &hi);
+        const int r0 = o0 + lo, r1 = o0 + hi;
+        mmw_part(sdn, sact, w->sh2, w->wdt, SI, o0, r0, r1);
+        k3_prof_add(K3P_SHARED, tp);
+        const K3Seg sa = { accL, L, 1, 0 };
+        k3_tp_gather_end(&sa, 1);
+
+        /* 4. RMSNorm the AGGREGATE (not per expert), 5. up-project, and add 6b UNWEIGHTED.
+         * The norm in three parts: chunk sums over the team, a barrier, then each thread
+         * scales its own copy of the aggregate as the input of its up-projection rows. */
+        tp = k3_prof_t0();
+        const float *ain = accL;
+        if (c->latent_norm) {
+            double *ap = rc_parts(rc_n(L));
+            rc_sq_team(ap, accL, L);
+            k3_sync();
+            if (r1 > r0) {
+                const float inv = rms_inv(ap, L, c->rms_eps);
+                float *an = (float *)k3_scratch(K3S_MOE_AN, (size_t)L * sizeof(float),
+                                                "MoE aggregate");
+                for (int i = 0; i < L; i++) an[i] = w->latent_norm[i] * accL[i] * inv;
+                ain = an;
             }
-            const float wj = wt[j];
-            for (int i = 0; i < L; i++) accL[i] += wj * edn[i];
         }
-
-        /* 4. RMSNorm the AGGREGATE (not per expert), then 5. up-project */
-        if (c->latent_norm) k3_rmsnorm(accL, accL, w->latent_norm, L, c->rms_eps);
-        k3_mmw(ot, accL, w->up, w->wdt, L, E);
-
-        /* 6. shared expert on the ORIGINAL full-width input, added UNWEIGHTED */
-        k3_mmw(sgu,      xt, w->sh1, w->wdt, E, SI);
-        k3_mmw(sgu + SI, xt, w->sh3, w->wdt, E, SI);
-        k3_situ_glu(sact, sgu, SI, c->situ_b1, c->situ_b2);
-        k3_mmw(sdn, sact, w->sh2, w->wdt, SI, E);
-        for (int i = 0; i < E; i++) ot[i] += sdn[i];
+        if (r1 > r0) {
+            mmw_part(ot, ain, w->up, w->wdt, L, o0, r0, r1);
+            for (int i = r0; i < r1; i++) ot[i] += sdn[i];
+        }
+        const K3Seg so = { ot, E, 1, 0 };
+        k3_tp_gather(&so, 1);
+        k3_prof_add(K3P_MOE_UP, tp);
     }
+}
+
+void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
+            int T, int *idx, float *wt, float *scratch)
+{
+    K3_TEAM_IF(1, moe_team(out, x, w, c, T, idx, wt, scratch));
 }
 
 size_t k3_moe_scratch(const K3Cfg *c)
@@ -662,7 +1548,8 @@ size_t k3_moe_scratch(const K3Cfg *c)
          + (size_t)3 * c->moe_inter       /* gu (2*I) + act (I) */
          + (size_t)c->latent              /* edn                */
          + (size_t)3 * SI                 /* sgu (2*SI) + sact  */
-         + (size_t)c->hidden;             /* sdn                */
+         + (size_t)c->hidden              /* sdn                */
+         + 1 + moe_batch_floats(c);       /* streamed expert batch, double-aligned */
 }
 
 /* Batched MoE for PREFILL over a chunk of T tokens, streamed experts only.
@@ -686,8 +1573,9 @@ size_t k3_moe_scratch(const K3Cfg *c)
 static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
                               const K3Cfg *c, int T, float *scratch);
 
-void k3_moe_prefill(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
-                    int T, int *idx, float *wt, float *scratch)
+/* Whether k3_moe_prefill takes the batched chunk path, which forks per kernel and so
+ * must run outside a team. */
+static int moe_batched(const K3MoeW *w, int T)
 {
     /* K3_NO_BATCH_PREFILL forces the per-token path, so one binary can produce both the
      * batched and the reference token streams for a bit-identity A/B. */
@@ -696,7 +1584,13 @@ void k3_moe_prefill(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
     /* cache_only renormalises per token over the resident subset, which the per-token
      * path already does; the draft's prompt prefill is one-time, so defer rather than
      * duplicate the renorm in the batch. */
-    if (!w->src || T <= 1 || no_batch || w->cache_only) {
+    return !(!w->src || T <= 1 || no_batch || w->cache_only || k3_tp.size > 1);
+}
+
+void k3_moe_prefill(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
+                    int T, int *idx, float *wt, float *scratch)
+{
+    if (!moe_batched(w, T)) {
         k3_moe(out, x, w, c, T, idx, wt, scratch);
         return;
     }
@@ -722,18 +1616,24 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
 
     /* Per-token routing decisions and latent inputs, plus a contribution buffer holding
      * every routed expert's latent output for every token: [T][K][Ll]. At T=32, K=16,
-     * Ll=3584 that is ~7.3 MB, trivial beside the tens of GB already reserved. */
-    int   *ridx = (int *)  malloc((size_t)T * K * sizeof(int));
-    float *rwt  = (float *)malloc((size_t)T * K * sizeof(float));
-    float *zz   = (float *)malloc((size_t)T * Ll * sizeof(float));
-    float *contrib = (float *)malloc((size_t)T * K * Ll * sizeof(float));
-    if (!ridx || !rwt || !zz || !contrib)
-        k3_fatal_oom("MoE prefill batch", (size_t)T * K * Ll * sizeof(float));
+     * Ll=3584 that is ~7.3 MB, trivial beside the tens of GB already reserved. All of it
+     * is carved from one persistent slot. */
+    #define K3_R64(b) (((b) + 63) & ~(size_t)63)
+    const size_t b_con = K3_R64((size_t)T * K * Ll * sizeof(float));
+    const size_t b_zz  = K3_R64((size_t)T * Ll * sizeof(float));
+    const size_t b_tk  = K3_R64((size_t)T * K * sizeof(float));
+    unsigned char *pool = (unsigned char *)k3_scratch(
+        K3S_PREFILL, b_con + b_zz + 3 * b_tk + K3_R64((size_t)c->n_experts), "MoE prefill batch");
+    float *contrib = (float *)pool;
+    float *zz   = (float *)(pool + b_con);
+    float *rwt  = (float *)(pool + b_con + b_zz);
+    int   *ridx = (int *)  (pool + b_con + b_zz + b_tk);
+    int   *uniq = (int *)  (pool + b_con + b_zz + 2 * b_tk);
+    char  *seen = (char *) (pool + b_con + b_zz + 3 * b_tk);
+    #undef K3_R64
+    memset(seen, 0, (size_t)c->n_experts);
 
     /* 1. route every token and down-project it, and collect the batch's unique experts. */
-    int  *uniq = (int *)malloc((size_t)T * K * sizeof(int));
-    char *seen = (char *)calloc((size_t)c->n_experts, 1);
-    if (!uniq || !seen) k3_fatal_oom("MoE prefill index", (size_t)c->n_experts);
     int nu = 0;
     for (int t = 0; t < T; t++) {
         const float *xt = x + (size_t)t * E;
@@ -785,10 +1685,10 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
             const float *zt = zz  + (size_t)t * Ll;
             for (int j = 0; j < K; j++) {
                 if (it[j] != e) continue;
-                k3_matmul_mxfp4(gu,     zt, q.p1, q.s1, Ll, I, K3_MXFP4_GROUP);
-                k3_matmul_mxfp4(gu + I, zt, q.p3, q.s3, Ll, I, K3_MXFP4_GROUP);
+                matmul_mxfp4(gu,     zt, q.p1, q.s1, Ll, I, K3_MXFP4_GROUP, q.ilv);
+                matmul_mxfp4(gu + I, zt, q.p3, q.s3, Ll, I, K3_MXFP4_GROUP, q.ilv);
                 k3_situ_glu(act, gu, I, c->situ_b1, c->situ_b2);
-                k3_matmul_mxfp4(edn, act, q.p2, q.s2, I, Ll, K3_MXFP4_GROUP);
+                matmul_mxfp4(edn, act, q.p2, q.s2, I, Ll, K3_MXFP4_GROUP, q.ilv);
                 memcpy(contrib + ((size_t)t * K + j) * Ll, edn, (size_t)Ll * sizeof(float));
             }
         }
@@ -820,8 +1720,6 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
         k3_mmw(sdn, sact, w->sh2, w->wdt, SI, E);
         for (int i = 0; i < E; i++) ot[i] += sdn[i];
     }
-
-    free(ridx); free(rwt); free(zz); free(contrib); free(uniq); free(seen);
 }
 
 /* --------------------------------------------------------- KDA full layer ---- */
@@ -847,11 +1745,20 @@ size_t k3_kda_scratch(const K3Cfg *c, int T)
          + (size_t)c->kda_head_dim; /* f_a output                    */
 }
 
-void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
-                  int T, float *state, float *scratch)
+static float *kda_fresh;                   /* zeroed state for the stateless form */
+
+static void kda_layer_team(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
+                           int T, float *state, float *scratch)
 {
     const int E = c->hidden, H = c->kda_heads, D = c->kda_head_dim;
     const int P = H * D, K = c->conv_k, hist = K - 1;
+
+    /* Tensor parallel: this rank owns heads [h0, h1), i.e. channels [c0, c1), and rows
+     * [e0, e1) of the output projection. Every other head's slots are left untouched. */
+    int h0, h1, e0, e1;
+    k3_tp_part(H, &h0, &h1);
+    k3_tp_part(E, &e0, &e1);
+    const int c0 = h0 * D, c1 = h1 * D;
 
     float *q  = scratch;                 float *k  = q + (size_t)T * P;
     float *v  = k + (size_t)T * P;       float *z  = v + (size_t)T * P;
@@ -860,80 +1767,119 @@ void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
     float *wr = gb + P;                  float *fa = wr + P;
 
     /* 1. projections */
+    double tp = k3_prof_t0();
     for (int t = 0; t < T; t++) {
         const float *xt = x + (size_t)t * E;
-        k3_mmw(q + (size_t)t * P, xt, w->q, w->wdt, E, P);
-        k3_mmw(k + (size_t)t * P, xt, w->k, w->wdt, E, P);
-        k3_mmw(v + (size_t)t * P, xt, w->v, w->wdt, E, P);
-        k3_mmw(bt + (size_t)t * H, xt, w->b, w->wdt, E, H);
-        /* ONE shared low-rank pair feeds every head: [E->D] then [D->H*D] */
-        k3_mmw(fa, xt, w->f_a, w->wdt, E, D);
-        k3_mmw(z + (size_t)t * P, fa, w->f_b, w->wdt, D, P);
-    }
-
-    /* 2. ShortConv with fused SiLU, carrying state across calls */
-    float *cs = state ? state + (size_t)H * D * D : NULL;
-    k3_shortconv(q, q, w->q_conv, cs ? cs : NULL, P, K, T);
-    k3_shortconv(k, k, w->k_conv, cs ? cs + (size_t)P * hist : NULL, P, K, T);
-    k3_shortconv(v, v, w->v_conv, cs ? cs + (size_t)2 * P * hist : NULL, P, K, T);
-
-    /* 3. L2Norm on q and k ONLY, per head. v is deliberately left alone. */
-    for (int t = 0; t < T; t++)
-        for (int h = 0; h < H; h++) {
-            l2norm_(q + (size_t)t * P + (size_t)h * D, D, 1e-6f);
-            l2norm_(k + (size_t)t * P + (size_t)h * D, D, 1e-6f);
+        if (w->qkv) {
+            qkv_rows(q + (size_t)t * P, k + (size_t)t * P, v + (size_t)t * P, xt, w->qkv, E, c0, c1);
+        } else {
+            mmw_rows(q + (size_t)t * P, xt, w->q, w->wdt, E, c0, c1);
+            mmw_rows(k + (size_t)t * P, xt, w->k, w->wdt, E, c0, c1);
+            mmw_rows(v + (size_t)t * P, xt, w->v, w->wdt, E, c0, c1);
         }
-
-    /* 4/5. beta and the decay chain */
-    for (int t = 0; t < T; t++) {
-        for (int h = 0; h < H; h++) bt[(size_t)t * H + h] = sigmoidf_(bt[(size_t)t * H + h]);
-        k3_kda_decay(z + (size_t)t * P, al + (size_t)t * P, z + (size_t)t * P,
-                     w->A_log, w->dt_bias, H, D, c->gate_lb);
+        mmw_rows(bt + (size_t)t * H, xt, w->b, w->wdt, E, h0, h1);
+        /* ONE shared low-rank pair feeds every head: [E->D] then [D->H*D]. The D-row f_a
+         * is recomputed on every rank rather than gathered. */
+        k3_mmw(fa, xt, w->f_a, w->wdt, E, D);
+        k3_sync();
+        mmw_rows(z + (size_t)t * P, fa, w->f_b, w->wdt, D, c0, c1);
+        if (t + 1 < T) k3_sync();           /* fa is rewritten for the next token */
     }
+    k3_prof_add(K3P_KDA_PROJ, tp);
+    tp = k3_prof_t0();
 
-    /* 6. recurrence, per head, with q pre-scaled by d_k^-0.5 */
+    /* 2. ShortConv with fused SiLU, carrying state across calls, and 4/5 the decay chain:
+     * both channel-local over the same team split as the q/k/v/f_b rows above, so every
+     * thread finishes the rows it wrote itself, with no barrier (a GEMV epilogue) */
+    float *cs = state ? state + (size_t)H * D * D : NULL;
+    shortconv_range(q, q, w->q_conv, cs, c0, c1, P, K, T);
+    shortconv_range(k, k, w->k_conv, cs ? cs + (size_t)P * hist : NULL, c0, c1, P, K, T);
+    shortconv_range(v, v, w->v_conv, cs ? cs + (size_t)2 * P * hist : NULL, c0, c1, P, K, T);
+    const int nh = h1 - h0;
+    for (int t = 0; t < T; t++) {
+        if (k3_tid() == 0)
+            for (int h = h0; h < h1; h++) bt[(size_t)t * H + h] = sigmoidf_(bt[(size_t)t * H + h]);
+        k3_kda_decay(z + (size_t)t * P + c0, al + (size_t)t * P + c0, z + (size_t)t * P + c0,
+                     w->A_log + h0, w->dt_bias + c0, nh, D, c->gate_lb);
+    }
+    k3_sync();
+
+    /* 3. L2Norm on q and k ONLY, per head (v is deliberately left alone), then q is
+     * pre-scaled by d_k^-0.5 for 6; q is dead after the recurrence, so in place. */
+    const float qscale = 1.0f / sqrtf((float)D);
+    {
+        int lo, hi;
+        k3_split(T * nh, &lo, &hi);
+        for (int th = lo; th < hi; th++) {
+            const size_t off = (size_t)(th / nh) * P + (size_t)(h0 + th % nh) * D;
+            l2norm_(q + off, D, 1e-6f);
+            l2norm_(k + off, D, 1e-6f);
+            for (int i = 0; i < D; i++) q[off + i] *= qscale;
+        }
+    }
+    k3_sync();
+
+    /* 6. recurrence, per head */
     float *S = state;
-    float *Sown = NULL;
     if (!S) {
         /* Dereferenced at a computed offset immediately below; an unchecked NULL here
          * is a wild write, not a missing result. */
-        Sown = (float *)calloc((size_t)H * D * D, sizeof(float));
-        if (!Sown) k3_fatal_oom("KDA recurrent state", (size_t)H * D * D * sizeof(float));
-        S = Sown;
+        if (k3_tid() == 0) {
+            const size_t nb = (size_t)H * D * D * sizeof(float);
+            kda_fresh = (float *)k3_scratch(K3S_KDA_STATE, nb, "KDA recurrent state");
+            memset(kda_fresh, 0, nb);
+        }
+        k3_sync();
+        S = kda_fresh;
     }
-    const float qscale = 1.0f / sqrtf((float)D);
-    /* Heads are independent: each reads and writes only its own S block, its own D-wide
-     * slice of q/k/v/al/o, and its own beta column. The recurrence is sequential in t
-     * WITHIN a head, so the loops nest head-outer here and each head walks its own t in
-     * order; per-head arithmetic is untouched and the results are bit-identical to the
-     * serial form (gated by test_ops' kda fixtures under 1 vs N threads). The recurrence
-     * is 0.4% of FLOPs but, serial, it is a majority of non-matmul wall time at high
-     * core counts. wr is a full P-wide work row, so wr + h*D gives each head a private
-     * slice with no new allocation. */
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-    for (int h = 0; h < H; h++) {
-        float *wh = wr + (size_t)h * D;
+    /* Heads are independent, and within a head so are the value columns (see
+     * kda_step_cols), so the work is split over (head, column block). Each task walks its
+     * own t in order; per-element arithmetic is untouched, so the results are
+     * bit-identical to the serial form at any thread count. 96 heads alone left a
+     * 64-thread socket with two uneven waves. */
+    const int CB = D <= K3_KDA_STEP_DV ? (D >= 64 ? 32 : D) : K3_KDA_STEP_DV;
+    const int nbc = (D + CB - 1) / CB;
+    K3_TEAM_IF(1, int lo, hi; k3_split(nh * nbc, &lo, &hi);
+    for (int task = lo; task < hi; task++) {
+        const int h = h0 + task / nbc;
+        const int j0 = (task % nbc) * CB;
+        const int j1 = (D - j0 < CB) ? D : j0 + CB;
         for (int t = 0; t < T; t++) {
             const size_t off = (size_t)t * P + (size_t)h * D;
-            for (int i = 0; i < D; i++) wh[i] = q[off + i] * qscale;
-            k3_kda_step(S + (size_t)h * D * D, o + off, wh, k + off, v + off,
-                        al + off, bt[(size_t)t * H + h], D, D);
+            kda_step_cols(S + (size_t)h * D * D, o + off, q + off, k + off, v + off,
+                          al + off, bt[(size_t)t * H + h], D, D, j0, j1);
         }
-    }
+    });
+    k3_sync();
+
+    k3_prof_add(K3P_KDA_CORE, tp);
+    tp = k3_prof_t0();
 
     /* 7/8/9. head-wise RMSNorm, THEN the gate, THEN the output projection */
     for (int t = 0; t < T; t++) {
         const float *xt = x + (size_t)t * E;
         float *ot = o + (size_t)t * P;
-        for (int h = 0; h < H; h++)
-            k3_rmsnorm(ot + (size_t)h * D, ot + (size_t)h * D, w->o_norm, D, c->rms_eps);
-        k3_mmw(gb, xt, w->g, w->wdt, E, P);
-        for (int i = 0; i < P; i++) ot[i] *= sigmoidf_(gb[i]);
-        k3_mmw(out + (size_t)t * E, ot, w->o, w->wdt, P, E);
+        int lo, hi;
+        k3_split(nh, &lo, &hi);
+        for (int h = h0 + lo; h < h0 + hi; h++)
+            rmsnorm_serial(ot + (size_t)h * D, ot + (size_t)h * D, w->o_norm, D, c->rms_eps);
+        mmw_rows(gb, xt, w->g, w->wdt, E, c0, c1);
+        k3_sync();
+        k3_split(c1 - c0, &lo, &hi);
+        for (int i = c0 + lo; i < c0 + hi; i++) ot[i] *= sigmoidf_(gb[i]);
+        if (t + 1 < T) k3_sync();           /* gb is rewritten for the next token */
     }
-    free(Sown);
+    tp_gather_rows(o, T, P, D);
+    for (int t = 0; t < T; t++)
+        mmw_rows(out + (size_t)t * E, o + (size_t)t * P, w->o, w->wdt, P, e0, e1);
+    tp_gather_rows(out, T, E, 1);
+    k3_prof_add(K3P_KDA_OUT, tp);
+}
+
+void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
+                  int T, float *state, float *scratch)
+{
+    K3_TEAM_IF(1, kda_layer_team(out, x, w, c, T, state, scratch));
 }
 
 /* ----------------------------------------------------------- decoder layer ---- */
@@ -961,10 +1907,14 @@ size_t k3_layer_scratch(const K3Cfg *c, int T)
  * exists and why it is threaded through here rather than hidden inside k3_mla.
  *
  * kvc == NULL gives exactly the behaviour k3_decoder_layer has always had. */
-void k3_decoder_layer_inc(float *h, float *block_residual, int *n_blocks,
-                          const K3LayerW *w, const K3Cfg *c, int layer_idx,
-                          int T, float *state, float *scratch,
-                          float *kvc, float *ropec, int cached, int cap)
+enum { K3L_PRE = 1, K3L_MLP = 2, K3L_POST = 4, K3L_ALL = 7 };
+
+/* The layer as a team body: PRE is the aggregation, attention and the norms up to the
+ * MLP input, MLP the MoE or dense block, POST the final residual. */
+static void layer_team(float *h, float *block_residual, int *n_blocks,
+                       const K3LayerW *w, const K3Cfg *c, int layer_idx,
+                       int T, float *state, float *scratch,
+                       float *kvc, float *ropec, int cached, int cap, int part)
 {
     const int E = c->hidden;
     const int maxb = c->n_layers / c->attn_res_block + 2;
@@ -974,83 +1924,146 @@ void k3_decoder_layer_inc(float *h, float *block_residual, int *n_blocks,
     float *hin    = tmp  + (size_t)T * E;       /* [T][E] normalised layer input */
     float *foldA  = hin  + (size_t)T * E;       /* [E] attention aggregator      */
     float *foldM  = foldA + E;                  /* [E] mlp aggregator            */
-    float *src    = foldM + E;                  /* [maxb+1][E] source stack      */
-    float *dgu    = src + (size_t)(maxb) * E;   /* [2*dense_inter]               */
+    /* [maxb][E] after foldM is the old source stack, still reserved by k3_layer_scratch */
+    float *dgu    = foldM + E + (size_t)maxb * E; /* [2*dense_inter]             */
     float *sub    = dgu + (size_t)2 * c->dense_inter;
+    int lo, hi;
+    k3_split(E, &lo, &hi);                      /* this thread's elements of a vector */
 
-    /* The norm gain and the scoring projection collapse to ONE vector. Folding them
-     * here costs 2*hidden multiplies per layer; a real engine folds at load time. */
-    for (int i = 0; i < E; i++) {
-        foldA[i] = w->attn_res_norm[i] * w->attn_res_proj[i];
-        foldM[i] = w->mlp_res_norm[i]  * w->mlp_res_proj[i];
-    }
-
-    memcpy(pref, h, (size_t)T * E * sizeof(float));
-    int have_prefix = 1;                        /* mirrors "prefix_sum is not None" */
-
-    /* aggregation before attention, only when snapshots already exist */
-    if (*n_blocks > 0) {
-        for (int t = 0; t < T; t++) {
-            for (int b = 0; b < *n_blocks; b++)
-                memcpy(src + (size_t)b * E,
-                       block_residual + ((size_t)t * maxb + b) * E,
-                       (size_t)E * sizeof(float));
-            memcpy(src + (size_t)(*n_blocks) * E, pref + (size_t)t * E,
-                   (size_t)E * sizeof(float));
-            k3_attn_res(h + (size_t)t * E, src, foldA, *n_blocks + 1, E, c->rms_eps);
+    if (part & K3L_PRE) {
+        int nb = *n_blocks;                     /* read by all before thread 0 bumps it */
+        /* The norm gain and the scoring projection collapse to ONE vector. Folding them
+         * here costs 2*hidden multiplies per layer; a real engine folds at load time. */
+        for (int i = lo; i < hi; i++) {
+            foldA[i] = w->attn_res_norm[i] * w->attn_res_proj[i];
+            foldM[i] = w->mlp_res_norm[i]  * w->mlp_res_proj[i];
         }
-    }
 
-    /* block boundary: snapshot the running residual, then CLEAR it */
-    if (layer_idx % c->attn_res_block == 0) {
+        double tp = k3_prof_t0();
         for (int t = 0; t < T; t++)
-            memcpy(block_residual + ((size_t)t * maxb + *n_blocks) * E,
-                   pref + (size_t)t * E, (size_t)E * sizeof(float));
-        (*n_blocks)++;
-        have_prefix = 0;
-    }
+            memcpy(pref + (size_t)t * E + lo, h + (size_t)t * E + lo,
+                   (size_t)(hi - lo) * sizeof(float));
+        int have_prefix = 1;                    /* mirrors "prefix_sum is not None" */
+        k3_sync();
 
-    /* attention */
-    for (int t = 0; t < T; t++)
-        k3_rmsnorm(hin + (size_t)t * E, h + (size_t)t * E, w->in_norm, E, c->rms_eps);
-    if (w->kda) k3_kda_layer(tmp, hin, w->kda, c, T, state, sub);
-    else        k3_mla_cached(tmp, hin, w->mla, c, T, sub, kvc, ropec, cached, cap);
-
-    if (have_prefix) for (size_t i = 0; i < (size_t)T * E; i++) pref[i] += tmp[i];
-    else             { memcpy(pref, tmp, (size_t)T * E * sizeof(float)); have_prefix = 1; }
-
-    /* aggregation before the MLP. NO emptiness guard in the reference. */
-    for (int t = 0; t < T; t++) {
-        for (int b = 0; b < *n_blocks; b++)
-            memcpy(src + (size_t)b * E,
-                   block_residual + ((size_t)t * maxb + b) * E,
-                   (size_t)E * sizeof(float));
-        memcpy(src + (size_t)(*n_blocks) * E, pref + (size_t)t * E,
-               (size_t)E * sizeof(float));
-        k3_attn_res(h + (size_t)t * E, src, foldM, *n_blocks + 1, E, c->rms_eps);
-    }
-
-    for (int t = 0; t < T; t++)
-        k3_rmsnorm(hin + (size_t)t * E, h + (size_t)t * E, w->post_norm, E, c->rms_eps);
-
-    if (w->moe) {
-        int   idx[K3_MAX_TOPK]; float wt[K3_MAX_TOPK];
-        /* Prefill batches (T > 1, streamed source) fetch each unique expert once for
-         * the whole chunk; decode (T == 1) and the resident path fall straight through
-         * to k3_moe inside, byte-identical. */
-        k3_moe_prefill(tmp, hin, w->moe, c, T, idx, wt, sub);
-    } else {
+        const float *v[K3_AR_MAXSRC];
+        if (nb + 1 > K3_AR_MAXSRC) k3_fatal_bound("AttnRes sources", nb + 1, K3_AR_MAXSRC);
+        const int boundary = layer_idx % c->attn_res_block == 0;
         for (int t = 0; t < T; t++) {
-            k3_mmw(dgu, hin + (size_t)t * E, w->dense_gate, w->wdt, E, c->dense_inter);
-            k3_mmw(dgu + c->dense_inter, hin + (size_t)t * E, w->dense_up, w->wdt,
-                      E, c->dense_inter);
-            k3_situ_glu(sub, dgu, c->dense_inter, c->situ_b1, c->situ_b2);
-            k3_mmw(tmp + (size_t)t * E, sub, w->dense_down, w->wdt, c->dense_inter, E);
+            float *ht = h + (size_t)t * E;
+            double *hp = rc_parts(rc_n(E));
+            /* aggregation before attention, only when snapshots already exist; its mix
+             * leaves the chunk sums the input norm needs */
+            if (nb > 0) {
+                for (int b = 0; b < nb; b++) v[b] = block_residual + ((size_t)t * maxb + b) * E;
+                v[nb] = pref + (size_t)t * E;
+                attn_res_v(ht, v, foldA, nb + 1, E, c->rms_eps, hp);
+            } else {
+                rc_sq_team(hp, ht, E);
+            }
+            /* block boundary: snapshot the running residual, then CLEAR it */
+            if (boundary)
+                memcpy(block_residual + ((size_t)t * maxb + nb) * E + lo,
+                       pref + (size_t)t * E + lo, (size_t)(hi - lo) * sizeof(float));
+            k3_sync();
+            rms_scale(hin + (size_t)t * E, ht, w->in_norm, E, rms_inv(hp, E, c->rms_eps));
+        }
+        if (boundary) {
+            nb++;
+            if (k3_tid() == 0) *n_blocks = nb;
+            have_prefix = 0;
+        }
+        k3_prof_add(K3P_ATTNRES, tp);
+        k3_sync();
+
+        /* attention */
+        if (w->kda) kda_layer_team(tmp, hin, w->kda, c, T, state, sub);
+        else        mla_team(tmp, hin, w->mla, c, T, sub, kvc, ropec, cached, cap);
+
+        tp = k3_prof_t0();
+        for (int t = 0; t < T; t++) {
+            float *pt = pref + (size_t)t * E;
+            const float *mt = tmp + (size_t)t * E;
+            if (have_prefix) for (int i = lo; i < hi; i++) pt[i] += mt[i];
+            else             memcpy(pt + lo, mt + lo, (size_t)(hi - lo) * sizeof(float));
+        }
+        k3_sync();
+
+        /* aggregation before the MLP, whose mix leaves the chunk sums for the post norm.
+         * NO emptiness guard in the reference. */
+        for (int t = 0; t < T; t++) {
+            float *ht = h + (size_t)t * E;
+            double *hp = rc_parts(rc_n(E));
+            for (int b = 0; b < nb; b++) v[b] = block_residual + ((size_t)t * maxb + b) * E;
+            v[nb] = pref + (size_t)t * E;
+            attn_res_v(ht, v, foldM, nb + 1, E, c->rms_eps, hp);
+            k3_sync();
+            rms_scale(hin + (size_t)t * E, ht, w->post_norm, E, rms_inv(hp, E, c->rms_eps));
+        }
+        k3_prof_add(K3P_ATTNRES, tp);
+        k3_sync();
+    }
+
+    if (part & K3L_MLP) {
+        if (w->moe) {
+            int   idx[K3_MAX_TOPK]; float wt[K3_MAX_TOPK];
+            /* Prefill batches (T > 1, streamed source) fetch each unique expert once for
+             * the whole chunk; decode (T == 1) and the resident path fall straight
+             * through to k3_moe inside, byte-identical. */
+            k3_moe_prefill(tmp, hin, w->moe, c, T, idx, wt, sub);
+        } else {
+            double tp = k3_prof_t0();
+            const int DI = c->dense_inter;
+            int d0, d1, e0, e1;
+            k3_tp_part(DI, &d0, &d1);
+            k3_tp_part(E, &e0, &e1);
+            for (int t = 0; t < T; t++) {
+                int dl, dh;
+                k3_split(d1 - d0, &dl, &dh);
+                const int r0 = d0 + dl, r1 = d0 + dh;
+                mmw_part(dgu, hin + (size_t)t * E, w->dense_gate, w->wdt, E, d0, r0, r1);
+                mmw_part(dgu + DI, hin + (size_t)t * E, w->dense_up, w->wdt, E, d0, r0, r1);
+                situ_range(sub + r0, dgu + r0, dgu + DI + r0, r1 - r0, c->situ_b1, c->situ_b2);
+                const K3Seg sa = { sub, DI, 1, 0 };
+                k3_tp_gather(&sa, 1);
+                mmw_rows(tmp + (size_t)t * E, sub, w->dense_down, w->wdt, DI, e0, e1);
+                if (t + 1 < T) k3_sync();       /* sub is rewritten for the next token */
+            }
+            tp_gather_rows(tmp, T, E, 1);
+            k3_prof_add(K3P_DENSE, tp);
         }
     }
 
-    for (size_t i = 0; i < (size_t)T * E; i++) pref[i] += tmp[i];
-    memcpy(h, pref, (size_t)T * E * sizeof(float));
+    if (part & K3L_POST) {
+        double tp = k3_prof_t0();
+        for (int t = 0; t < T; t++) {
+            float *pt = pref + (size_t)t * E, *ht = h + (size_t)t * E;
+            const float *mt = tmp + (size_t)t * E;
+            for (int i = lo; i < hi; i++) { pt[i] += mt[i]; ht[i] = pt[i]; }
+        }
+        k3_prof_add(K3P_ATTNRES, tp);
+    }
+}
+
+/* One parallel region per layer rather than one per kernel: a fork costs ~12 us on a
+ * 64-core socket and a decode step used to open ~17 per layer; a barrier costs ~4. The
+ * batched prefill MoE forks per kernel itself, so that case runs between two regions. */
+void k3_decoder_layer_inc(float *h, float *block_residual, int *n_blocks,
+                          const K3LayerW *w, const K3Cfg *c, int layer_idx,
+                          int T, float *state, float *scratch,
+                          float *kvc, float *ropec, int cached, int cap)
+{
+    if (k3_in_team() || !(w->moe && moe_batched(w->moe, T))) {
+        K3_TEAM_IF(1, layer_team(h, block_residual, n_blocks, w, c, layer_idx, T, state,
+                                 scratch, kvc, ropec, cached, cap, K3L_ALL));
+        return;
+    }
+    K3_TEAM_IF(1, layer_team(h, block_residual, n_blocks, w, c, layer_idx, T, state,
+                             scratch, kvc, ropec, cached, cap, K3L_PRE));
+    layer_team(h, block_residual, n_blocks, w, c, layer_idx, T, state, scratch,
+               kvc, ropec, cached, cap, K3L_MLP);
+    K3_TEAM_IF(1, layer_team(h, block_residual, n_blocks, w, c, layer_idx, T, state,
+                             scratch, kvc, ropec, cached, cap, K3L_POST));
 }
 
 void k3_decoder_layer(float *h, float *block_residual, int *n_blocks,
@@ -1105,16 +2118,89 @@ static const float K3_E2M1[16] = {
  *     but that is a proof about the inputs. Mul-then-add is a proof about the code.
  *   - The scalar tail loop is reused verbatim for the in % 4 remainder.
  */
-void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out)
+#if defined(K3_DPBF16)
+/* bf16 activations: x rounded once per call into this thread's scratch, then
+ * vdpbf16ps (a bf16 pair per fp32 lane) with 32-element chunk c in accumulator c % 4
+ * and the v512_sum tree, so every row is summed in one fixed order. */
+static inline __m256i v512_f2bf(__m512 v)
 {
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) if (out > 64)
+    const __m512i u = _mm512_castps_si512(v);
+    const __m512i r = _mm512_add_epi32(u, _mm512_add_epi32(_mm512_set1_epi32(0x7FFF),
+                          _mm512_and_si512(_mm512_srli_epi32(u, 16), _mm512_set1_epi32(1))));
+    return _mm512_cvtepi32_epi16(_mm512_srli_epi32(r, 16));
+}
+
+static const uint16_t *xbf16(const float *x, int n)
+{
+    uint16_t *b = (uint16_t *)k3_scratch(K3S_XBF, (size_t)n * 2 + 64, "bf16 activations");
+    int i = 0;
+    for (; i + 15 < n; i += 16)
+        _mm256_storeu_si256((__m256i *)(b + i), v512_f2bf(_mm512_loadu_ps(x + i)));
+    for (; i < n; i++) b[i] = k3_f2bf(x[i]);
+    return b;
+}
+
+static inline __mmask32 v512_tail32(int n) { return n >= 32 ? 0xFFFFFFFFu : (1u << n) - 1; }
+
+#define K3_DP(a, w, x) _mm512_dpbf16_ps((a), (__m512bh)(w), (__m512bh)(x))
+
+static void dot_bf16_rows(float *y, const uint16_t *xb, const uint16_t *W, int in,
+                          int o0, int o1)
+{
+    for (int o = o0; o < o1; o++) {
+        const uint16_t *row = W + (size_t)o * in;
+        __m512 a[4] = { _mm512_setzero_ps(), _mm512_setzero_ps(),
+                        _mm512_setzero_ps(), _mm512_setzero_ps() };
+        int i = 0;
+        for (; i + 127 < in; i += 128)
+            for (int k = 0; k < 4; k++)
+                a[k] = K3_DP(a[k], _mm512_loadu_si512(row + i + 32 * k),
+                             _mm512_loadu_si512(xb + i + 32 * k));
+        for (int k = 0; i < in; i += 32, k++) {
+            const __mmask32 m = v512_tail32(in - i);
+            a[k] = K3_DP(a[k], _mm512_maskz_loadu_epi16(m, row + i),
+                         _mm512_maskz_loadu_epi16(m, xb + i));
+        }
+        y[o] = v512_sum(a);
+    }
+}
 #endif
-    for (int o = 0; o < out; o++) {
+
+static void matmul_bf16_rows(float *y, const float *x, const uint16_t *W, int in,
+                             int o0, int o1)
+{
+#if defined(K3_DPBF16)
+    if (k3_act_bf16 & K3_BF16_MM) {
+        if (o1 > o0) dot_bf16_rows(y, xbf16(x, in), W, in, o0, o1);
+        return;
+    }
+#endif
+    for (int o = o0; o < o1; o++) {
         const uint16_t *row = W + (size_t)o * in;
         int i = 0;
         double acc;
-#if defined(__AVX2__)
+#if defined(K3_AVX512)
+        {
+            /* fp32 in the shared K3_AVX512 scheme, so it equals k3_matmul on the
+             * widened values to the bit; bf16 widens to fp32 exactly by a 16-bit shift */
+            #define K3_BF16X16(p, m) _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32( \
+                                         _mm256_maskz_loadu_epi16((m), (p))), 16))
+            __m512 a[4] = { _mm512_setzero_ps(), _mm512_setzero_ps(),
+                            _mm512_setzero_ps(), _mm512_setzero_ps() };
+            for (; i + 63 < in; i += 64)
+                for (int k = 0; k < 4; k++)
+                    a[k] = _mm512_fmadd_ps(K3_BF16X16(row + i + 16 * k, 0xFFFF),
+                                           _mm512_loadu_ps(x + i + 16 * k), a[k]);
+            for (int k = 0; i < in; i += 16, k++) {
+                const __mmask16 m = v512_tail(in - i);
+                a[k] = _mm512_mask3_fmadd_ps(K3_BF16X16(row + i, m),
+                                             _mm512_maskz_loadu_ps(m, x + i), a[k], m);
+            }
+            #undef K3_BF16X16
+            y[o] = v512_sum(a);
+            continue;
+        }
+#elif defined(__AVX2__)
         {
             /* Four vector accumulators, fused. _mm256_fmadd_pd per lane is the same
              * IEEE operation as scalar fma() in double, and the reduction below is
@@ -1212,20 +2298,23 @@ void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out
     }
 }
 
+void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out)
+{
+    K3_TEAM_IF(out > 64, int lo, hi; k3_split(out, &lo, &hi);
+               matmul_bf16_rows(y, x, W, in, lo, hi));
+}
+
 /* Per-row int8 matmul for the draft model: each row is [f32 scale][int8 * in]. The int8
  * weights are widened to float, dotted with the fp32 activation, and the row's scale is
  * applied once at the end. Unlike the trunk kernels this carries NO cross-path
  * determinism contract (K3_WI8 is draft-only, and the exact model decides every emitted
  * token), so it accumulates in float with fused products and the natural AVX2 reduction,
  * which is what makes it fast. */
-void k3_matmul_q8(float *y, const float *x, const void *W, int in, int out)
+static void matmul_q8_rows(float *y, const float *x, const void *W, int in, int o0, int o1)
 {
     const unsigned char *base = (const unsigned char *)W;
     const size_t rowb = (size_t)4 + (size_t)in;
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) if (out > 64)
-#endif
-    for (int o = 0; o < out; o++) {
+    for (int o = o0; o < o1; o++) {
         const unsigned char *row = base + (size_t)o * rowb;
         float scale;
         memcpy(&scale, row, 4);
@@ -1288,6 +2377,12 @@ void k3_matmul_q8(float *y, const float *x, const void *W, int in, int out)
     }
 }
 
+void k3_matmul_q8(float *y, const float *x, const void *W, int in, int out)
+{
+    K3_TEAM_IF(out > 64, int lo, hi; k3_split(out, &lo, &hi);
+               matmul_q8_rows(y, x, W, in, lo, hi));
+}
+
 /* A whole BYTE to its two E2M1 values, so the inner loop does one 8-byte load instead
  * of masking, shifting and two separate lookups. 2 KB, built once, shared by all
  * threads after initialisation.
@@ -1331,10 +2426,31 @@ static const uint8_t K3_E2M1_B3[16] = {
  * into a vectorised body. */
 static float K3_E8M0[256];
 static int   k3_e8m0_ready = 0;
+#if defined(K3_AVX512)
+/* Every E2M1 code times every E8M0 scale, formed as k3_mxfp4_dequant forms it:
+ * [scale][code], 16 KB. A NaN scale gives signed zeros, as dequantised. */
+static float K3_MXTAB[256][16];
+#define K3_MXPF   512       /* packed bytes prefetched ahead; measured 0..4096 */
+#define K3_MXPF_S 8         /* scale rows prefetched ahead */
+#endif
+#if defined(K3_DPBF16)
+/* The same products as bf16, exact (3 mantissa bits), each code twice so vpermw may
+ * see the next nibble's low bit as index bit 4: [scale][32], 16 KB. */
+static uint16_t K3_MXTAB16[256][32];
+#endif
 
 static void k3_e8m0_init(void)
 {
     for (int b = 0; b < 256; b++) K3_E8M0[b] = (b == 255) ? 0.0f : ldexpf(1.0f, b - 127);
+#if defined(K3_AVX512)
+    for (int b = 0; b < 256; b++)
+        for (int code = 0; code < 16; code++)
+            K3_MXTAB[b][code] = K3_E2M1[code] * K3_E8M0[b];
+#endif
+#if defined(K3_DPBF16)
+    for (int b = 0; b < 256; b++)
+        for (int j = 0; j < 32; j++) K3_MXTAB16[b][j] = k3_f2bf(K3_E2M1[j & 15] * K3_E8M0[b]);
+#endif
     k3_e8m0_ready = 1;
 }
 
@@ -1377,8 +2493,7 @@ static void k3_e8m0_init(void)
  * 1e-6 against dequantise-then-matmul on real checkpoint weights, gated by
  * tests/unit/test_expert.c. The margin is nine orders of magnitude.
  */
-void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
-                     const unsigned char *scales, int in, int rows, int group)
+static void mxfp4_check(int in, int group)
 {
     if (in & 1) {
         fprintf(stderr,
@@ -1399,15 +2514,24 @@ void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
                 group);
         abort();
     }
-
-    const int pcols = in / 2;                     /* two elements per byte */
-    const int ngrp  = (in + group - 1) / group;
-    const int gbyte = group / 2;
-
 #if !defined(__AVX2__)
     if (!k3_pair_ready)  k3_pair_init();
 #endif
     if (!k3_e8m0_ready)  k3_e8m0_init();
+}
+
+/* Rows [r0, r1) of y = W x. xd is x widened to double, or NULL. packed/scales start at
+ * row rbase (0 for a whole matrix, the slice start for a tensor-parallel slice); y is
+ * indexed by absolute row. Every row is computed exactly the same way whoever calls
+ * this and however the rows are split. */
+static void mxfp4_rows(float *y, const float *x, const double *xd,
+                       const unsigned char *packed, const unsigned char *scales,
+                       int in, int r0, int r1, int rbase, int group, int ilv);
+
+static void matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
+                         const unsigned char *scales, int in, int rows, int group, int ilv)
+{
+    mxfp4_check(in, group);
 
     /* WIDEN x ONCE, NOT ONCE PER ROW. The accumulators are double, so every row used to
      * re-run the same `in` float-to-double conversions -- 3072 rows x 3584 elements is
@@ -1417,19 +2541,207 @@ void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
      * BIT-IDENTICAL: float to double is exact (24 mantissa bits into 53), so the widened
      * copy holds precisely what _mm256_cvtps_pd produced in place.
      *
-     * Read-only and shared by every thread, so one copy serves the whole parallel
-     * region. At the K3 shapes it is 28 KB, which stays in L2 while the packed weights
-     * stream past it. NULL is a valid state: the group loop then widens into a small
-     * stack buffer instead, so an allocation failure costs speed and nothing else. */
-    double *const xd = (double *)malloc((size_t)in * sizeof(double));
-    if (xd) for (int i = 0; i < in; i++) xd[i] = (double)x[i];
-
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) if (rows > 64)
+     * Read-only, one persistent copy per thread: at the K3 shapes it is 28 KB, which
+     * stays in L2 while the packed weights stream past it. The fp32 AVX-512 path reads
+     * x itself. */
+#if defined(K3_AVX512)
+    K3_TEAM_IF(rows > 64, int lo, hi; k3_split(rows, &lo, &hi);
+               mxfp4_rows(y, x, NULL, packed, scales, in, lo, hi, 0, group, ilv));
+#else
+    K3_TEAM_IF(rows > 64,
+        double *const xd = (double *)k3_scratch(K3S_MXFP4_XD, (size_t)in * sizeof(double),
+                                                "MXFP4 widened input");
+        for (int i = 0; i < in; i++) xd[i] = (double)x[i];
+        int lo, hi;
+        k3_split(rows, &lo, &hi);
+        mxfp4_rows(y, x, xd, packed, scales, in, lo, hi, 0, group, ilv));
 #endif
-    for (int r = 0; r < rows; r++) {
-        const unsigned char *pr = packed + (size_t)r * pcols;
-        const unsigned char *sr = scales + (size_t)r * ngrp;
+}
+
+void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
+                     const unsigned char *scales, int in, int rows, int group)
+{
+    matmul_mxfp4(y, x, packed, scales, in, rows, group, K3_MX_CKPT);
+}
+
+void k3_matmul_mxfp4_ilv(float *y, const float *x, const unsigned char *packed,
+                         const unsigned char *scales, int in, int rows, int group,
+                         int layout)
+{
+    matmul_mxfp4(y, x, packed, scales, in, rows, group, layout);
+}
+
+int k3_mxfp4_interleave(unsigned char *packed, int rows, int in, int group, int layout)
+{
+    if ((in & 1) || (group & (group - 1))) return 0;
+#if defined(K3_AVX512)
+    if (layout == K3_MX_F32 && (group & 15) == 0) {
+        const size_t pcols = (size_t)in / 2;
+        for (int r = 0; r < rows; r++)
+            for (int b = 0; b + 127 < in; b += 128) {
+                unsigned char *p = packed + r * pcols + b / 2, t[64] = { 0 };
+                for (int e = 0; e < 128; e++) {
+                    const int code = (p[e >> 1] >> ((e & 1) * 4)) & 15, s = e >> 4, l = e & 15;
+                    t[4 * l + (s >> 1)] |= (unsigned char)(code << ((s & 1) * 4));
+                }
+                memcpy(p, t, 64);
+            }
+        return 1;
+    }
+#endif
+#if defined(K3_DPBF16)
+    if (layout == K3_MX_BF16 && (group & 31) == 0) {
+        const size_t pcols = (size_t)in / 2;
+        for (int r = 0; r < rows; r++)
+            for (int b = 0; b + 127 < in; b += 128) {
+                unsigned char *p = packed + r * pcols + b / 2, t[64] = { 0 };
+                for (int e = 0; e < 128; e++) {
+                    const int code = (p[e >> 1] >> ((e & 1) * 4)) & 15, s = e >> 5, m = e & 31;
+                    t[2 * m + (s >> 1)] |= (unsigned char)(code << ((s & 1) * 4));
+                }
+                memcpy(p, t, 64);
+            }
+        return 1;
+    }
+#endif
+    (void)packed; (void)rows; (void)layout;
+    return 0;
+}
+
+#if defined(K3_DPBF16)
+/* 32 codes from checkpoint order starting at element i (n <= 32 of them) as bf16 */
+static inline __m512i mx_chunk_ckpt(const unsigned char *pr, const unsigned char *sr,
+                                    int i, int n, int group)
+{
+    uint16_t t[32] = { 0 };
+    for (int e = 0; e < n; e++) {
+        const int j = i + e;
+        t[e] = K3_MXTAB16[sr[j / group]][(pr[j >> 1] >> ((j & 1) * 4)) & 15];
+    }
+    return _mm512_loadu_si512(t);
+}
+
+/* MXFP4 x bf16 activations. K3_MX_BF16 blocks: one 64-byte load is 128 codes, then per
+ * 32 one shift, one vpermw into the group's table and one vdpbf16ps. */
+static void mxfp4_rows_bf16(float *y, const uint16_t *xb, const unsigned char *packed,
+                            const unsigned char *scales, int in, int r0, int r1,
+                            int rbase, int group, int ilv)
+{
+    const int pcols = in / 2, ngrp = (in + group - 1) / group;
+    const int gsh = __builtin_ctz((unsigned)group);
+    for (int r = r0; r < r1; r++) {
+        const unsigned char *pr = packed + (size_t)(r - rbase) * pcols;
+        const unsigned char *sr = scales + (size_t)(r - rbase) * ngrp;
+        __m512 a[4] = { _mm512_setzero_ps(), _mm512_setzero_ps(),
+                        _mm512_setzero_ps(), _mm512_setzero_ps() };
+        int i = 0;
+        if (ilv == K3_MX_BF16) {
+            _mm_prefetch((const char *)(sr + K3_MXPF_S * ngrp), _MM_HINT_T0);
+            _mm_prefetch((const char *)(sr + K3_MXPF_S * ngrp + ngrp - 1), _MM_HINT_T0);
+            for (; i + 127 < in; i += 128) {
+                const __m512i w = _mm512_loadu_si512((const void *)(pr + (i >> 1)));
+                _mm_prefetch((const char *)(pr + (i >> 1)) + K3_MXPF, _MM_HINT_T0);
+                for (int s = 0; s < 4; s++) {
+                    const int j = i + 32 * s;
+                    const __m512i v = _mm512_permutexvar_epi16(_mm512_srli_epi16(w, 4 * s),
+                                          _mm512_loadu_si512(K3_MXTAB16[sr[j >> gsh]]));
+                    a[s] = K3_DP(a[s], v, _mm512_loadu_si512(xb + j));
+                }
+            }
+        }
+        for (; i < in; i += 32) {
+            const int n = in - i < 32 ? in - i : 32;
+            a[(i >> 5) & 3] = K3_DP(a[(i >> 5) & 3], mx_chunk_ckpt(pr, sr, i, n, group),
+                                    _mm512_maskz_loadu_epi16(v512_tail32(n), xb + i));
+        }
+        y[r] = v512_sum(a);
+    }
+}
+#endif
+
+static void mxfp4_rows(float *y, const float *x, const double *xd,
+                       const unsigned char *packed, const unsigned char *scales,
+                       int in, int r0, int r1, int rbase, int group, int ilv)
+{
+    const int bfm = (k3_act_bf16 & K3_BF16_MX) != 0;
+    if (ilv != K3_MX_CKPT && ilv != (bfm ? K3_MX_BF16 : K3_MX_F32)) {
+        fprintf(stderr, "k3: FATAL, MXFP4 rows in layout %d, which the %s mode does not "
+                        "decode\n", ilv, bfm ? "bf16" : "fp32");
+        abort();
+    }
+#if defined(K3_DPBF16)
+    if (bfm) {
+        if (r1 > r0)
+            mxfp4_rows_bf16(y, xbf16(x, in), packed, scales, in, r0, r1, rbase, group, ilv);
+        return;
+    }
+#endif
+    const int pcols = in / 2;                     /* two elements per byte */
+    const int ngrp  = (in + group - 1) / group;
+    const int gbyte = group / 2;
+
+#if defined(K3_AVX512)
+    /* fp32 in the shared K3_AVX512 scheme, so it equals dequantise-then-k3_matmul to
+     * the bit. 8 packed bytes become 16 dword codes in element order: each byte is
+     * doubled, widened, and the odd lanes shifted down a nibble (vpermps reads only the
+     * low 4 bits), then vpermps looks them up in the group scale's table. */
+    if ((group & 15) == 0 && (group & (group - 1)) == 0) {
+        const __m512i nsh = _mm512_setr_epi32(0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4, 0, 4);
+        const int gsh = __builtin_ctz((unsigned)group);
+        #define K3_MX16(b, s) _mm512_permutexvar_ps(_mm512_srlv_epi32( \
+                _mm512_cvtepu8_epi32(_mm_unpacklo_epi8((b), (b))), nsh), \
+                _mm512_loadu_ps(K3_MXTAB[(s)]))
+        for (int r = r0; r < r1; r++) {
+            const unsigned char *pr = packed + (size_t)(r - rbase) * pcols;
+            const unsigned char *sr = scales + (size_t)(r - rbase) * ngrp;
+            __m512 a[4] = { _mm512_setzero_ps(), _mm512_setzero_ps(),
+                            _mm512_setzero_ps(), _mm512_setzero_ps() };
+            int i = 0;
+            /* interleaved: 128 codes per 64-byte load, one shift + one vpermps per 16
+             * (vpermps ignores the upper index bits), no widening; chunk s of a block
+             * still lands in a[s & 3], so the sums are the checkpoint-order ones */
+            if (ilv == K3_MX_F32) {
+                /* expert streams are short, so do not wait for the hardware prefetcher */
+                _mm_prefetch((const char *)(sr + K3_MXPF_S * ngrp), _MM_HINT_T0);
+                _mm_prefetch((const char *)(sr + K3_MXPF_S * ngrp + ngrp - 1), _MM_HINT_T0);
+                for (; i + 127 < in; i += 128) {
+                    const __m512i w = _mm512_loadu_si512((const void *)(pr + (i >> 1)));
+                    _mm_prefetch((const char *)(pr + (i >> 1)) + K3_MXPF, _MM_HINT_T0);
+                    for (int s = 0; s < 8; s++) {
+                        const int j = i + 16 * s;
+                        a[s & 3] = _mm512_fmadd_ps(
+                            _mm512_permutexvar_ps(_mm512_srli_epi32(w, 4 * s),
+                                                  _mm512_loadu_ps(K3_MXTAB[sr[j >> gsh]])),
+                            _mm512_loadu_ps(x + j), a[s & 3]);
+                    }
+                }
+            }
+            for (; i + 63 < in; i += 64)
+                for (int k = 0; k < 4; k++) {
+                    const int j = i + 16 * k;
+                    const __m128i b = _mm_loadl_epi64((const __m128i *)(pr + (j >> 1)));
+                    a[k] = _mm512_fmadd_ps(K3_MX16(b, sr[j >> gsh]), _mm512_loadu_ps(x + j), a[k]);
+                }
+            for (int k = 0; i < in; i += 16, k++) {
+                const __mmask16 m = v512_tail(in - i);
+                const __m128i b = _mm_maskz_loadu_epi8(v512_tail((in - i + 1) >> 1), pr + (i >> 1));
+                a[k] = _mm512_mask3_fmadd_ps(K3_MX16(b, sr[i >> gsh]),
+                                             _mm512_maskz_loadu_ps(m, x + i), a[k], m);
+            }
+            y[r] = v512_sum(a);
+        }
+        #undef K3_MX16
+        return;
+    }
+#endif
+    if (ilv) {
+        fprintf(stderr, "k3: FATAL, interleaved MXFP4 rows without their kernel\n");
+        abort();
+    }
+
+    for (int r = r0; r < r1; r++) {
+        const unsigned char *pr = packed + (size_t)(r - rbase) * pcols;
+        const unsigned char *sr = scales + (size_t)(r - rbase) * ngrp;
         double acc = 0.0;
 
 #if defined(__AVX2__)
@@ -1780,8 +3092,6 @@ void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
         }
         y[r] = (float)acc;
     }
-
-    free(xd);                                     /* free(NULL) is a no-op */
 }
 
 void k3_mxfp4_dequant(float *out, const unsigned char *packed,

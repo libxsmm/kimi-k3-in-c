@@ -63,11 +63,13 @@
 #include "k3.h"
 #include "k3_bind.h"
 #include "k3_cache.h"
+#include "k3_resident.h"
 #include "k3_trunk.h"
 #include "k3_tok.h"   /* text in/out; the --ids path never touches it */
 #include "k3_chat.h"
 #include "k3_sampler.h"
 #include "k3_cfg.h"   /* read the checkpoint's own config rather than assuming it */
+#include "k3_mpi.h"   /* tensor parallelism; no-ops unless built with MPI=1 */
 
 static double now_s(void)
 {
@@ -363,6 +365,11 @@ static void usage(FILE *f)
 "                        the reader run a layer further ahead and costs one more slot\n"
 "                        of RAM; the budget still wins if it does not fit\n"
 "  --cache-gb X          routed-expert cache budget\n"
+"  --experts-resident    load EVERY routed expert of the bound layers into RAM up\n"
+"                        front instead of streaming them through the cache\n"
+"  --bf16-act            round matmul inputs to bf16, bf16 dot products with fp32\n"
+"                        accumulation, bf16 TP gathers (router scores stay fp32).\n"
+"                        Faster, NOT the exact engine\n"
 "  --ultra-low-memory    stream embedding rows and lm_head chunks, and reuse one\n"
 "                        recurrent-state slot during full recompute; needs --trunk\n"
 "\n"
@@ -545,6 +552,8 @@ typedef struct {
     int         *mla_slot;   /* [n_layers] -> dense MLA index, or -1 */
     int          n_mla, kv_cap, cached;
     int          draft_mode;   /* 1 for the hybrid draft: cache-only expert routing */
+    K3ExpertSrc *esrc;         /* when set, experts come from here instead of the cache */
+    double      *layer_s;      /* [n_bound] per-layer wall time, filled when profiling */
 } Weights;
 
 /* One full forward over T tokens, writing logits for the LAST position only. Every
@@ -567,6 +576,7 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
     const int P = c->kda_heads * c->kda_head_dim;
     const size_t kper = (size_t)P * c->kda_head_dim + (size_t)3 * P * (c->conv_k - 1);
 
+    double tp = k3_prof_t0();
     for (int t = 0; t < T; t++) {
         if (w->ultra) {
             if (k3_model_stream_embed_row(&w->ms, h + (size_t)t * E, ids[t]) != 0) {
@@ -578,6 +588,7 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
             k3_embed_row(h + (size_t)t * E, w->mb.embed, w->mb.wdt, ids[t], E);
         }
     }
+    k3_prof_add(K3P_EMBED, tp);
 
     memset(br, 0, (size_t)T * maxb * E * sizeof(float));
     /* Incremental decode carries the KDA recurrent matrix and ShortConv history across
@@ -590,6 +601,7 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
     w->layers_completed = 0;
     int nb = 0;
     for (int L = 0; L < w->n_bound; L++) {
+        const double t_layer = k3_prof_on ? k3_prof_now() : 0.0;
         /* Streaming: bring this layer in, and hint the next one so its read overlaps
          * this layer's arithmetic. The order is fixed 0..92 every token, so the hint is
          * never wrong. */
@@ -603,7 +615,7 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
         /* Point this layer's MoE at the cache before use. Doing it here rather than at
          * bind time keeps K3LayerBind independent of any particular cache. */
         if (w->lay[L].lay.moe) {
-            w->lay[L].moe.src = &cache->src;
+            w->lay[L].moe.src = w->esrc ? w->esrc : &cache->src;
             w->lay[L].moe.layer = L;
             /* The draft routes only among resident experts, reading zero new expert bytes;
              * the exact model keeps true routing. This is what makes a draft step cheap. */
@@ -638,8 +650,10 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
             return -1;
         }
         w->layers_completed = L + 1;
+        if (k3_prof_on && w->layer_s) w->layer_s[L] += k3_prof_now() - t_layer;
     }
 
+    tp = k3_prof_t0();
     /* The model-level aggregator, beyond the two per layer. Exactly one pair exists in
      * the checkpoint; skipping it is silent. */
     if (w->mb.out_res_norm && w->mb.out_res_proj) {
@@ -662,19 +676,21 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
             if (w->ultra) {
                 if (k3_model_stream_project(&w->ms, logits_last, nrm) != 0) return -1;
             } else {
-                k3_mmw(logits_last, nrm, w->mb.lm_head, w->mb.wdt, E, c->vocab);
+                k3_mmw_tp(logits_last, nrm, w->mb.lm_head, w->mb.wdt, E, c->vocab);
             }
             arg_all[t] = argmax_(logits_last, c->vocab);
         }
         /* logits_last now holds the FINAL position's vector, same as the plain path. */
+        k3_prof_add(K3P_HEAD, tp);
         return 0;
     }
     k3_rmsnorm(nrm, h + (size_t)(T - 1) * E, w->mb.norm, E, c->rms_eps);
     if (w->ultra) {
         if (k3_model_stream_project(&w->ms, logits_last, nrm) != 0) return -1;
     } else {
-        k3_mmw(logits_last, nrm, w->mb.lm_head, w->mb.wdt, E, c->vocab);
+        k3_mmw_tp(logits_last, nrm, w->mb.lm_head, w->mb.wdt, E, c->vocab);
     }
+    k3_prof_add(K3P_HEAD, tp);
     return 0;
 }
 
@@ -860,7 +876,20 @@ static int chat_run(Tok *tok, const K3ChatTemplate *tmpl, K3ChatHistory *history
     }
 }
 
+static int k3_main(int argc, char **argv);
+
+/* Under MPI every rank runs the same program on the same input; all ranks compute the
+ * same tokens, and only rank 0 prints and writes files. */
 int main(int argc, char **argv)
+{
+    if (k3_mpi_init(&argc, &argv) != 0) return 2;
+    if (k3_tp.rank != 0 && !freopen("/dev/null", "w", stdout)) k3_mpi_abort(2);
+    const int rc = k3_main(argc, argv);
+    k3_mpi_finalize();
+    return rc;
+}
+
+static int k3_main(int argc, char **argv)
 {
     /* Informational flags are answered before anything else, because they must work
      * without a model directory, `k3 --help` on a machine with no checkpoint is the
@@ -907,6 +936,7 @@ int main(int argc, char **argv)
     const char *load_state = NULL, *save_state = NULL;
     const char *preset_name = NULL;
     int incremental = 0, ultra = 0, chat = 0, greedy = 0;
+    int experts_res = 0;
     int trunk_ring = 0;   /* 0 selects k3_trunk_open's default of 2 */
     K3ChatOptions chat_opts = k3_chat_options_default();
     int no_think = 0, effort_set = 0;
@@ -942,6 +972,16 @@ int main(int argc, char **argv)
             }
         }
         else if (!strcmp(argv[i], "--cache-gb") && i + 1 < argc) cache_gb = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--experts-resident")) experts_res = 1;
+        else if (!strcmp(argv[i], "--bf16-act")) {
+            if (!k3_act_bf16_supported()) {
+                fprintf(stderr, "--bf16-act: this build has no AVX512-BF16 kernels\n");
+                return 2;
+            }
+            k3_act_bf16 = K3_BF16_ALL;
+            if (getenv("K3_BF16_PARTS"))              /* experiments: a K3_BF16_* mask */
+                k3_act_bf16 = atoi(getenv("K3_BF16_PARTS")) & K3_BF16_ALL;
+        }
         else if (!strcmp(argv[i], "--layers") && i + 1 < argc) want_layers = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) { outp = argv[++i]; out_set = 1; }
         else if (!strcmp(argv[i], "--trunk") && i + 1 < argc) trunk_dir = argv[++i];
@@ -1023,6 +1063,15 @@ int main(int argc, char **argv)
                 "use deterministic serial decode\n");
         return 2;
     }
+    if (k3_tp.size > 1 && (ultra || spec_n > 0 || draft_dir || chat || load_state ||
+                           save_state)) {
+        fprintf(stderr, "tensor parallel (%d ranks) does not yet support --ultra-low-memory, "
+                        "--spec, --draft-trunk, --chat or state files\n", k3_tp.size);
+        return 2;
+    }
+    /* Each rank then binds only its own rows of every sharded matrix. A packed trunk holds
+     * whole layers, so streaming it keeps full matrices on every rank. */
+    k3_tp.local = k3_tp.size > 1 && !trunk_dir;
     if (chat && !gen_set) gen = K3_MAX_GEN;
     if ((no_think || effort_set) && !chat) {
         fprintf(stderr, "%s only applies to --chat\n", no_think ? "--no-think" : "--thinking-effort");
@@ -1366,6 +1415,9 @@ int main(int argc, char **argv)
 
     char b1[32];
     printf("Kimi K3, pure C, released checkpoint\n");
+    if (k3_tp.size > 1)
+        printf("  parallel : tensor parallel over %d ranks (output identical to 1 rank)\n",
+               k3_tp.size);
     /* The directory, not a shard count: the index has not been built yet at this point.
      * The count is printed by the "indexed N tensors from M shards" line below, once
      * k3_st_open has actually counted them. */
@@ -1417,7 +1469,8 @@ int main(int argc, char **argv)
         const double w_model = ultra
             ? (double)K3_MODEL_STREAM_CHUNK + 2.0 * K3_ST_ALIGN + 3.0 * E64 * 4
             : 2.0 * (double)c.vocab * E64 * 2 + 3.0 * E64 * 4;
-        const double w_cache = cache_gb * 1e9;
+        const double w_cache = experts_res
+            ? (double)k3_resident_bytes(&st, &c, 0, NL) / k3_tp.size : cache_gb * 1e9;
         const int Tm = np + gen + 1;
         const int mb = c.n_layers / c.attn_res_block + 2;
         const int Pp = c.kda_heads * c.kda_head_dim;
@@ -1516,17 +1569,30 @@ int main(int argc, char **argv)
         printf("embedding, final norm and lm_head: %s in %.1f s\n\n", b1, now_s() - t0);
 
     K3Cache cache;
-    if (k3_cache_init(&cache, &st, &c, (int64_t)(cache_gb * 1e9)) != 0) return 1;
+    static K3Resident res;
+    if (experts_res) {
+        /* A zeroed cache is inert: its stats, report, dumps and free all see zero slots. */
+        memset(&cache, 0, sizeof cache);
+        if (k3_resident_init(&res, &st, &c, 0, NL) != 0) return 1;
+        w.esrc = &res.src;
+    } else if (k3_cache_init(&cache, &st, &c, (int64_t)(cache_gb * 1e9)) != 0) return 1;
     {   /* The plan is a forecast. This is the outcome. */
         char rb[32];
         human(peak_rss_bytes(), rb, sizeof rb);
         printf("peak RSS after loading weights: %s  (the plan above is a forecast, "
                "this is measured)\n", rb);
     }
-    printf("expert cache: %d slots x %.2f MB = %.2f GB (%.2f%% of the 1.45 TB expert pool)\n\n",
-           cache.nslot, (double)cache.slot_bytes / 1e6,
-           (double)cache.nslot * cache.slot_bytes / 1e9,
-           100.0 * cache.nslot / (double)(92 * c.n_experts));
+    if (!experts_res)
+        printf("expert cache: %d slots x %.2f MB = %.2f GB (%.2f%% of the 1.45 TB expert pool)\n\n",
+               cache.nslot, (double)cache.slot_bytes / 1e6,
+               (double)cache.nslot * cache.slot_bytes / 1e9,
+               100.0 * cache.nslot / (double)(92 * c.n_experts));
+
+    k3_prof_on = getenv("K3_PROF") != NULL;
+    if (k3_prof_on) {
+        w.layer_s = (double *)calloc((size_t)NL, sizeof(double));
+        if (!w.layer_s) return 1;
+    }
 
     /* ---- buffers ----
      * A resumed session must hold the saved history as well as the new tokens, so the
@@ -1641,6 +1707,8 @@ int main(int argc, char **argv)
         free(w.kvc); free(w.ropec); free(w.mla_slot);
         if (w.trunk) k3_trunk_close(w.trunk);
         k3_cache_free(&cache);
+        if (experts_res) k3_resident_free(&res);
+        free(w.layer_s);
         for (int L = 0; L < w.n_bound; L++) k3_bind_free(&w.lay[L]);
         free(w.lay); k3_bind_model_free(&w.mb); k3_st_close(&st);
         free(h); free(br); free(ks); free(sc); free(lg); free(seq); free(outtok);
@@ -1748,7 +1816,7 @@ int main(int argc, char **argv)
             if (arg[i] != seq[i + 1])
                 printf("[%d p=%d a=%d] ", i, arg[i], seq[i + 1]);
         printf("\n");
-        FILE *tf = fopen(outp, "w");
+        FILE *tf = k3_tp.rank == 0 ? fopen(outp, "w") : NULL;
         if (tf) {
             fprintf(tf, "{\"tf_positions\":%d,\"tf_matches\":%d,\"tf_agreement\":%.4f}\n",
                     np - 1, match, (double)match / (np - 1));
@@ -1774,8 +1842,15 @@ int main(int argc, char **argv)
      * state are computed and can be saved with ZERO generated tokens. That is what
      * lets --gen 0 --save-state warm a reusable prefix (e.g. a chat system prompt)
      * whose recurrent state is exact rather than one generated token past the end. */
+    double prof_wall = 0.0;
+    int prof_steps = 0;
     for (int g = 0; nout < gen || (incremental && g == 0); g++) {
         k3_cache_reset_stats(&cache);
+        if (g == 1 && k3_prof_on) {   /* step 0 is prefill or cold: keep it out */
+            memset(k3_prof_s, 0, sizeof k3_prof_s);
+            k3_tp.calls = 0; k3_tp.floats = 0.0;
+            memset(w.layer_s, 0, (size_t)NL * sizeof(double));
+        }
         const double ts = now_s();
         int frc;
         int emit[K3_SPEC_MAX + 1];
@@ -1903,7 +1978,7 @@ int main(int argc, char **argv)
          * same vector from the same shards in torch, and tools/cmp_logits.py compares
          * them elementwise. That is the only check here that can see a small systematic
          * error in the final norm, the lm_head, or the model-level AttnRes. */
-        if (logits_path && g == 0) {
+        if (logits_path && g == 0 && k3_tp.rank == 0) {
             FILE *lf = fopen(logits_path, "wb");
             if (lf) {
                 fwrite(lg, sizeof(float), (size_t)c.vocab, lf);
@@ -1915,6 +1990,7 @@ int main(int argc, char **argv)
         }
         const double dt = now_s() - ts;
         t_total += dt;
+        if (g >= 1) { prof_wall += dt; prof_steps++; }
         const uint64_t req = cache.hits + cache.misses;
         printf("%-6d %-10d %-12.2f %-10.1f %-10.2f %.3f\n", g, nxt, dt,
                req ? 100.0 * cache.hits / req : 0.0,
@@ -2000,9 +2076,51 @@ int main(int argc, char **argv)
                w.layers_completed, NL, k3_expert_drops);
     }
     k3_cache_report(&cache, "final step");
+    if (experts_res) k3_resident_report(&res, "final");
 
-    FILE *f = fopen(outp, "w");
-    if (!f) {
+    if (k3_prof_on && prof_steps > 0) {
+        const double ms = 1e3 / prof_steps;
+        double phase_sum = 0.0;
+        for (int i = 0; i < K3P_N; i++) phase_sum += k3_prof_s[i];
+        printf("\nprofile: %d steps after step 0, %.2f ms/step wall\n", prof_steps,
+               prof_wall * ms);
+        for (int i = 0; i < K3P_N; i++)
+            if (k3_prof_s[i] > 0.0)
+                printf("  %-14s %9.3f ms/step  %5.1f%%\n", k3_prof_name[i],
+                       k3_prof_s[i] * ms, 100.0 * k3_prof_s[i] / prof_wall);
+        printf("  %-14s %9.3f ms/step  %5.1f%%\n", "(untimed)",
+               (prof_wall - phase_sum) * ms, 100.0 * (prof_wall - phase_sum) / prof_wall);
+        if (k3_tp.size > 1)
+            printf("  tp gathers: %.1f per step, %.0f floats per gather, %.1f us each\n",
+                   (double)k3_tp.calls / prof_steps,
+                   k3_tp.calls ? k3_tp.floats / k3_tp.calls : 0.0,
+                   k3_tp.calls ? k3_prof_s[K3P_COMM] * 1e6 / k3_tp.calls : 0.0);
+        double sum[3] = {0}; int cnt[3] = {0};    /* dense, KDA, MLA */
+        for (int L = 0; L < NL; L++) {
+            const int k = k3_is_dense(&c, L) ? 0 : (k3_is_mla(&c, L) ? 2 : 1);
+            sum[k] += w.layer_s[L]; cnt[k]++;
+        }
+        static const char *const kind[3] = { "dense", "KDA", "MLA" };
+        for (int k = 0; k < 3; k++)
+            if (cnt[k]) printf("  %-5s layers: %2d, %.3f ms/layer/step\n", kind[k], cnt[k],
+                               sum[k] * ms / cnt[k]);
+        /* Weight bytes a decode step must read: every bound layer's trunk, the top-k
+         * experts of each MoE layer, and the lm_head. Under tensor parallelism these are
+         * this rank's shares. */
+        const double share = k3_tp.local ? 1.0 / k3_tp.size : 1.0;
+        double wb = (double)c.vocab * c.hidden * 2.0 * share;
+        for (int L = 0; L < NL; L++) {
+            K3ExpertRef er;
+            if (w.lay[L].blob) wb += (double)w.lay[L].nbytes;
+            if (!k3_is_dense(&c, L) && k3_expert_ref(&st, L, 0, &er) == 0)
+                wb += (double)c.topk * (double)er.nbytes * (experts_res ? share : 1.0);
+        }
+        printf("  weights read per step %.2f GB%s -> %.1f GB/s effective\n",
+               wb / 1e9, k3_tp.local ? " per rank" : "", wb / 1e9 / (prof_wall / prof_steps));
+    }
+
+    FILE *f = k3_tp.rank == 0 ? fopen(outp, "w") : NULL;
+    if (!f && k3_tp.rank == 0) {
         fprintf(stderr, "cannot write %s\n", outp);
         out_fail = 1;
     }
@@ -2032,7 +2150,7 @@ int main(int argc, char **argv)
         fclose(f);
         printf("\nwrote %s\n", outp);
     }
-    if (trace_dir) {
+    if (trace_dir && k3_tp.rank == 0) {
         char p[4096];
         snprintf(p, sizeof p, "%s/expert_hist.json", trace_dir);
         k3_cache_dump_hist(&cache, p);
@@ -2089,6 +2207,8 @@ int main(int argc, char **argv)
     }
     if (w.trunk) { k3_trunk_report(w.trunk, "final"); k3_trunk_close(w.trunk); }
     k3_cache_free(&cache);
+    if (experts_res) k3_resident_free(&res);
+    free(w.layer_s);
     for (int L = 0; L < w.n_bound; L++) k3_bind_free(&w.lay[L]);
     free(w.lay);
     k3_model_stream_free(&w.ms);

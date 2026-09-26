@@ -547,6 +547,32 @@ int64_t k3_st_read_aligned(const K3St *s, int shard, int64_t off, int64_t nbytes
     return got >= pad + nbytes ? nbytes : (got > pad ? got - pad : 0);
 }
 
+int64_t k3_st_read_par(const K3St *s, int shard, int64_t off, int64_t nbytes,
+                       void *buf, int64_t bufcap, int64_t *payload_off)
+{
+    const int64_t CH = (int64_t)64 << 20;     /* a multiple of K3_ST_ALIGN */
+    const int64_t lo = off & ~(int64_t)(K3_ST_ALIGN - 1);
+    const int64_t end = off + nbytes;
+    const int nchunk = (int)((end - lo + CH - 1) / CH);
+    volatile int failed = 0;
+#ifdef _OPENMP
+#   pragma omp parallel for schedule(dynamic, 1)
+#endif
+    for (int ci = 0; ci < nchunk; ci++) {
+        if (failed) continue;
+        const int64_t c_off = lo + (int64_t)ci * CH;
+        const int64_t n = (end - c_off < CH) ? end - c_off : CH;
+        int64_t pad = 0;
+        const int64_t got = k3_st_read_aligned(s, shard, c_off, n,
+                                               (char *)buf + (size_t)ci * CH,
+                                               bufcap - (int64_t)ci * CH, &pad);
+        if (got != n || pad != 0) failed = 1;
+    }
+    if (failed) return 0;
+    if (payload_off) *payload_off = off - lo;
+    return nbytes;
+}
+
 int64_t k3_st_read(const K3St *s, const K3Tensor *t, void *buf)
 {
     /* One coalesced pread, looped only because the kernel may return short. This is the

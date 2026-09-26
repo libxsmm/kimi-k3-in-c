@@ -847,6 +847,213 @@ static void t_matmul_bf16(void)
     free(Wb); free(Wf); free(x); free(ya); free(yb);
 }
 
+/* Streamed MoE: k3_moe with a K3ExpertSrc must equal, bit for bit, the per-expert loop
+ * it replaced (three k3_matmul_mxfp4 calls per expert, summed in top-k order). Random
+ * MXFP4 experts, shapes chosen so the batched path splits rows into several blocks. */
+typedef struct { K3ExpertSrc src; unsigned char *mem; size_t per; int I, L; } MemExperts;
+
+static int memx_get(K3ExpertSrc *self, int layer, int e, K3ExpertQ *q)
+{
+    MemExperts *m = (MemExperts *)self;
+    (void)layer;
+    const size_t p13 = (size_t)m->I * m->L / 2, s13 = (size_t)m->I * m->L / 32;
+    unsigned char *b = m->mem + (size_t)e * m->per;
+    q->p1 = b;                  q->s1 = b + p13;
+    q->p3 = b + p13 + s13;      q->s3 = q->p3 + p13;
+    q->p2 = q->s3 + s13;        q->s2 = q->p2 + p13;
+    q->ilv = 0;
+    return 0;
+}
+
+static void t_moe_streamed(void)
+{
+    K3Cfg c; memset(&c, 0, sizeof c);
+    c.hidden = 96; c.latent = 128; c.moe_inter = 160; c.n_experts = 12; c.topk = 5;
+    c.n_shared = 1; c.moe_renorm = 1; c.routed_scale = 1.0f; c.latent_norm = 1;
+    c.rms_eps = 1e-5f; c.situ_b1 = 4.0f; c.situ_b2 = 25.0f;
+    const int E = c.hidden, L = c.latent, I = c.moe_inter, NE = c.n_experts, T = 3;
+    const size_t per = 3 * ((size_t)I * L / 2 + (size_t)I * L / 32);
+
+    unsigned s = 0xBADC0DEu;
+#define RNG() (s ^= s << 13, s ^= s >> 17, s ^= s << 5, s)
+    MemExperts mx; memset(&mx, 0, sizeof mx);
+    mx.src.get = memx_get; mx.per = per; mx.I = I; mx.L = L;
+    mx.mem = (unsigned char *)malloc(per * NE);
+    for (size_t i = 0; i < per * NE; i++) mx.mem[i] = (unsigned char)(RNG() >> 11);
+    for (int e = 0; e < NE; e++) {                  /* keep scales in a sane range */
+        K3ExpertQ q; memx_get(&mx.src, 0, e, &q);
+        unsigned char *sc[3] = { (unsigned char *)q.s1, (unsigned char *)q.s3,
+                                 (unsigned char *)q.s2 };
+        for (int m = 0; m < 3; m++)
+            for (int i = 0; i < I * L / 32; i++) sc[m][i] = (unsigned char)(120 + RNG() % 8);
+    }
+    float *fv = (float *)malloc(sizeof(float) * ((size_t)NE * E + NE + L + 2 * (size_t)L * E
+                                                 + 3 * (size_t)I * E + (size_t)T * E));
+    float *gate = fv, *bias = gate + NE * E, *lnorm = bias + NE, *down = lnorm + L;
+    float *up = down + (size_t)L * E, *sh = up + (size_t)E * L, *x = sh + 3 * (size_t)I * E;
+    for (size_t i = 0; i < (size_t)NE * E + NE + L + 2 * (size_t)L * E + 3 * (size_t)I * E
+                           + (size_t)T * E; i++)
+        fv[i] = ((float)(RNG() >> 8) / 8388608.0f - 1.0f) * 0.2f;
+    for (int i = 0; i < L; i++) lnorm[i] += 1.0f;
+
+    K3MoeW w; memset(&w, 0, sizeof w);
+    w.gate = gate; w.bias = bias; w.latent_norm = lnorm; w.down = down; w.up = up;
+    w.sh1 = sh; w.sh3 = sh + (size_t)I * E; w.sh2 = sh + 2 * (size_t)I * E;
+    w.src = &mx.src;
+
+    float *got = (float *)malloc(sizeof(float) * T * E);
+    float *want = (float *)malloc(sizeof(float) * T * E);
+    float *sc = (float *)malloc(k3_moe_scratch(&c) * sizeof(float));
+    int idx[K3_MAX_TOPK]; float wt[K3_MAX_TOPK];
+    k3_moe(got, x, &w, &c, T, idx, wt, sc);
+
+    float *z = (float *)malloc(sizeof(float) * (3 * (size_t)L + 6 * (size_t)I + E));
+    float *acc = z + L, *edn = acc + L, *gu = edn + L, *act = gu + 2 * I;
+    float *sgu = act + I, *sdn = sgu + 2 * I + I;
+    for (int t = 0; t < T; t++) {
+        const float *xt = x + (size_t)t * E;
+        float *ot = want + (size_t)t * E;
+        k3_router(idx, wt, xt, gate, bias, E, NE, c.topk, c.moe_renorm, c.routed_scale);
+        k3_matmul(z, xt, down, E, L);
+        for (int i = 0; i < L; i++) acc[i] = 0.0f;
+        for (int j = 0; j < c.topk; j++) {
+            K3ExpertQ q; memx_get(&mx.src, 0, idx[j], &q);
+            k3_matmul_mxfp4(gu,     z, q.p1, q.s1, L, I, K3_MXFP4_GROUP);
+            k3_matmul_mxfp4(gu + I, z, q.p3, q.s3, L, I, K3_MXFP4_GROUP);
+            k3_situ_glu(act, gu, I, c.situ_b1, c.situ_b2);
+            k3_matmul_mxfp4(edn, act, q.p2, q.s2, I, L, K3_MXFP4_GROUP);
+            for (int i = 0; i < L; i++) acc[i] += wt[j] * edn[i];
+        }
+        k3_rmsnorm(acc, acc, lnorm, L, c.rms_eps);
+        k3_matmul(ot, acc, up, L, E);
+        k3_matmul(sgu, xt, w.sh1, E, I);
+        k3_matmul(sgu + I, xt, w.sh3, E, I);
+        k3_situ_glu(sgu + 2 * I, sgu, I, c.situ_b1, c.situ_b2);
+        k3_matmul(sdn, sgu + 2 * I, w.sh2, I, E);
+        for (int i = 0; i < E; i++) ot[i] += sdn[i];
+    }
+#undef RNG
+    const int same = memcmp(got, want, sizeof(float) * T * E) == 0;
+    if (same) { printf("  PASS  moe_streamed  n=%d    bit-identical to the per-expert loop\n", T * E); g_pass++; }
+    else      { printf("  FAIL  moe_streamed  batched experts differ from the per-expert loop\n"); g_fail++; }
+    free(mx.mem); free(fv); free(got); free(want); free(sc); free(z);
+}
+
+/* Interleaved MXFP4 rows must give k3_matmul_mxfp4's result bit for bit; `in` has full
+ * 128-blocks, a 64-chunk and a 16 tail so every kernel section runs. */
+static void t_mxfp4_ilv(void)
+{
+    const int in = 3 * 128 + 64 + 48, rows = 97, G = K3_MXFP4_GROUP;
+    const size_t pb = (size_t)rows * in / 2, sb = (size_t)rows * ((in + G - 1) / G);
+    unsigned char *P = (unsigned char *)malloc(pb), *Q = (unsigned char *)malloc(pb);
+    unsigned char *S = (unsigned char *)malloc(sb);
+    float *x = (float *)malloc(in * sizeof(float));
+    float *ya = (float *)malloc(rows * sizeof(float)), *yb = (float *)malloc(rows * sizeof(float));
+    unsigned s = 0x5EEDu;
+#define RNG() (s ^= s << 13, s ^= s >> 17, s ^= s << 5, s)
+    for (size_t i = 0; i < pb; i++) P[i] = (unsigned char)(RNG() >> 9);
+    for (size_t i = 0; i < sb; i++) S[i] = (unsigned char)(118 + RNG() % 12);
+    for (int i = 0; i < in; i++) x[i] = (float)(RNG() >> 8) / 8388608.0f - 1.0f;
+#undef RNG
+    memcpy(Q, P, pb);
+    k3_matmul_mxfp4(ya, x, P, S, in, rows, G);
+    int ok;
+    if (k3_mxfp4_interleave(Q, rows, in, G, K3_MX_F32)) {
+        k3_matmul_mxfp4_ilv(yb, x, Q, S, in, rows, G, K3_MX_F32);
+        ok = memcmp(ya, yb, rows * sizeof(float)) == 0 && memcmp(P, Q, pb) != 0;
+        printf("  %s  mxfp4_ilv     n=%d    interleaved rows %s\n", ok ? "PASS" : "FAIL",
+               rows, ok ? "bit-identical to checkpoint order" : "DIFFER");
+    } else {
+        ok = memcmp(P, Q, pb) == 0;
+        printf("  %s  mxfp4_ilv     no interleaved kernel in this build, bytes %s\n",
+               ok ? "PASS" : "FAIL", ok ? "untouched" : "CHANGED");
+    }
+    if (ok) g_pass++; else g_fail++;
+
+    /* bf16 activations: both layouts agree to the bit, and both are the fp32 product
+     * of the dequantised weights with x rounded to bf16, up to fp32 summation order */
+    if (k3_act_bf16_supported()) {
+        float *W = (float *)malloc((size_t)rows * in * sizeof(float));
+        float *xr = (float *)malloc(in * sizeof(float));
+        float *yc = (float *)malloc(rows * sizeof(float));
+        k3_mxfp4_dequant(W, P, S, rows, in / 2, G);
+        for (int i = 0; i < in; i++) {
+            union { float f; uint32_t u; } v = { x[i] };
+            v.u = (v.u + 0x7FFFu + ((v.u >> 16) & 1u)) & 0xFFFF0000u;
+            xr[i] = v.f;
+        }
+        k3_matmul(yc, xr, W, in, rows);
+        memcpy(Q, P, pb);
+        k3_act_bf16 = K3_BF16_ALL;
+        k3_matmul_mxfp4(ya, x, P, S, in, rows, G);
+        const int lay = k3_mxfp4_interleave(Q, rows, in, G, K3_MX_BF16);
+        if (lay) k3_matmul_mxfp4_ilv(yb, x, Q, S, in, rows, G, K3_MX_BF16);
+        k3_act_bf16 = 0;
+        double worst = 0.0;
+        for (int r = 0; r < rows; r++) {
+            const double d = fabs((double)ya[r] - yc[r]) / (fabs((double)yc[r]) + 1e-3);
+            if (d > worst) worst = d;
+        }
+        ok = lay && memcmp(ya, yb, rows * sizeof(float)) == 0 && worst < 1e-5;
+        printf("  %s  mxfp4_bf16    n=%d    layouts %s, rel diff to fp32 of bf16 x %.1e\n",
+               ok ? "PASS" : "FAIL", rows, lay && !memcmp(ya, yb, rows * sizeof(float))
+               ? "bit-identical" : "DIFFER", worst);
+        if (ok) g_pass++; else g_fail++;
+        free(W); free(xr); free(yc);
+    }
+    free(P); free(Q); free(S); free(x); free(ya); free(yb);
+}
+
+/* bf16 activations on bf16 weights: the fp32 matmul of the same weights with x rounded
+ * to bf16, up to fp32 summation order; the one-rank gather rounds the same way. */
+static void t_bf16_act(void)
+{
+    if (!k3_act_bf16_supported()) {
+        printf("  PASS  bf16_act      not built with AVX512-BF16, mode unavailable\n");
+        g_pass++;
+        return;
+    }
+    const int in = 7168 + 40, out = 77;
+    uint16_t *Wb = (uint16_t *)malloc((size_t)in * out * sizeof(uint16_t));
+    float *Wf = (float *)malloc((size_t)in * out * sizeof(float));
+    float *x = (float *)malloc(in * sizeof(float)), *xr = (float *)malloc(in * sizeof(float));
+    float *ya = (float *)malloc(out * sizeof(float)), *yb = (float *)malloc(out * sizeof(float));
+    unsigned s = 0xB16Fu;
+#define RNG() (s ^= s << 13, s ^= s >> 17, s ^= s << 5, s)
+    for (size_t i = 0; i < (size_t)in * out; i++) {
+        union { float f; uint32_t u; } v = { (float)(RNG() >> 8) / 8388608.0f - 1.0f };
+        Wb[i] = (uint16_t)(v.u >> 16);
+        Wf[i] = k3_bf16f(Wb[i]);
+    }
+    for (int i = 0; i < in; i++) {
+        union { float f; uint32_t u; } v = { (float)(RNG() >> 8) / 8388608.0f - 1.0f };
+        x[i] = v.f;
+        v.u = (v.u + 0x7FFFu + ((v.u >> 16) & 1u)) & 0xFFFF0000u;
+        xr[i] = v.f;
+    }
+#undef RNG
+    k3_matmul(ya, xr, Wf, in, out);
+    k3_act_bf16 = K3_BF16_ALL;
+    k3_matmul_bf16(yb, x, Wb, in, out);
+    float g[5] = { x[0], x[1], x[2], x[3], x[4] };
+    const K3Seg sg = { g, 5, 1, 0 };
+    k3_tp_gather(&sg, 1);
+    k3_act_bf16 = 0;
+    double worst = 0.0;
+    for (int o = 0; o < out; o++) {
+        double mag = 0.0;                   /* summation-order error scales with sum |w x| */
+        for (int i = 0; i < in; i++) mag += fabs((double)Wf[(size_t)o * in + i] * xr[i]);
+        const double d = fabs((double)ya[o] - yb[o]) / mag;
+        if (d > worst) worst = d;
+    }
+    const int gok = !memcmp(g, xr, sizeof g);
+    const int ok = worst < 1e-6 && gok;
+    printf("  %s  bf16_act      n=%d    rel diff %.1e to fp32 of bf16 x, gather %s\n",
+           ok ? "PASS" : "FAIL", out, worst, gok ? "rounds" : "DOES NOT ROUND");
+    if (ok) g_pass++; else g_fail++;
+    free(Wb); free(Wf); free(x); free(xr); free(ya); free(yb);
+}
+
 int main(int argc, char **argv)
 {
     const char *dir = (argc > 1) ? argv[1] : "../fixtures/ops";
@@ -882,8 +1089,11 @@ int main(int argc, char **argv)
     t_router(dir);
     t_mla(dir);
     t_moe(dir);
+    t_moe_streamed();
     t_mxfp4(dir);
+    t_mxfp4_ilv();
     t_matmul_bf16();
+    t_bf16_act();
     t_kda_layer(dir, "kda_layer1");
     t_kda_layer(dir, "kda_layer8");
     t_layer(dir, "layer_kda");

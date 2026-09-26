@@ -64,9 +64,51 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {
+#endif
+
+/* ------------------------------------------------------------------ team ---- */
+/* SPMD threading. A decoder layer runs as ONE parallel region: every thread executes
+ * the same code, takes its share of each loop by thread id (k3_split), and meets the
+ * others only at k3_sync where data crosses threads. Outside any region the team is
+ * one thread, k3_split yields the whole range and k3_sync does nothing, so the same
+ * code is also the serial reference. Work split by rows changes no arithmetic. */
+#ifdef _OPENMP
+void k3_team_barrier(void);
+static inline int  k3_tid(void)     { return omp_get_thread_num(); }
+static inline int  k3_nth(void)     { return omp_get_num_threads(); }
+static inline int  k3_in_team(void) { return omp_in_parallel(); }
+static inline void k3_sync(void)    { k3_team_barrier(); }
+#else
+static inline int  k3_tid(void)     { return 0; }
+static inline int  k3_nth(void)     { return 1; }
+static inline int  k3_in_team(void) { return 0; }
+static inline void k3_sync(void)    { }
+#endif
+
+/* This thread's contiguous, balanced part [lo, hi) of n items. */
+static inline void k3_split(int n, int *lo, int *hi)
+{
+    const int t = k3_tid(), p = k3_nth();
+    *lo = (int)((long)n * t / p);
+    *hi = (int)((long)n * (t + 1) / p);
+}
+
+/* Run a team body: inside a team every thread runs it on its share and returns with NO
+ * barrier (k3_sync before reading other threads' results); outside one, a region is
+ * opened for it when `cond` says the work is worth the fork. */
+#ifdef _OPENMP
+#define K3_TEAM_IF(cond, ...) do {                                            \
+        if (k3_in_team() || !(cond)) { __VA_ARGS__; }                         \
+        else { _Pragma("omp parallel") { __VA_ARGS__; } }                     \
+    } while (0)
+#else
+#define K3_TEAM_IF(cond, ...) do { __VA_ARGS__; } while (0)
 #endif
 
 /* ---------------------------------------------------------------- config ---- */
@@ -122,6 +164,103 @@ typedef struct {
 int  k3_is_mla(const K3Cfg *c, int layer);   /* layer is ZERO-based */
 int  k3_is_kda(const K3Cfg *c, int layer);
 int  k3_is_dense(const K3Cfg *c, int layer);
+
+/* ------------------------------------------------------------- profiling ---- */
+/* Opt-in wall-clock accounting by phase. Off unless k3_prof_on is set (the CLI sets it
+ * from K3_PROF); the timers wrap whole phases and never touch the arithmetic. Time spent
+ * in tensor-parallel collectives is charged to K3P_COMM and excluded from the phase
+ * that issued it. */
+enum {
+    K3P_EMBED, K3P_KDA_PROJ, K3P_KDA_CORE, K3P_KDA_OUT,
+    K3P_MLA_PROJ, K3P_MLA_CORE, K3P_MLA_OUT, K3P_ATTNRES,
+    K3P_ROUTER, K3P_MOE_DOWN, K3P_EXPERTS, K3P_MOE_UP, K3P_SHARED,
+    K3P_DENSE, K3P_HEAD, K3P_COMM, K3P_WAIT, K3P_N
+};
+extern int    k3_prof_on;
+extern double k3_prof_s[K3P_N];
+extern const char *const k3_prof_name[K3P_N];
+double k3_prof_now(void);
+static inline double k3_prof_t0(void)
+{
+    return k3_prof_on && k3_tid() == 0
+         ? k3_prof_now() - k3_prof_s[K3P_COMM] - k3_prof_s[K3P_WAIT] : 0.0;
+}
+/* Only the team's thread 0 records, so a phase is timed once and not raced on. */
+static inline void k3_prof_add(int phase, double t0)
+{
+    if (k3_prof_on && k3_tid() == 0)
+        k3_prof_s[phase] += k3_prof_now() - k3_prof_s[K3P_COMM] - k3_prof_s[K3P_WAIT] - t0;
+}
+
+/* ------------------------------------------------------ tensor parallelism ---- */
+/* Every rank holds the same activations. A sharded operation computes only this rank's
+ * contiguous part of its output rows (or heads) and then allgathers, so each output
+ * element is produced by exactly the arithmetic the single-process engine uses and the
+ * result is bit-identical at any rank count. size == 1 (the default) is the plain
+ * engine: every gather is a no-op and every part is the whole range.
+ *
+ * allgatherv is supplied by the MPI layer (src/par/k3_mpi.c) so this core needs no MPI
+ * headers: in place, buf holds the full vector and this rank's block
+ * [displs[rank], displs[rank] + counts[rank]) is already filled. */
+typedef struct {
+    int   rank, size;
+    void (*allgatherv)(float *buf, const int *counts, const int *displs, void *ctx);
+    void *ctx;
+    /* 1 when every row-sharded weight matrix holds ONLY this rank's rows (k3_bind_layer_tp,
+     * k3_bind_model_parts), so kernels index it from the slice start. 0: full matrices. */
+    int   local;
+    /* Diagnostics: with skew set, every gather is preceded by barrier() and the time
+     * spent there is charged to K3P_WAIT, separating rank imbalance from transfer. */
+    void (*barrier)(void *ctx);
+    int   skew;
+    long  calls;             /* gathers issued, and floats they moved */
+    double floats;
+    /* Optional one-sided transport (k3_mpi.c; default, K3_TP_ONESIDED=0 off). Peers put 8-byte words,
+     * sequence number << 32 | float bits, into ll_recv: two halves of ll_hw words, data
+     * then one flag word per rank. Thread 0 packs and puts, the whole team polls and
+     * unpacks (k3_tp_gather_end). ll_put == NULL, or more than ll_maxw floats, selects
+     * allgatherv. */
+    uint64_t *ll_recv, *ll_send;           /* window [2][ll_hw]; send ring [ll_nsend][ll_hw] */
+    int   ll_hw, ll_maxw, ll_nsend;
+    void (*ll_put)(const uint64_t *src, int nwords, long disp);   /* to every peer */
+    void (*ll_flush)(void);                /* local completion of every put issued */
+} K3Tp;
+extern K3Tp k3_tp;
+
+/* This rank's part [lo, hi) of n units, contiguous and balanced. */
+static inline void k3_tp_part(int n, int *lo, int *hi)
+{
+    *lo = (int)((long)n * k3_tp.rank / k3_tp.size);
+    *hi = (int)((long)n * (k3_tp.rank + 1) / k3_tp.size);
+}
+
+/* A vector of n floats partitioned in blocks of `unit` floats (n % unit == 0): rank r
+ * owns units k3_tp_part(n / unit) of it. With k3_act_bf16 a gather moves and leaves
+ * bf16-rounded values, on every rank including the owner, unless `exact` is set. */
+typedef struct { float *p; int n, unit, exact; } K3Seg;
+
+/* bf16 activation mode (--bf16-act; AVX512-BF16 builds only): every bf16 or MXFP4
+ * matmul rounds its input to bf16 and runs bf16 dot products with fp32 accumulation,
+ * and gathers travel as bf16. A mask of the three parts; set before weights are
+ * loaded; 0 is the exact engine. */
+enum { K3_BF16_MM = 1, K3_BF16_MX = 2, K3_BF16_TP = 4, K3_BF16_ALL = 7 };
+extern int k3_act_bf16;
+int k3_act_bf16_supported(void);
+
+/* Allgather several segments in ONE collective: each rank has filled its part of every
+ * segment, and on return every rank holds all of every segment. A team collective: all
+ * threads call it, and it doubles as the team barrier (also with one rank). */
+void k3_tp_gather(const K3Seg *seg, int nseg);
+
+/* The same gather in two halves: between them the team may do work that touches none of
+ * the segments. Thread 0 sends in begin while the others go on; end receives on every
+ * thread. At most one gather may be outstanding. */
+void k3_tp_gather_begin(const K3Seg *seg, int nseg);
+void k3_tp_gather_end(const K3Seg *seg, int nseg);   /* the same segments as begin */
+
+/* y = W x with the output rows split across ranks and gathered: bit-identical to k3_mmw.
+ * W holds every row on every rank. */
+void k3_mmw_tp(float *y, const float *x, const void *W, int wdt, int in, int out);
 
 /* ------------------------------------------------------------------ ops ---- */
 
@@ -285,7 +424,8 @@ void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out
 void k3_matmul_q8(float *y, const float *x, const void *W, int in, int out);
 
 /* The one call every trunk matmul goes through. Dispatch is a predictable branch on a
- * per-layer flag, outside the inner loops, so it costs nothing measurable. */
+ * per-layer flag, outside the inner loops, so it costs nothing measurable. Inside a
+ * team (see K3_TEAM_IF) each thread computes its share of the rows, with no barrier. */
 static inline void k3_mmw(float *y, const float *x, const void *W, int wdt,
                           int in, int out)
 {
@@ -324,6 +464,7 @@ typedef struct {
     const unsigned char *p1, *s1;        /* w1 gate, packed and E8M0 scales           */
     const unsigned char *p3, *s3;        /* w3 up                                     */
     const unsigned char *p2, *s2;        /* w2 down                                   */
+    int ilv;                             /* K3_MX_* layout of the packed rows         */
 } K3ExpertQ;
 
 /* A source of experts. get() must leave the returned pointers valid until the caller
@@ -352,6 +493,9 @@ typedef struct K3ExpertSrc {
      * with zero expert I/O. May be NULL; callers must cope. */
     int (*resident)(struct K3ExpertSrc *self, int layer, int expert, K3ExpertQ *out);
     void *ctx;
+    /* 1 when get() hands out only this rank's tensor-parallel rows: w1/w3 rows
+     * k3_tp_part(moe_inter) and w2 rows k3_tp_part(latent), each from its slice start. */
+    int sliced;
 } K3ExpertSrc;
 
 typedef struct {
@@ -457,6 +601,9 @@ typedef struct {
     const void  *g;                      /* [H*D][hidden] full-rank gate    */
     const float *o_norm;                 /* [D] head-wise norm gain         */
     const void  *o;                      /* [hidden][H*D]                   */
+    /* Optional: q, k, v as ONE matrix, row 3*r + m = row r of q, k, v (m = 0, 1, 2),
+     * so a thread's rows are one contiguous stream; q, k, v are then unused. */
+    const void  *qkv;
     int          wdt;                    /* q,k,v,g,o,f_a,f_b,b             */
 } K3KdaW;
 
@@ -564,6 +711,22 @@ void k3_mxfp4_dequant(float *out, const unsigned char *packed,
  * becoming 132 MB. See the comment on the definition. */
 void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
                      const unsigned char *scales, int in, int rows, int group);
+
+/* Reorders `rows` packed rows of `in` elements in place into the layout a kernel
+ * decodes fastest; a row tail shorter than 128 keeps checkpoint order. In every full
+ * 128-element block, K3_MX_F32 puts element 16*s + l in nibble s of dword l (fp32
+ * kernel) and K3_MX_BF16 puts element 32*s + m in nibble s of 16-bit word m (bf16
+ * kernel). Returns 1 if it did, 0 (bytes untouched) when this build or `group` has no
+ * kernel for `layout`. */
+enum { K3_MX_CKPT = 0, K3_MX_F32 = 1, K3_MX_BF16 = 2 };
+int k3_mxfp4_interleave(unsigned char *packed, int rows, int in, int group, int layout);
+
+/* k3_matmul_mxfp4 on rows in `layout`, which must be the one the active mode decodes
+ * (K3_MX_BF16 exactly when k3_act_bf16 has K3_BF16_MX); the same results as checkpoint
+ * order. */
+void k3_matmul_mxfp4_ilv(float *y, const float *x, const unsigned char *packed,
+                         const unsigned char *scales, int in, int rows, int group,
+                         int layout);
 
 #ifdef __cplusplus
 }

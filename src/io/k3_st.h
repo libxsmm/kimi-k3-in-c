@@ -93,6 +93,13 @@ int64_t k3_st_read(const K3St *s, const K3Tensor *t, void *buf);
 int64_t k3_st_read_aligned(const K3St *s, int shard, int64_t off, int64_t nbytes,
                            void *buf, int64_t bufcap, int64_t *payload_off);
 
+/* k3_st_read_aligned over a large span, issued as parallel aligned chunks. Same buffer
+ * contract: buf page aligned, holding the span widened to K3_ST_ALIGN at both ends, and
+ * *payload_off receives where the payload starts. Returns nbytes, or 0 on any short
+ * chunk. Queue depth is what reaches the store's bandwidth on NFS and NVMe alike. */
+int64_t k3_st_read_par(const K3St *s, int shard, int64_t off, int64_t nbytes,
+                       void *buf, int64_t bufcap, int64_t *payload_off);
+
 /* Read and widen to float32. Handles F32 (memcpy), BF16 (shift left 16), F16, and
  * U8 (raw byte value, for callers that want the quantised codes as numbers).
  * out must hold t->nbytes/elem_size floats. */

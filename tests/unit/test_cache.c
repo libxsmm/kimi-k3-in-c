@@ -34,6 +34,7 @@
 #include "k3.h"
 #include "k3_cache.h"
 #include "k3_load.h"
+#include "k3_resident.h"
 #include "k3_st.h"
 
 static int g_fail = 0;
@@ -74,6 +75,9 @@ static int same_expert(const K3St *st, int layer, int e, const K3ExpertQ *q)
         const unsigned char *tp = truth + r.m[i].p_off, *ts = truth + r.m[i].s_off;
         const int64_t pn = (int64_t)r.m[i].rows * r.m[i].pcols;
         const int64_t sn = (int64_t)r.m[i].rows * r.m[i].scols;
+        if (q->ilv)
+            k3_mxfp4_interleave(truth + r.m[i].p_off, r.m[i].rows, r.m[i].pcols * 2,
+                                K3_MXFP4_GROUP, q->ilv);
         if (memcmp(got[i * 2], tp, (size_t)pn) != 0) ok = 0;
         if (memcmp(got[i * 2 + 1], ts, (size_t)sn) != 0) ok = 0;
     }
@@ -180,6 +184,29 @@ int main(int argc, char **argv)
       ck(bad3 == 0, "mixed batch and serial", b); }
 
     k3_cache_free(&cache);
+
+    /* ---- 5: the DRAM-resident source must hand out the same bytes as a direct read ---- */
+    {
+        K3Resident res;
+        int bad5 = 0;
+        if (k3_resident_init(&res, &st, &c, 0, 1) != 0) {
+            ck(0, "resident source loads", "init failed");
+        } else {
+            for (int e = 0; e < NE; e++) {
+                K3ExpertQ q;
+                if (res.src.get(&res.src, 0, e, &q) != 0) { bad5++; continue; }
+                if (!same_expert(&st, 0, e, &q)) bad5++;
+            }
+            K3ExpertQ q;
+            const int oob = res.src.get(&res.src, 1, 0, &q) != 0 &&
+                            res.src.get(&res.src, 0, NE, &q) != 0;
+            char b[64]; snprintf(b, sizeof b, "%d of %d wrong", bad5, NE);
+            ck(bad5 == 0, "resident source is byte-exact", b);
+            ck(oob, "resident refuses non-resident", NULL);
+            k3_resident_free(&res);
+        }
+    }
+
     k3_st_close(&st);
     printf("\n%s\n", g_fail ? "CACHE TESTS FAILED" : "CACHE TESTS PASSED");
     return g_fail ? 1 : 0;

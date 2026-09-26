@@ -98,6 +98,7 @@ add_library(k3 STATIC
   src/io/k3_load.c
   src/io/k3_trunk.c
   src/cache/k3_cache.c
+  src/cache/k3_resident.c
   src/model/k3_bind.c)
 
 target_include_directories(k3 PUBLIC
@@ -108,11 +109,20 @@ target_include_directories(k3 PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/src/io
   ${CMAKE_CURRENT_SOURCE_DIR}/src/cache
   ${CMAKE_CURRENT_SOURCE_DIR}/src/model
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/par
   ${CMAKE_CURRENT_SOURCE_DIR}/src/tokenizer)
 
 target_link_libraries(k3 PUBLIC k3_flags m Threads::Threads)
 if(K3_OPENMP_TARGET)
   target_link_libraries(k3 PUBLIC ${K3_OPENMP_TARGET})
+endif()
+
+option(K3_MPI "Build the tensor-parallel engine against MPI" OFF)
+if(K3_MPI)
+  find_package(MPI REQUIRED COMPONENTS C)
+  target_sources(k3 PRIVATE src/par/k3_mpi.c)
+  target_compile_definitions(k3 PUBLIC K3_MPI)
+  target_link_libraries(k3 PUBLIC MPI::MPI_C)
 endif()
 
 # ------------------------------------------------------------------------------ cli --
