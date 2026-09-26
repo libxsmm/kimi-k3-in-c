@@ -256,6 +256,9 @@ python3 tools/sim_cache.py tests/fixtures/expert_trace.bin
 
 Six steps from an empty directory to generated text. Only step 4 is slow.
 
+For a multi-node Xeon cluster (the whole model resident in RAM, tensor parallel over MPI,
+56.0 ms/token at 16 sockets), follow [docs/REPRODUCE-TP.md](docs/REPRODUCE-TP.md) instead.
+
 `./scripts/k3-doctor.sh` can be run at any point. It checks the toolchain, sizes your RAM
 to a preset, measures your storage, and prints the exact command to run next.
 
