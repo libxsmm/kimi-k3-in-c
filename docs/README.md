@@ -16,7 +16,7 @@
 | [PERFORMANCE.md](PERFORMANCE.md) | the memory ladder, measured, with its noise floor |
 | [TESTING.md](TESTING.md) | what each gate proves |
 | [BENCHMARKING.md](BENCHMARKING.md) | how to measure without fooling yourself |
-| [REPRODUCE-TP.md](REPRODUCE-TP.md) | full model on a Xeon cluster, tensor parallel over MPI: 56.0 ms/token at TP=16, and TP=32, step by step |
+| [REPRODUCE-TP.md](REPRODUCE-TP.md) | full model on a Xeon cluster, tensor parallel over MPI: 56.0 ms/token at TP=16, 47.6 ms/token at TP=32, step by step |
 | [ROADMAP.md](ROADMAP.md) | what is missing, in priority order |
 | [data/](data/) | the raw measurement output every table is transcribed from |
 

@@ -7,9 +7,9 @@ other documentation is required.
 
 | config | nodes × sockets | ms/token | tokens/s | peak RSS per rank | status |
 |---|---|---|---|---|---|
-| **TP=16**, 1 rank/socket, pinned HCA | 8 × 2 | **56.0** | 17.9 | 101 GB | measured (best 55.98; unpinned 56.2 to 56.8) |
+| **TP=32**, 1 rank/socket, pinned HCA (16 nodes) | 16 × 2 | **47.6** | 21.0 | 52.5 GB | measured (47.62 and 47.53; same session TP=16: 57.0) |
+| TP=16, 1 rank/socket, pinned HCA | 8 × 2 | 56.0 | 17.9 | 101 GB | measured (best 55.98; unpinned 56.2 to 56.8) |
 | TP=32, 2 ranks/socket (8 nodes) | 8 × 2 | 58.9 | 17.0 | 52.5 GB | measured: same hardware, so no faster |
-| TP=32, 1 rank/socket (16 nodes) | 16 × 2 | about 35 to 45 | about 22 to 28 | about 52 GB | **estimate, not measured** (section 7) |
 
 For every configuration the output is the same 16 tokens as the single-process
 reference. Logits are byte-identical at any rank count, and the correctness oracle
@@ -115,7 +115,7 @@ mpirun -np 16 --map-by ppr:1:package --bind-to package \
        --incremental --experts-resident --ids 19180 --gen 16 --out run16.json
 ```
 
-### TP=32: 16 nodes, 1 rank per socket
+### TP=32: 16 nodes, 1 rank per socket (the 47.6 ms result)
 
 ```bash
 salloc -N 16 --exclusive
@@ -189,11 +189,32 @@ each when pinned.
 - **2 ranks per socket on 8 nodes is not faster** (58.9 vs 56.0 ms). Each socket
   still streams the same bytes, and two ranks now share one HCA. Communication roughly
   doubled, to 10.0 ms (17.3 µs per gather).
-- **TP=32 on 16 nodes** halves the bytes each socket streams. Compute (about 51 ms at
-  TP=16) should drop to roughly 26 to 33 ms: shorter per-thread streams lose some
-  bandwidth efficiency. Communication stays latency-bound at 581 gathers per token,
-  with 31 instead of 15 puts each, so expect 6 to 10 ms. Hence the 35 to 45 ms
-  estimate. Measure it before quoting it.
+- **TP=32 on 16 nodes, measured: 47.6 ms/token (21.0 tokens/s), 1.20x over TP=16.**
+  Each rank reads 4.50 GB per token instead of 8.8 GB. Both runs below are from the
+  same session on the same 16 nodes (TP=16 used 8 of them), HCA-pinned, and give the
+  reference tokens:
+
+  | ms/token | TP=16 (8 nodes) | TP=32 (16 nodes) | speedup |
+  |---|---|---|---|
+  | **wall** | 57.04 | **47.62** (repeat 47.53) | 1.20x |
+  | compute (wall − comm − untimed) | 49.8 | 35.3 | 1.41x |
+  | TP communication | 5.06 (8.7 µs/gather) | 9.65 (16.6 µs/gather) | 0.52x |
+  | KDA projections | 8.99 | 5.17 | 1.74x |
+  | KDA output | 8.11 | 5.97 | 1.36x |
+  | routed experts | 9.41 | 6.65 | 1.41x |
+  | shared expert | 4.26 | 1.22 | 3.5x |
+  | MoE up | 3.25 | 2.79 | 1.17x |
+  | MLA proj + out | 3.92 | 2.98 | 1.32x |
+  | KDA recurrence | 3.27 | 2.99 | 1.09x |
+  | AttnRes + norms | 2.99 | 2.98 | 1.0x |
+  | router + MoE down | 4.57 | 3.99 | 1.15x |
+  | peak RSS per rank | 101.2 GB | 52.5 GB | |
+
+  The weight-streaming phases scale well; AttnRes, norms, the router and the KDA
+  recurrence are replicated or fixed per rank and do not shrink. Communication doubles:
+  still 581 gathers per token, but each waits on 31 peers instead of 15, so it becomes
+  the largest phase (20%). That makes the native transport (section 10) worth more at
+  TP=32. The pre-measurement estimate was 35 to 45 ms.
 - All sharded dimensions of Kimi K3 are divisible by 32, but they need not be: every
   split is a balanced contiguous partition, so any rank count works.
 
