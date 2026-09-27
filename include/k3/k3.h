@@ -220,10 +220,15 @@ typedef struct {
      * then one flag word per rank. Thread 0 packs and puts, the whole team polls and
      * unpacks (k3_tp_gather_end). ll_put == NULL, or more than ll_maxw floats, selects
      * allgatherv. */
-    uint64_t *ll_recv, *ll_send;           /* window [2][ll_hw]; send ring [ll_nsend][ll_hw] */
+    uint64_t *ll_recv, *ll_send;           /* window [2][ll_hw]; send rings [ll_nlanes][ll_nsend][ll_hw] */
     int   ll_hw, ll_maxw, ll_nsend;
-    void (*ll_put)(const uint64_t *src, int nwords, long disp);   /* to every peer */
-    void (*ll_flush)(void);                /* local completion of every put issued */
+    /* Lane l puts to its own share of the peers; team thread t drives lanes t, t+S, ...
+     * (S sending threads), so a lane is only ever used by one thread at a time. */
+    int   ll_nlanes;
+    void (*ll_put)(int lane, const uint64_t *src, int nwords, long disp);
+    void (*ll_flush)(int lane);            /* local completion of every put issued */
+    void (*ll_poll)(int lane);             /* optional: cheap progress while spinning */
+    void (*ll_done)(int lane);             /* optional: once a gather is received */
 } K3Tp;
 extern K3Tp k3_tp;
 

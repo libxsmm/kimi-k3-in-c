@@ -161,6 +161,11 @@ ENGINE_SRC := src/core/k3_ops.c \
 ifeq ($(MPI),1)
   ENGINE_SRC += src/par/k3_mpi.c
   CFLAGS     += -DK3_MPI
+  # UCX=<prefix> adds the direct UCP transport for the team gather (K3_TP_UCX=1)
+  ifneq ($(UCX),)
+    CFLAGS   += -DK3_UCX -isystem $(UCX)/include
+    LDFLAGS  += -L$(UCX)/lib -Wl,-rpath,$(UCX)/lib -lucp -lucs
+  endif
 endif
 ENGINE_OBJ := $(patsubst %.c,$(BUILD)/%.o,$(ENGINE_SRC))
 

@@ -7,9 +7,11 @@ other documentation is required.
 
 | config | nodes × sockets | ms/token | tokens/s | peak RSS per rank | status |
 |---|---|---|---|---|---|
-| **TP=32**, 1 rank/socket, pinned HCA (16 nodes) | 16 × 2 | **47.6** | 21.0 | 52.5 GB | measured (47.62 and 47.53; same session TP=16: 57.0) |
-| TP=16, 1 rank/socket, pinned HCA | 8 × 2 | 56.0 | 17.9 | 101 GB | measured (best 55.98; unpinned 56.2 to 56.8) |
-| TP=32, 2 ranks/socket (8 nodes) | 8 × 2 | 58.9 | 17.0 | 52.5 GB | measured: same hardware, so no faster |
+| **TP=32**, 1 rank/socket, pinned HCA, direct UCX (16 nodes) | 16 × 2 | **42.5** | 23.5 | 52.5 GB | measured (42.53 and 42.63; osc/ucx same session: 48.26) |
+| TP=16, 1 rank/socket, pinned HCA, direct UCX | 8 × 2 | 55.1 | 18.2 | 101 GB | measured (55.09, 55.27; osc/ucx same session: 56.62, 56.75) |
+| TP=32, 1 rank/socket, osc/ucx (`K3_TP_UCX=0` or no `UCX=` build) | 16 × 2 | 47.6 | 21.0 | 52.5 GB | measured (47.53 to 48.26) |
+| TP=16, 1 rank/socket, osc/ucx | 8 × 2 | 56.0 | 17.9 | 101 GB | measured (best 55.98; unpinned 56.2 to 56.8) |
+| TP=32, 2 ranks/socket (8 nodes), osc/ucx | 8 × 2 | 58.9 | 17.0 | 52.5 GB | measured: same hardware, so no faster |
 
 For every configuration the output is the same 16 tokens as the single-process
 reference. Logits are byte-identical at any rank count, and the correctness oracle
@@ -64,6 +66,12 @@ srun -N1 -n1 bash -c '
 '
 ```
 
+Add `UCX=<prefix>` (the UCX that Open MPI uses, e.g. `$(dirname $(which ucx_info))/..`)
+to build the direct UCX transport for the team gather (section 10), which is then the
+default: `make MPI=1 UCX=/opt/ucx -j32 bin-mpi/k3 bin-mpi/k3_model`. It is worth 5.7 ms
+per token at TP=32 and 1.5 ms at TP=16. Changing `UCX=` does not rebuild objects;
+`touch src/par/k3_mpi.c` or clean first.
+
 `make MPI=1` on its own does not relink `bin-mpi/k3_model`, so always name the targets.
 You can also cross-compile, for example
 `make MPI=1 ARCH="-march=emeraldrapids" bin-mpi/k3 bin-mpi/k3_model`.
@@ -106,7 +114,7 @@ mpirun -np 16 --map-by ppr:1:package --bind-to package \
 
 All `-x` options belong to `mpirun`, so they must come **before** `./ucxpin.sh`.
 
-### TP=16: 8 nodes, 1 rank per socket (the 56.0 ms result)
+### TP=16: 8 nodes, 1 rank per socket (the 55.1 ms result with a UCX build)
 
 ```bash
 mpirun -np 16 --map-by ppr:1:package --bind-to package \
@@ -115,7 +123,7 @@ mpirun -np 16 --map-by ppr:1:package --bind-to package \
        --incremental --experts-resident --ids 19180 --gen 16 --out run16.json
 ```
 
-### TP=32: 16 nodes, 1 rank per socket (the 47.6 ms result)
+### TP=32: 16 nodes, 1 rank per socket (the 42.5 ms result with a UCX build)
 
 ```bash
 salloc -N 16 --exclusive
@@ -214,7 +222,16 @@ each when pinned.
   recurrence are replicated or fixed per rank and do not shrink. Communication doubles:
   still 581 gathers per token, but each waits on 31 peers instead of 15, so it becomes
   the largest phase (20%). That makes the native transport (section 10) worth more at
-  TP=32. The pre-measurement estimate was 35 to 45 ms.
+  TP=32. The pre-measurement estimate was 35 to 45 ms. With the direct UCX transport
+  (section 10) the same TP=32 run takes 42.5 ms, communication 3.2 ms (5.5 µs/gather).
+- **Communication cost follows the rank count, not the node count.** `bench_allgather`
+  at 32 ranks gives the same gather times on 8 nodes (2 ranks/socket) and on 16 nodes
+  (1 rank/socket), e.g. 21.8 against 22.9 µs at 7168 floats, and the TP=32 engine paid
+  10.0 ms (8 nodes) against 9.7 ms (16 nodes) of communication. What grows is the
+  per-peer software cost: one sending thread issues P−1 puts, and the time to issue
+  them went from about 5 µs (15 `MPI_Put`) to 8 to 10 µs (31). On 8 nodes this showed
+  up as the whole 56.0 → 58.9 ms regression, because compute did not shrink; on 16
+  nodes compute fell by 14.5 ms and hid it.
 - All sharded dimensions of Kimi K3 are divisible by 32, but they need not be: every
   split is a balanced contiguous partition, so any rank count works.
 
@@ -225,6 +242,8 @@ All of these are off, or at their fastest, by default. They exist for A/B testin
 | setting | effect |
 |---|---|
 | `K3_TP_ONESIDED=0` | `MPI_Allgatherv` instead of the one-sided (MPI RMA) team gather: slower |
+| `K3_TP_UCX=0` | UCX builds: the one-sided gather over Open MPI's osc/ucx instead of direct UCX puts: slower |
+| `K3_TP_UCX_LANES=N` | UCX builds: N team threads issue the puts, each to 1/N of the peers (default ⌈(P−1)/4⌉, at most 8: 4 at TP=16, 8 at TP=32) |
 | `K3_MXFP4_ILV=0` | keep MXFP4 experts in checkpoint order instead of the AVX-512 load-time layout: slower, same bits |
 | `K3_NO_QKV=1` | do not merge the q/k/v rows into one stream per thread: slightly slower, same bits |
 | `K3_NOHUGE=1` | no huge-page hint for the resident experts |
@@ -243,36 +262,60 @@ All of these are off, or at their fastest, by default. They exist for A/B testin
 - Put `-x` options before the wrapper script; otherwise they become arguments of the
   wrapper's `exec` and the run fails.
 
-## 10. Future work: a native transport for the team gather
+## 10. The team-gather transport: direct UCX (done) and what is left
 
-TP communication is 5.0 ms of the 56.0 ms per token: 581 gathers at 8.6 µs each. A
-run with `K3_TP_SKEW=1` puts a barrier before every gather and splits that time:
+Before: TP communication was 5.0 ms of 56.0 ms per token at TP=16 (581 gathers at
+8.6 µs) and 9.7 ms of 47.6 ms at TP=32 (16.6 µs). A `K3_TP_SKEW=1` run at TP=16 split
+it into 4.2 ms of transfer (7.2 µs per gather with ranks aligned) and 0.8 to 2.9 ms of
+waiting for slower ranks. The transfer part was mostly software: the one sending
+thread spent about 0.3 µs per `MPI_Put`.
 
-| per token | ms | |
-|---|---|---|
-| transfer, ranks aligned | 4.2 | 7.2 µs per gather, latency-bound: a 16-float gather already costs 6.65 µs |
-| waiting for slower ranks | 0.8 to 2.9 | load imbalance; no transport change helps |
+### Done: direct UCX puts (`make MPI=1 UCX=<prefix>`, default in such builds)
 
-The floor is one network one-way latency per gather, about 1.5 to 2 µs on NDR
-(`MPI_Barrier`, 4 dissemination rounds, takes 7.3 µs). Estimated gain from bypassing
-Open MPI's one-sided layer (osc/ucx) is **2 to 3 ms/token (4 to 5%), about 53 to
-54 ms/token**:
+`src/par/k3_mpi.c` implements the same one-sided protocol (window layout, tagged
+8-byte words) with `ucp_put_nbx`, so the results are bit-identical: oracle exact at 3,
+16 and 32 ranks, 8-layer logits byte-identical to osc/ucx and to the single-process
+reference. Parts of it:
 
-1. **Issue cost, about 2.3 ms.** Today each gather makes 15 `MPI_Put` calls. With
-   raw verbs, one doorbell posts 15 unsignaled RDMA writes with small payloads inline,
-   so a gather could take about 2.5 to 3.5 µs.
-2. **Wire format, about 0.3 to 0.5 ms.** Every float travels as an 8-byte
-   `seq << 32 | bits` word so the receiver can detect its arrival. RDMA writes on one
-   RC queue pair land in order, so raw 4-byte floats plus one flag word per block would
-   halve the bytes. This matters mostly for the 55k-float MoE activation gather.
-3. **Flushes, under 0.2 ms.** Poll completions instead of calling
-   `MPI_Win_flush_local_all` every 32 sends.
+- **Local-only flush.** `ucp_put_nbx` completes locally; a flush reaps this rank's own
+  requests and never waits a round trip to every peer as `MPI_Win_flush_local_all` does.
+- **Send lanes.** The P−1 puts of a gather are split over `K3_TP_UCX_LANES` team
+  threads, each with its own UCP worker and endpoints to a contiguous share of the
+  peers, and its own send ring. Skew mode and bf16 gathers keep one sender.
+- **Measured pitfalls**, each of which cost a hang or a large slowdown:
+  1. A put that returned `UCS_OK` can stay unsent until the next
+     `ucp_worker_progress`: the transport progresses after every put (without it,
+     32 ms stalls when nobody polled).
+  2. A put still queued when its rank moves on and blocks in MPI deadlocks the peers
+     spinning on it: every gather ends with a flush (`ll_done`).
+  3. With the default CQ moderation (a signalled completion every 64 sends) a QP fills
+     with inline puts before any completion comes back, and 2 to 18% of the small puts
+     queued. The transport sets `UCX_RC_MLX5_TX_CQ_MODERATION=8` for its own context
+     (unless set); `ucp_config_modify` of that key had no effect.
+  4. `UCS_THREAD_MODE_SINGLE` asserts on the owner thread, so multi-lane workers use
+     `SERIALIZED`, which costs about 3 µs per gather at one lane; one lane uses SINGLE.
 
-Suggested order:
-1. Call UCX directly (`ucp_put_nbi` + `ucp_worker_fence`/`flush`) inside
-   `src/par/k3_mpi.c`. It is transport-only, stays portable across fabrics, and
-   should show how much of the ~4 µs per gather is software overhead.
-2. Then raw verbs (RC queue pairs, one per peer, on the rank's NUMA-local HCA) if
-   UCX falls short.
-3. Independently, fuse gathers: every gather removed saves its whole ~7 µs, more than
-   any transport change can.
+Measured, full model, same session, 16 nodes, HCA-pinned, reference tokens:
+
+| ms/token | osc/ucx | UCX 1 lane | UCX 4 lanes | UCX 8 lanes |
+|---|---|---|---|---|
+| TP=32 wall | 48.26 | 44.71 | 42.89 | **42.53**, 42.63 |
+| TP=32 comm (µs/gather) | 9.74 (16.8) | 6.46 (11.1) | 3.90 (6.7) | 3.20 (5.5) |
+| TP=16 wall | 56.62, 56.75 | **55.09** | 55.27 | 57.58 |
+| TP=16 comm (µs/gather) | 5.20 (9.0) | 4.98 (8.6) | 4.15 (7.1) | 4.50 (7.7) |
+
+`bench_allgather` at 32 ranks, one thread, µs per gather (osc/ucx → UCX 1 lane): 32
+floats 13.8 → 10.0, 896 floats 14.3 → 11.2, 12288 floats 34.7 → 26.1; the rest within
+1 µs. The issue part (`begin`) fell from 8 to 11 µs to 4 to 6 µs.
+
+### Left
+
+1. **Wire format, about 0.3 to 0.5 ms.** Every float still travels as an 8-byte
+   `seq << 32 | bits` word. RDMA writes on one RC queue pair land in order, so raw
+   4-byte floats plus one flag word per block would halve the bytes, mostly for the
+   55k-float MoE activation gather. Needs raw verbs or a verified ordering guarantee.
+2. **Raw verbs**: one doorbell for several inline writes; only worth it if the
+   per-put cost is still visible after lanes (at 8 lanes a gather is 5.5 µs, close to
+   two network latencies).
+3. **Fuse gathers**: every gather removed saves its whole cost; 581 per token remain.
+4. **Rank skew** (0.8 to 2.9 ms at TP=16) is load imbalance, not transport.

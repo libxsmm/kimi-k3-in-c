@@ -149,9 +149,21 @@ static int   *tp_cnt;
 #define TP_MAXSEG (K3_MAX_TOPK + 2)
 static int      tp_open;                   /* a gather is outstanding */
 static uint32_t tp_seq;                    /* one-sided sequence number, set before a barrier */
-static int      tp_slot;                   /* position in the one-sided send ring */
+#define TP_MAXLANES 64
+static struct { int v; char pad[60]; } tp_slot[TP_MAXLANES];   /* per lane: position in its send ring */
+
+/* Threads that issue one-sided puts; thread t drives lanes t, t + S, ... Skew mode
+ * barriers on thread 0 before sending, and bf16 packing rounds the owner's block in
+ * place, so both keep one sender. */
+static inline int tp_senders(void)
+{
+    const int L = k3_tp.ll_nlanes > 0 ? k3_tp.ll_nlanes : 1, n = k3_nth();
+    if (L == 1 || k3_tp.skew || (k3_act_bf16 & K3_BF16_TP)) return 1;
+    return L < n ? L : n;
+}
 
 static void tp_send(const K3Seg *seg, int nseg, int total, int ll);
+static void tp_put_lanes(const K3Seg *seg, int nseg);
 static void tp_recv(const K3Seg *seg, int nseg, int total, int ll);
 
 static int tp_total(const K3Seg *seg, int nseg)
@@ -212,6 +224,7 @@ void k3_tp_gather_begin(const K3Seg *seg, int nseg)
     if (ll && k3_tid() == 0 && ++tp_seq == 0) tp_seq = 1;   /* 0 is what a fresh window holds */
     k3_sync();
     if (k3_tid() == 0) tp_send(seg, nseg, total, ll);
+    if (ll) tp_put_lanes(seg, nseg);
 }
 
 void k3_tp_gather_end(const K3Seg *seg, int nseg)
@@ -222,6 +235,10 @@ void k3_tp_gather_end(const K3Seg *seg, int nseg)
     if (!ll) k3_sync();
     const double t0 = k3_prof_on && k3_tid() == 0 ? k3_prof_now() : 0.0;
     tp_recv(seg, nseg, total, ll);
+    if (ll && k3_tp.ll_done) {
+        const int S = tp_senders();
+        for (int l = k3_tid(); k3_tid() < S && l < k3_tp.ll_nlanes; l += S) k3_tp.ll_done(l);
+    }
     if (k3_prof_on && k3_tid() == 0) k3_prof_s[K3P_COMM] += k3_prof_now() - t0;
     k3_sync();
     if (k3_tid() == 0) tp_open = 0;
@@ -245,8 +262,16 @@ static void ll_wait(float *d, const volatile uint64_t *w, int n, uint32_t seq, i
 #if defined(__x86_64__)
             __builtin_ia32_pause();
 #endif
-            /* only thread 0 may call MPI; a flush costs a round trip, so rarely */
-            if (++spins % (1L << 20) == 0 && k3_tid() == 0) k3_tp.ll_flush();
+            /* sending threads progress their own lanes (MPI: one lane, thread 0);
+             * a flush may cost a round trip, so rarely */
+            if (k3_tid() < k3_tp.ll_nlanes && k3_tid() < tp_senders()) {
+                const int S = tp_senders();
+                ++spins;
+                for (int l = k3_tid(); l < k3_tp.ll_nlanes; l += S) {
+                    if (spins % (1L << 20) == 0) k3_tp.ll_flush(l);
+                    else if (k3_tp.ll_poll && (spins & 63) == 0) k3_tp.ll_poll(l);
+                }
+            }
         }
         if (!d) continue;
         const uint32_t u = (uint32_t)v;
@@ -286,34 +311,7 @@ static void tp_send(const K3Seg *seg, int nseg, int total, int ll)
         cnt[r] = off - dsp[r];
     }
     if (ll) {
-        /* see k3_mpi.c: the ring lets one flush per lap cover every buffer's puts */
-        if (++tp_slot == k3_tp.ll_nsend) { tp_slot = 0; k3_tp.ll_flush(); }
-        uint64_t *snd = k3_tp.ll_send + (size_t)tp_slot * k3_tp.ll_hw, *o = snd;
-        const uint64_t tag = (uint64_t)tp_seq << 32;
-        for (int s = 0; s < nseg; s++) {
-            int lo, hi; k3_tp_part(seg[s].n / seg[s].unit, &lo, &hi);
-            float *p = seg[s].p + (size_t)lo * seg[s].unit;
-            const int n = (hi - lo) * seg[s].unit;
-            if (seg_lp(&seg[s])) {
-                /* the owner keeps exactly what its peers receive */
-                for (int i = 0; i < n; i += 2) {
-                    const uint16_t b0 = k3_f2bf(p[i]), b1 = i + 1 < n ? k3_f2bf(p[i + 1]) : 0;
-                    p[i] = k3_bf16f(b0);
-                    if (i + 1 < n) p[i + 1] = k3_bf16f(b1);
-                    *o++ = tag | (uint32_t)b1 << 16 | b0;
-                }
-            } else {
-                for (int i = 0; i < n; i++) {
-                    uint32_t u;
-                    memcpy(&u, p + i, 4);
-                    *o++ = tag | u;
-                }
-            }
-        }
-        const long half = (long)(tp_seq & 1) * k3_tp.ll_hw;
-        /* an empty block sends its flag word, so every call orders every pair of ranks */
-        if (cnt[me] > 0) k3_tp.ll_put(snd, cnt[me], half + dsp[me]);
-        else { snd[0] = tag; k3_tp.ll_put(snd, 1, half + k3_tp.ll_maxw + me); }
+        /* the puts are issued by tp_put_lanes, on every sending thread */
     } else {
         if ((size_t)total > tp_pack_cap) {
             free(tp_pack);
@@ -336,6 +334,64 @@ static void tp_send(const K3Seg *seg, int nseg, int total, int ll)
     k3_tp.calls++;
     k3_tp.floats += (double)tp_total(seg, nseg);
     if (k3_prof_on) k3_prof_s[K3P_COMM] += k3_prof_now() - t0;
+}
+
+/* This rank's block as tagged words; with `own` the owner also keeps the bf16 rounding. */
+static void tp_pack_words(uint64_t *o, const K3Seg *seg, int nseg, uint64_t tag, int own)
+{
+    for (int s = 0; s < nseg; s++) {
+        int lo, hi; k3_tp_part(seg[s].n / seg[s].unit, &lo, &hi);
+        float *p = seg[s].p + (size_t)lo * seg[s].unit;
+        const int n = (hi - lo) * seg[s].unit;
+        if (seg_lp(&seg[s])) {
+            /* the owner keeps exactly what its peers receive */
+            for (int i = 0; i < n; i += 2) {
+                const uint16_t b0 = k3_f2bf(p[i]), b1 = i + 1 < n ? k3_f2bf(p[i + 1]) : 0;
+                if (own) {
+                    p[i] = k3_bf16f(b0);
+                    if (i + 1 < n) p[i + 1] = k3_bf16f(b1);
+                }
+                *o++ = tag | (uint32_t)b1 << 16 | b0;
+            }
+        } else {
+            for (int i = 0; i < n; i++) {
+                uint32_t u;
+                memcpy(&u, p + i, 4);
+                *o++ = tag | u;
+            }
+        }
+    }
+}
+
+/* One-sided send: each sending thread packs this rank's block into its lanes' own send
+ * rings (see k3_mpi.c: one flush per lap covers a ring) and puts it to their peers. */
+static void tp_put_lanes(const K3Seg *seg, int nseg)
+{
+    const int S = tp_senders(), t = k3_tid();
+    if (t >= S) return;
+    const double t0 = k3_prof_on && t == 0 ? k3_prof_now() : 0.0;
+    const int me = k3_tp.rank;
+    int dsp = 0, cnt = 0;
+    for (int r = 0; r <= me; r++)
+        for (int s = 0; s < nseg; s++) {
+            const int b = tp_blk(&seg[s], r, 1, NULL);
+            if (r < me) dsp += b; else cnt += b;
+        }
+    const uint64_t tag = (uint64_t)tp_seq << 32;
+    const long half = (long)(tp_seq & 1) * k3_tp.ll_hw;
+    for (int l = t; l < k3_tp.ll_nlanes; l += S) {
+        if (++tp_slot[l].v == k3_tp.ll_nsend) { tp_slot[l].v = 0; k3_tp.ll_flush(l); }
+        uint64_t *snd = k3_tp.ll_send + ((size_t)l * k3_tp.ll_nsend + tp_slot[l].v) * k3_tp.ll_hw;
+        /* an empty block sends its flag word, so every call orders every pair of ranks */
+        if (cnt > 0) {
+            tp_pack_words(snd, seg, nseg, tag, l == 0);
+            k3_tp.ll_put(l, snd, cnt, half + dsp);
+        } else {
+            snd[0] = tag;
+            k3_tp.ll_put(l, snd, 1, half + k3_tp.ll_maxw + me);
+        }
+    }
+    if (k3_prof_on && t == 0) k3_prof_s[K3P_COMM] += k3_prof_now() - t0;
 }
 
 /* This thread's share of the packed words, other ranks' blocks only, into the segments. */
