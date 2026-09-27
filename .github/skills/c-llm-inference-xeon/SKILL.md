@@ -1,13 +1,13 @@
 ---
 name: c-llm-inference-xeon
-description: "Use when: optimizing a C (or C++) LLM inference engine for CPU decode speed; porting a model to multi-socket or multi-node Xeon; adding OpenMP, AVX-512, MXFP4/int4/bf16 GEMV kernels, NUMA placement, or MPI tensor parallelism; making results bit-identical across thread and rank counts; profiling memory-bandwidth-bound decode; deciding whether bf16 activations, LIBXSMM, or RDMA/verbs will pay off. Generalized from the Kimi K3 C engine (117 -> 56 ms/token on 16 Xeon sockets)."
+description: "Use when: optimizing a C (or C++) LLM inference engine for CPU decode speed; porting a model to multi-socket or multi-node Xeon; adding OpenMP, AVX-512, MXFP4/int4/bf16 GEMV kernels, NUMA placement, or MPI tensor parallelism; making results bit-identical across thread and rank counts; profiling memory-bandwidth-bound decode; deciding whether bf16 activations, LIBXSMM, or RDMA/verbs will pay off. Generalized from the Kimi K3 C engine (117 -> 55 ms/token on 16 Xeon sockets, 42.5 ms/token on 32)."
 ---
 
 # Fast, exact CPU decode for LLMs in C
 
 A playbook that turned a correct but slow C engine for a 2.8T-parameter MoE model
-into a 16-socket tensor-parallel engine running 2.1× faster, with bit-identical
-output. The steps are ordered: each one relies on the measurements and guarantees of
+into a 16-socket tensor-parallel engine running 2.1× faster (2.8× on 32 sockets), with
+bit-identical output. The steps are ordered: each one relies on the measurements and guarantees of
 the ones before it. Apply them to any decoder-only transformer, dense or MoE.
 
 ## 0. Ground rules (do these first, keep them forever)
@@ -145,14 +145,36 @@ the ones before it. Apply them to any decoder-only transformer, dense or MoE.
   to `tp wait` instead of `tp comm`. At 16 ranks gathers are latency-bound, about
   7 µs each; the floor is one network one-way latency. The remaining levers are
   **fewer gathers** (fusion) and a leaner transport (direct UCX or verbs).
+- **Gather cost follows the rank count, not the node count.** Measure the same rank
+  count on N and 2N nodes: identical here. One sending thread issues P−1 puts, about
+  0.3 µs each through `MPI_Put`, so doubling the ranks doubled the gather time
+  (8.6 → 16.6 µs). If compute does not shrink (more ranks on the same sockets), that
+  shows up as a pure regression.
+- **Direct UCX transport** (`ucp_put_nbx`, same window and tagged words, so same bits)
+  replaced osc/ucx: TP=32 48.3 → 42.5 ms/token, TP=16 56.7 → 55.1. What made it work:
+  - **progress after every put:** a put that returned `UCS_OK` may stay unsent until
+    the next `ucp_worker_progress` (32 ms stalls otherwise);
+  - **flush at the end of every gather:** a rank that moves on and blocks in MPI with
+    a queued put deadlocks the peers spinning on it;
+  - **lower CQ moderation** (`UCX_RC_MLX5_TX_CQ_MODERATION=8`, set with `setenv` before
+    `ucp_config_read`; `ucp_config_modify` of transport keys did nothing): at the
+    default 64 a QP filled with inline puts and 2–18% of them queued;
+  - a **local-only flush** (reap own requests), never a round trip to every peer;
+  - **send lanes:** split the P−1 puts over several team threads, each with its own
+    UCP worker, endpoints to a contiguous share of peers, and send ring. Worth 2.2 ms
+    at 32 ranks (8 lanes), nothing at 16. `UCS_THREAD_MODE_SINGLE` asserts on the
+    owner thread; multi-lane workers need `SERIALIZED`.
+  - Test transports with a microbenchmark **and** the engine: one-thread microbench
+    wins (e.g. bf16 payloads) can vanish when 64 threads receive and 8 send.
 
 ## 7. Precision experiments: measure before adopting
 
 - **bf16 activations** (round inputs to bf16, `vdpbf16ps`, bf16 gathers) change the
   numerics. They helped nothing here, because weight streaming dominates the bytes and
-  the gathers are latency-bound. Keep such modes **opt-in**, rank-invariant (the owner
-  rounds its own block like its peers), and keep selection-critical values (router
-  scores) in fp32.
+  the gathers are latency-bound: bf16 gathers alone at 32 ranks (half the bytes)
+  measured 42.8/43.6 against 43.0/42.6 ms. Keep such modes **opt-in**, rank-invariant
+  (the owner rounds its own block like its peers, e.g. at gather end so several
+  threads can pack), and keep selection-critical values (router scores) in fp32.
 - **int8 activations with VNNI** for 4-bit weights: only worth it when a kernel is
   still compute-bound after step 4.
 
@@ -169,7 +191,8 @@ the ones before it. Apply them to any decoder-only transformer, dense or MoE.
 7. [ ] Task splits for long streams; merged same-input matrices; huge pages; first
    touch.
 8. [ ] TP: per-rank slices, one-sided team gather, overlap, window sizing, NIC pinning.
-9. [ ] Skew/transfer split; gather count; decide on transport work.
+9. [ ] Skew/transfer split; gather count; same ranks on N vs 2N nodes; decide on
+   transport work (direct UCX with send lanes).
 10. [ ] A reproduction guide: hardware, exact commands, expected tokens, variance.
 
 ## Reference numbers (Kimi K3, 8 × 2 Xeon 8592+, TP=16, ms/token)
@@ -185,5 +208,10 @@ the ones before it. Apply them to any decoder-only transformer, dense or MoE.
 | MXFP4 load-time layout + prefetch | 61.3 |
 | one-sided MoE gather + merged q/k/v | 56.4 |
 | NUMA-local HCA | 56.0 |
+| direct UCX transport (1 lane) | 55.1 |
+
+TP=32 (16 × 2 sockets), same session: osc/ucx 48.3, direct UCX 1 lane 44.7,
+8 send lanes **42.5** ms/token (23.5 tokens/s). Compute scales 1.31× from TP=16;
+replicated phases (norms, router, MoE up, recurrence) do not shrink.
 
 For the full recipe, see `docs/REPRODUCE-TP.md`.

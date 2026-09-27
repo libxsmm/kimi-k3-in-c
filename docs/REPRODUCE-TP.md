@@ -7,7 +7,7 @@ other documentation is required.
 
 | config | nodes × sockets | ms/token | tokens/s | peak RSS per rank | status |
 |---|---|---|---|---|---|
-| **TP=32**, 1 rank/socket, pinned HCA, direct UCX (16 nodes) | 16 × 2 | **42.5** | 23.5 | 52.5 GB | measured (42.53 and 42.63; osc/ucx same session: 48.26) |
+| **TP=32**, 1 rank/socket, pinned HCA, direct UCX (16 nodes) | 16 × 2 | **42.5** | 23.5 | 53.6 GB | measured (42.53 and 42.63; osc/ucx same session: 48.26) |
 | TP=16, 1 rank/socket, pinned HCA, direct UCX | 8 × 2 | 55.1 | 18.2 | 101 GB | measured (55.09, 55.27; osc/ucx same session: 56.62, 56.75) |
 | TP=32, 1 rank/socket, osc/ucx (`K3_TP_UCX=0` or no `UCX=` build) | 16 × 2 | 47.6 | 21.0 | 52.5 GB | measured (47.53 to 48.26) |
 | TP=16, 1 rank/socket, osc/ucx | 8 × 2 | 56.0 | 17.9 | 101 GB | measured (best 55.98; unpinned 56.2 to 56.8) |
@@ -114,16 +114,28 @@ mpirun -np 16 --map-by ppr:1:package --bind-to package \
 
 All `-x` options belong to `mpirun`, so they must come **before** `./ucxpin.sh`.
 
-### TP=16: 8 nodes, 1 rank per socket (the 55.1 ms result with a UCX build)
+The best numbers (TP=16 55.09 ms, TP=32 42.53 ms) need the direct UCX transport, so
+build with `UCX=` first (section 3):
+
+```bash
+srun -N1 -n1 bash -c 'source <openmpi>/openmpi_vars.sh &&
+  make MPI=1 UCX=<openmpi>/ucx -j32 bin-mpi/k3 bin-mpi/k3_model'
+```
+
+### TP=16: 8 nodes, 1 rank per socket (best: 55.09 ms)
 
 ```bash
 mpirun -np 16 --map-by ppr:1:package --bind-to package \
        -x OMP_NUM_THREADS=64 -x OMP_PROC_BIND=close -x OMP_PLACES=cores -x K3_PROF=1 \
+       -x K3_TP_UCX_LANES=1 \
        ./ucxpin.sh ./bin-mpi/k3 /path/to/k3model \
        --incremental --experts-resident --ids 19180 --gen 16 --out run16.json
 ```
 
-### TP=32: 16 nodes, 1 rank per socket (the 42.5 ms result with a UCX build)
+`K3_TP_UCX_LANES=1` gave the best TP=16 run (55.09); the default at 16 ranks, 4 lanes,
+measured 55.27, within noise.
+
+### TP=32: 16 nodes, 1 rank per socket (best: 42.53 ms)
 
 ```bash
 salloc -N 16 --exclusive
@@ -132,6 +144,37 @@ mpirun -np 32 --map-by ppr:1:package --bind-to package \
        ./ucxpin.sh ./bin-mpi/k3 /path/to/k3model \
        --incremental --experts-resident --ids 19180 --gen 16 --out run32.json
 ```
+
+The default at 32 ranks is 8 send lanes (42.53 and 42.63; 4 lanes 42.89, 1 lane
+44.71).
+
+### The exact commands behind the best numbers
+
+On the cluster used here (Slurm, no ssh between nodes) `mpirun` ran from the login
+node against an allocation made with `salloc --no-shell`, through a wrapper that sets
+the Slurm environment an `salloc` shell would have and then calls `mpirun`:
+
+```bash
+salloc --partition=emr --nodes=16 --nodelist=pcl-sprh[01-16] --constraint=ddr5600 \
+       --exclusive --time=03:59:00 --no-shell                      # -> JOBID
+# TP=16 (fills the first 8 nodes), 55.09 ms/token
+mpirun_job.sh $JOBID -np 16 --map-by ppr:1:package --bind-to package \
+    -x OMP_NUM_THREADS=64 -x OMP_PROC_BIND=close -x OMP_PLACES=cores -x K3_PROF=1 \
+    -x K3_TP_UCX=1 -x K3_TP_UCX_LANES=1 ucxpin2.sh $PWD/bin-mpi/k3 /scratch/.../k3model \
+    --incremental --experts-resident --ids 19180 --gen 16 --out full_ucx1_16.json
+# TP=32, 42.53 ms/token
+mpirun_job.sh $JOBID -np 32 --map-by ppr:1:package --bind-to package \
+    -x OMP_NUM_THREADS=64 -x OMP_PROC_BIND=close -x OMP_PLACES=cores -x K3_PROF=1 \
+    -x K3_TP_UCX=1 -x K3_TP_UCX_LANES=8 ucxpin2.sh $PWD/bin-mpi/k3 /scratch/.../k3model \
+    --incremental --experts-resident --ids 19180 --gen 16 --out full_ucx8b.json
+```
+
+`mpirun_job.sh JOBID args...` exports `SLURM_JOB_ID`, `SLURM_JOB_NODELIST` and
+`SLURM_JOB_NUM_NODES` from `squeue -j JOBID`, sets `SLURM_TASKS_PER_NODE="2(xN)"`,
+sources Open MPI and runs `mpirun "$@"`. `ucxpin2.sh` is the section 4 script. The
+binary path must be absolute, since the wrapper runs from the rank's working directory.
+Both `K3_TP_UCX` values shown are the defaults of a UCX build; they are spelled out
+only to make the runs explicit.
 
 ### TP=32 on 8 nodes: 2 ranks per socket, 32 cores each (measured 58.9 ms)
 
@@ -162,7 +205,7 @@ What each part does:
 Rank 0 prints the number to report:
 
 ```
-profile: 15 steps after step 0, 55.98 ms/step wall
+profile: 15 steps after step 0, 42.53 ms/step wall
 ```
 
 It averages steps 1 to 15. The `s/token average` line above it also includes step 0
@@ -177,18 +220,9 @@ It averages steps 1 to 15. The `s/token average` line above it also includes ste
 To prove bit-identity across TP sizes, add `--layers 8 --dump-logits a.bin` to two runs
 with different `-np` values and `cmp` the two files.
 
-Representative TP=16 profile (ms/token):
-
-| phase | ms | | phase | ms |
-|---|---|---|---|---|
-| routed experts (MXFP4) | 9.3 | | shared expert | 4.1 |
-| KDA projections (q/k/v, gates) | 9.0 | | MoE up | 3.3 |
-| KDA output (g, o_proj) | 7.6 | | KDA recurrence | 3.0 |
-| TP communication | 5.0 | | AttnRes + norms | 2.9 |
-| router + MoE down | 4.5 | | MLA proj + out | 3.8 |
-
-Each rank reads 8.8 GB of weights per token. There are 581 gathers per token, 8.6 µs
-each when pinned.
+The per-phase profiles of the best TP=16 and TP=32 runs are in section 7. Each rank
+reads 8.81 GB of weights per token at TP=16 and 4.50 GB at TP=32. There are 581
+gathers per token: 8.6 µs each at TP=16 and 5.5 µs at TP=32 with the UCX build.
 
 ## 7. Scaling notes: what changes at TP=32
 
@@ -197,33 +231,35 @@ each when pinned.
 - **2 ranks per socket on 8 nodes is not faster** (58.9 vs 56.0 ms). Each socket
   still streams the same bytes, and two ranks now share one HCA. Communication roughly
   doubled, to 10.0 ms (17.3 µs per gather).
-- **TP=32 on 16 nodes, measured: 47.6 ms/token (21.0 tokens/s), 1.20x over TP=16.**
-  Each rank reads 4.50 GB per token instead of 8.8 GB. Both runs below are from the
-  same session on the same 16 nodes (TP=16 used 8 of them), HCA-pinned, and give the
-  reference tokens:
+- **TP=32 on 16 nodes: best 42.53 ms/token (23.5 tokens/s), 1.30x over the best
+  TP=16 (55.09 ms).** Each rank reads 4.50 GB per token instead of 8.81 GB. Both are
+  the best runs of one session on the same 16 nodes (TP=16 used 8 of them),
+  HCA-pinned, direct UCX transport, with the reference tokens; commands in section 6:
 
-  | ms/token | TP=16 (8 nodes) | TP=32 (16 nodes) | speedup |
+  | ms/token | TP=16 (8 nodes, 1 lane) | TP=32 (16 nodes, 8 lanes) | speedup |
   |---|---|---|---|
-  | **wall** | 57.04 | **47.62** (repeat 47.53) | 1.20x |
-  | compute (wall − comm − untimed) | 49.8 | 35.3 | 1.41x |
-  | TP communication | 5.06 (8.7 µs/gather) | 9.65 (16.6 µs/gather) | 0.52x |
-  | KDA projections | 8.99 | 5.17 | 1.74x |
-  | KDA output | 8.11 | 5.97 | 1.36x |
-  | routed experts | 9.41 | 6.65 | 1.41x |
-  | shared expert | 4.26 | 1.22 | 3.5x |
-  | MoE up | 3.25 | 2.79 | 1.17x |
-  | MLA proj + out | 3.92 | 2.98 | 1.32x |
-  | KDA recurrence | 3.27 | 2.99 | 1.09x |
-  | AttnRes + norms | 2.99 | 2.98 | 1.0x |
-  | router + MoE down | 4.57 | 3.99 | 1.15x |
-  | peak RSS per rank | 101.2 GB | 52.5 GB | |
+  | **wall** | **55.09** | **42.53** (repeat 42.63) | 1.30x |
+  | tokens/s | 18.2 | 23.5 | |
+  | compute (wall − comm − untimed) | 47.9 | 36.6 | 1.31x |
+  | TP communication | 4.98 (8.6 µs/gather) | 3.20 (5.5 µs/gather) | 1.55x |
+  | KDA projections | 8.86 | 5.13 | 1.73x |
+  | KDA output | 7.54 | 6.13 | 1.23x |
+  | routed experts | 9.07 | 6.60 | 1.38x |
+  | shared expert | 4.32 | 2.24 | 1.93x |
+  | MoE up | 3.10 | 3.13 | 1.0x |
+  | MLA proj + out | 3.75 | 3.17 | 1.18x |
+  | KDA recurrence | 3.12 | 2.83 | 1.10x |
+  | AttnRes + norms | 2.91 | 2.90 | 1.0x |
+  | router + MoE down | 4.22 | 3.91 | 1.08x |
+  | untimed | 2.21 | 2.77 | |
+  | peak RSS per rank | 101.2 GB | 53.6 GB | |
 
-  The weight-streaming phases scale well; AttnRes, norms, the router and the KDA
-  recurrence are replicated or fixed per rank and do not shrink. Communication doubles:
-  still 581 gathers per token, but each waits on 31 peers instead of 15, so it becomes
-  the largest phase (20%). That makes the native transport (section 10) worth more at
-  TP=32. The pre-measurement estimate was 35 to 45 ms. With the direct UCX transport
-  (section 10) the same TP=32 run takes 42.5 ms, communication 3.2 ms (5.5 µs/gather).
+  The weight-streaming phases scale; AttnRes, norms, the router, MoE up and the KDA
+  recurrence are replicated or fixed per rank and barely shrink. Before the direct UCX
+  transport the same pair measured 57.04 against 47.62 ms (1.20x), with TP=32
+  communication at 9.65 ms (16.6 µs/gather), the largest phase; with osc/ucx each
+  gather's cost grows with the 31 peers (next point). The pre-measurement estimate for
+  TP=32 was 35 to 45 ms.
 - **Communication cost follows the rank count, not the node count.** `bench_allgather`
   at 32 ranks gives the same gather times on 8 nodes (2 ranks/socket) and on 16 nodes
   (1 rank/socket), e.g. 21.8 against 22.9 µs at 7168 floats, and the TP=32 engine paid
