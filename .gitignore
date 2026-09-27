@@ -53,6 +53,9 @@ venv/
 *.swp
 *~
 
+# written by test_expert for tools/verify_expert.py
+/expert_dump.json
+
 # ----------------------------------------------------------------------------------
 # Test fixtures are PART OF THE REPOSITORY and must survive every rule above.
 #
