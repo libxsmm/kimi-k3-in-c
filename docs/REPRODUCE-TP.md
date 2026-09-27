@@ -248,7 +248,7 @@ All of these are off, or at their fastest, by default. They exist for A/B testin
 | `K3_NO_QKV=1` | do not merge the q/k/v rows into one stream per thread: slightly slower, same bits |
 | `K3_NOHUGE=1` | no huge-page hint for the resident experts |
 | `K3_TP_SKEW=1` | barrier before every gather, so that rank skew (`tp wait`) is split from transfer (`tp comm`) |
-| `--bf16-act` | matmul inputs rounded to bf16, bf16 dot products, bf16 gathers. Not the exact engine; measured 56.6 to 58.3 ms at TP=16, so no faster here. `K3_BF16_PARTS=1\|2\|4` enables one part at a time: bf16 matmuls, MXFP4, gathers |
+| `--bf16-act` | matmul inputs rounded to bf16, bf16 dot products, bf16 gathers. Not the exact engine; measured 56.6 to 58.3 ms at TP=16, so no faster here. `K3_BF16_PARTS=1\|2\|4` enables one part at a time: bf16 matmuls, MXFP4, gathers. At TP=32 with UCX send lanes, bf16 gathers alone (`K3_BF16_PARTS=4`, half the bytes) measured 42.77 and 43.62 ms against 42.96 and 42.55 fp32: no gain |
 
 ## 9. Variance and pitfalls
 
@@ -281,7 +281,9 @@ reference. Parts of it:
   requests and never waits a round trip to every peer as `MPI_Win_flush_local_all` does.
 - **Send lanes.** The P−1 puts of a gather are split over `K3_TP_UCX_LANES` team
   threads, each with its own UCP worker and endpoints to a contiguous share of the
-  peers, and its own send ring. Skew mode and bf16 gathers keep one sender.
+  peers, and its own send ring. Skew mode keeps one sender. A bf16 gather's owner
+  rounds its own block at the end of the gather, so lanes work with bf16 too
+  (np=32 logits == np=3, and UCX == osc/ucx).
 - **Measured pitfalls**, each of which cost a hang or a large slowdown:
   1. A put that returned `UCS_OK` can stay unsent until the next
      `ucp_worker_progress`: the transport progresses after every put (without it,
@@ -310,10 +312,13 @@ floats 13.8 → 10.0, 896 floats 14.3 → 11.2, 12288 floats 34.7 → 26.1; the 
 
 ### Left
 
-1. **Wire format, about 0.3 to 0.5 ms.** Every float still travels as an 8-byte
-   `seq << 32 | bits` word. RDMA writes on one RC queue pair land in order, so raw
-   4-byte floats plus one flag word per block would halve the bytes, mostly for the
-   55k-float MoE activation gather. Needs raw verbs or a verified ordering guarantee.
+1. **Wire format: measured not worth it at TP=32.** Every float still travels as an
+   8-byte `seq << 32 | bits` word. bf16 gathers (`--bf16-act`, `K3_BF16_PARTS=4`)
+   already halve the bytes: one-thread `bench_allgather` gains (7168 floats 23.2 →
+   18.9 µs, 55296 floats 80 → 50 µs), but the engine does not (42.77 and 43.62 ms
+   against 42.96 and 42.55 fp32; communication 3.2 → 3.1 ms). With 8 send lanes and
+   64 receiving threads a gather is latency-bound, not volume-bound, so a 4-byte
+   format should not help either.
 2. **Raw verbs**: one doorbell for several inline writes; only worth it if the
    per-put cost is still visible after lanes (at 8 lanes a gather is 5.5 µs, close to
    two network latencies).
