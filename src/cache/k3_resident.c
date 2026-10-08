@@ -34,6 +34,7 @@ static int res_get(K3ExpertSrc *self, int layer, int expert, K3ExpertQ *out)
     out->p2 = b + e->m[1].p_off; out->s2 = b + e->m[1].s_off;
     out->p3 = b + e->m[2].p_off; out->s3 = b + e->m[2].s_off;
     out->ilv = r->ilv;
+    out->qt1 = out->qt3 = out->qt2 = K3_EQ_MXFP4;
     return 0;
 }
 

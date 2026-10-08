@@ -32,6 +32,7 @@
 #define _POSIX_C_SOURCE 200809L   /* clock_gettime under -std=c99 */
 
 #include "k3.h"
+#include "k3_gq.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -485,7 +486,7 @@ static void k3_fatal_bound(const char *what, long value, long limit)
  * 64-byte aligned) and is never freed. The main thread is tid 0 both inside and outside
  * a team, so a slot must not be live across a call that uses the same slot. */
 enum { K3S_MLA_SC, K3S_MOE_AN, K3S_ROUTER_CHOICE, K3S_ROUTER_SCORE, K3S_MOE_SCORE,
-       K3S_MXFP4_XD, K3S_PREFILL, K3S_SEGS, K3S_KDA_STATE, K3S_XBF, K3S_QKV, K3S_N };
+       K3S_MXFP4_XD, K3S_PREFILL, K3S_SEGS, K3S_KDA_STATE, K3S_XBF, K3S_QKV, K3S_XQ8, K3S_N };
 #define K3S_MAXT 1024
 static void  *k3s_buf[K3S_MAXT][K3S_N];
 static size_t k3s_cap[K3S_MAXT][K3S_N];
@@ -624,6 +625,34 @@ static void matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
 
 /* See k3.h. Incremented whenever a streamed expert cannot be fetched. */
 long k3_expert_drops = 0;
+int  k3_expert_q8 = 0;
+
+/* Rows [r0, r1) of one expert matrix in its K3_EQ_* format, indexed as mxfp4_rows is.
+ * xq/dx select int8 activations for the GGUF formats; NULL keeps the exact fp32 path. */
+static void eq_rows(float *y, const float *x, const double *xd, const int8_t *xq,
+                    const float *dx, const unsigned char *p, const unsigned char *s, int qt,
+                    int in, int r0, int r1, int rbase, int group, int ilv)
+{
+    if (qt == K3_EQ_MXFP4) { mxfp4_rows(y, x, xd, p, s, in, r0, r1, rbase, group, ilv); return; }
+    if (r1 <= r0) return;
+    const int t = qt == K3_EQ_IQ2XS ? K3_GG_IQ2_XS : K3_GG_IQ3_XXS;
+    const unsigned char *W = p + (size_t)(r0 - rbase) * k3_gq_row_bytes(t, in);
+    if (xq) {
+        if (qt == K3_EQ_IQ2XS) k3_iq2xs_rows_q8(y + r0, xq, dx, W, in, 0, r1 - r0);
+        else                   k3_iq3xxs_rows_q8(y + r0, xq, dx, W, in, 0, r1 - r0);
+    } else {
+        if (qt == K3_EQ_IQ2XS) k3_iq2xs_rows(y + r0, x, W, in, 0, r1 - r0);
+        else                   k3_iq3xxs_rows(y + r0, x, W, in, 0, r1 - r0);
+    }
+}
+
+static void eq_matmul(float *y, const float *x, const unsigned char *p, const unsigned char *s,
+                      int qt, int in, int rows, int ilv)
+{
+    if (qt == K3_EQ_MXFP4) { matmul_mxfp4(y, x, p, s, in, rows, K3_MXFP4_GROUP, ilv); return; }
+    K3_TEAM_IF(rows > 64, int lo, hi; k3_split(rows, &lo, &hi);
+               eq_rows(y, x, NULL, NULL, NULL, p, s, qt, in, lo, hi, 0, 0, 0));
+}
 
 /* Rows [r0, r1) of y = W x. W holds every row, or under k3_tp.local only this rank's
  * rows, in which case r0 is by construction where the slice starts. Per row this IS
@@ -652,6 +681,7 @@ static void mmw_part(float *y, const float *x, const void *W, int wdt, int in,
     const unsigned char *Wr = (const unsigned char *)W
         + (size_t)(k3_tp.local ? r0 - base : r0) * k3_row_bytes(wdt, in);
     if (wdt == K3_WBF16)    matmul_bf16_rows(y + r0, x, (const uint16_t *)Wr, in, 0, r1 - r0);
+    else if (wdt == K3_WQ8_0) k3_q80_rows(y + r0, x, Wr, in, 0, r1 - r0);
     else if (wdt == K3_WI8) matmul_q8_rows(y + r0, x, Wr, in, 0, r1 - r0);
     else                    matmul_f32_rows(y + r0, x, (const float *)Wr, in, 0, r1 - r0);
 }
@@ -1018,7 +1048,7 @@ static void mla_team(float *out, const float *x, const K3MlaW *w, const K3Cfg *c
         if (k3_tid() == 0) memcpy(K3_ROPE_AT(p), ct + c->kv_lora, (size_t)qr * sizeof(float));
         k3_sync();
         mmw_rows(q + (size_t)t * H * qh, ql, w->q_b, w->wdt, c->q_lora, h0 * qh, h1 * qh);
-        mmw_rows(K3_KV_AT(p), ct, w->kv_b, w->wdt, c->kv_lora, h0 * kvd, h1 * kvd);
+        mmw_rows(K3_KV_AT(p), ct, w->kv_b, w->kv_b_wdt, c->kv_lora, h0 * kvd, h1 * kvd);
         k3_sync();                          /* ql/ct are rewritten by the next token */
     }
     k3_prof_add(K3P_MLA_PROJ, tp);
@@ -1351,6 +1381,28 @@ static void moe_routed(float *accL, const float *z, const K3MoeW *w, const K3Exp
 #endif
     }
 
+    /* int8 activations for GGUF experts (K3_EXPERT_Q8): z once here, act after its gather */
+    static int8_t *zq, *aq;
+    static float  *zdx, *adx;
+    const int nzb = L / K3_GQ_QK, nab = I / K3_GQ_QK;
+    const int q8 = q && nq > 0 && k3_expert_q8 && q[0].qt1 != K3_EQ_MXFP4 &&
+                   k3_gq_have_q8() && L % K3_GQ_QK == 0 && I % K3_GQ_QK == 0;
+    if (q8) {
+        if (k3_tid() == 0) {
+            const size_t nb8 = (size_t)L + (size_t)nq * I;
+            unsigned char *pool = (unsigned char *)k3_scratch(K3S_XQ8,
+                nb8 + 64 + sizeof(float) * ((size_t)nzb + (size_t)nq * nab), "int8 activations");
+            zq = (int8_t *)pool; aq = zq + L;
+            zdx = (float *)(pool + ((nb8 + 63) & ~(size_t)63)); adx = zdx + nzb;
+        }
+        k3_sync();
+        int lo, hi;
+        k3_split(nzb, &lo, &hi);
+        for (int b = lo; b < hi; b++)
+            k3_gq_quant_x(zq + (size_t)b * K3_GQ_QK, zdx + b, z + (size_t)b * K3_GQ_QK, K3_GQ_QK);
+        k3_sync();
+    }
+
     /* gate|up split over (expert, row block) tasks, about one per thread, so each thread
      * streams two long contiguous runs rather than a few rows of every expert, and SiTU
      * on the same rows by the same thread: no barrier between them */
@@ -1364,8 +1416,10 @@ static void moe_routed(float *accL, const float *z, const K3MoeW *w, const K3Exp
             if (r1 <= r0) continue;
             float *g = gu + (size_t)j * 2 * I;
             if (q) {
-                mxfp4_rows(g,     z, zd, q[j].p1, q[j].s1, L, r0, r1, sliced ? i0 : 0, G, q[j].ilv);
-                mxfp4_rows(g + I, z, zd, q[j].p3, q[j].s3, L, r0, r1, sliced ? i0 : 0, G, q[j].ilv);
+                eq_rows(g,     z, zd, q8 ? zq : NULL, zdx, q[j].p1, q[j].s1, q[j].qt1, L,
+                        r0, r1, sliced ? i0 : 0, G, q[j].ilv);
+                eq_rows(g + I, z, zd, q8 ? zq : NULL, zdx, q[j].p3, q[j].s3, q[j].qt3, L,
+                        r0, r1, sliced ? i0 : 0, G, q[j].ilv);
             } else {
                 matmul_f32_rows(g,     z, w->w1 + (size_t)eidx[j] * I * L, L, r0, r1);
                 matmul_f32_rows(g + I, z, w->w3 + (size_t)eidx[j] * I * L, L, r0, r1);
@@ -1383,6 +1437,15 @@ static void moe_routed(float *accL, const float *z, const K3MoeW *w, const K3Exp
         }
         if (extra.p) sg[ng++] = extra;
         k3_tp_gather(sg, ng);
+    }
+    if (q8) {
+        int lo, hi;
+        k3_split(nq * nab, &lo, &hi);
+        for (int b = lo; b < hi; b++) {
+            const size_t off = (size_t)(b / nab) * I + (size_t)(b % nab) * K3_GQ_QK;
+            k3_gq_quant_x(aq + off, adx + b, act + off, K3_GQ_QK);
+        }
+        k3_sync();
     }
 
 #if !defined(K3_AVX512)
@@ -1406,8 +1469,9 @@ static void moe_routed(float *accL, const float *z, const K3MoeW *w, const K3Exp
             const int r0 = l0 + (int)((long)nl * b / nb), r1 = l0 + (int)((long)nl * (b + 1) / nb);
             if (r1 <= r0) continue;
             if (q)
-                mxfp4_rows(edn + (size_t)j * L, act + (size_t)j * I, ad ? ad + (size_t)j * I : NULL,
-                           q[j].p2, q[j].s2, I, r0, r1, sliced ? l0 : 0, G, q[j].ilv);
+                eq_rows(edn + (size_t)j * L, act + (size_t)j * I, ad ? ad + (size_t)j * I : NULL,
+                        q8 ? aq + (size_t)j * I : NULL, q8 ? adx + (size_t)j * nab : NULL,
+                        q[j].p2, q[j].s2, q[j].qt2, I, r0, r1, sliced ? l0 : 0, G, q[j].ilv);
             else
                 matmul_f32_rows(edn + (size_t)j * L, act + (size_t)j * I,
                                 w->w2 + (size_t)eidx[j] * L * I, I, r0, r1);
@@ -1723,6 +1787,7 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
     for (int u = 0; u < nu; u++) {
         const int e = uniq[u];
         K3ExpertQ q;
+        memset(&q, 0, sizeof q);
         if (w->src->get(w->src, w->layer, e, &q) != 0) {
             k3_expert_drops++;
             fprintf(stderr, "EXPERT DROP: layer %d expert %d failed to load; "
@@ -1751,10 +1816,10 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
             const float *zt = zz  + (size_t)t * Ll;
             for (int j = 0; j < K; j++) {
                 if (it[j] != e) continue;
-                matmul_mxfp4(gu,     zt, q.p1, q.s1, Ll, I, K3_MXFP4_GROUP, q.ilv);
-                matmul_mxfp4(gu + I, zt, q.p3, q.s3, Ll, I, K3_MXFP4_GROUP, q.ilv);
+                eq_matmul(gu,     zt, q.p1, q.s1, q.qt1, Ll, I, q.ilv);
+                eq_matmul(gu + I, zt, q.p3, q.s3, q.qt3, Ll, I, q.ilv);
                 k3_situ_glu(act, gu, I, c->situ_b1, c->situ_b2);
-                matmul_mxfp4(edn, act, q.p2, q.s2, I, Ll, K3_MXFP4_GROUP, q.ilv);
+                eq_matmul(edn, act, q.p2, q.s2, q.qt2, I, Ll, q.ilv);
                 memcpy(contrib + ((size_t)t * K + j) * Ll, edn, (size_t)Ll * sizeof(float));
             }
         }
@@ -1843,7 +1908,7 @@ static void kda_layer_team(float *out, const float *x, const K3KdaW *w, const K3
             mmw_rows(k + (size_t)t * P, xt, w->k, w->wdt, E, c0, c1);
             mmw_rows(v + (size_t)t * P, xt, w->v, w->wdt, E, c0, c1);
         }
-        mmw_rows(bt + (size_t)t * H, xt, w->b, w->wdt, E, h0, h1);
+        mmw_rows(bt + (size_t)t * H, xt, w->b, w->b_wdt, E, h0, h1);
         /* ONE shared low-rank pair feeds every head: [E->D] then [D->H*D]. The D-row f_a
          * is recomputed on every rank rather than gathered. */
         k3_mmw(fa, xt, w->f_a, w->wdt, E, D);
@@ -2368,6 +2433,12 @@ void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out
 {
     K3_TEAM_IF(out > 64, int lo, hi; k3_split(out, &lo, &hi);
                matmul_bf16_rows(y, x, W, in, lo, hi));
+}
+
+void k3_matmul_q80(float *y, const float *x, const void *W, int in, int out)
+{
+    K3_TEAM_IF(out > 64, int lo, hi; k3_split(out, &lo, &hi);
+               k3_q80_rows(y, x, W, in, lo, hi));
 }
 
 /* Per-row int8 matmul for the draft model: each row is [f32 scale][int8 * in]. The int8

@@ -31,6 +31,7 @@ static void fill_q(const K3Cache *c, int slot, K3ExpertQ *q)
     q->p2 = b + r->m[1].p_off; q->s2 = b + r->m[1].s_off;
     q->p3 = b + r->m[2].p_off; q->s3 = b + r->m[2].s_off;
     q->ilv = 0;
+    q->qt1 = q->qt3 = q->qt2 = K3_EQ_MXFP4;
 }
 
 /* Least recently used unpinned slot. Linear, deliberately: a few hundred comparisons

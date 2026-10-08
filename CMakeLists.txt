@@ -94,12 +94,15 @@ endif()
 # --------------------------------------------------------------------------- engine --
 add_library(k3 STATIC
   src/core/k3_ops.c
+  src/core/k3_gq.c
+  src/io/k3_gguf.c
   src/io/k3_st.c
   src/io/k3_load.c
   src/io/k3_trunk.c
   src/cache/k3_cache.c
   src/cache/k3_resident.c
-  src/model/k3_bind.c)
+  src/model/k3_bind.c
+  src/model/k3_gguf_bind.c)
 
 target_include_directories(k3 PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -154,6 +157,7 @@ function(k3_add_test name src)
 endfunction()
 
 k3_add_test(test_ops    tests/unit/test_ops.c)
+k3_add_test(test_gguf   tests/unit/test_gguf.c)
 k3_add_test(test_cache  tests/unit/test_cache.c)
 k3_add_test(test_st     tests/unit/test_st.c)
 k3_add_test(test_model_stream tests/unit/test_model_stream.c)
@@ -172,6 +176,7 @@ set(FIX ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures)
 # systems are documented as interchangeable, so a test present in one and absent from
 # the other silently gives ctest less coverage than `make test`.
 add_test(NAME ops        COMMAND test_ops   ${FIX}/ops)
+add_test(NAME gguf       COMMAND test_gguf  ${CMAKE_CURRENT_BINARY_DIR})
 add_test(NAME cache      COMMAND test_cache ${FIX}/cache)
 add_test(NAME config     COMMAND test_cfg   fixture ${FIX}/ref_k3.json)
 add_test(NAME scale      COMMAND scale_test)

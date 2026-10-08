@@ -64,6 +64,7 @@
 #include "k3_bind.h"
 #include "k3_cache.h"
 #include "k3_resident.h"
+#include "k3_gguf_bind.h"
 #include "k3_trunk.h"
 #include "k3_tok.h"   /* text in/out; the --ids path never touches it */
 #include "k3_chat.h"
@@ -1052,6 +1053,15 @@ static int k3_main(int argc, char **argv)
                         "memory contract\n");
         return 2;
     }
+    /* A *.gguf model (any shard of a split one) is bound from GGUF and runs fully resident. */
+    const size_t dlen = strlen(dir);
+    const int gguf = dlen > 5 && !strcmp(dir + dlen - 5, ".gguf");
+    if (gguf && (ultra || trunk_dir || draft_dir || budget_auto)) {
+        fprintf(stderr, "a GGUF model runs fully resident: --trunk, --ultra-low-memory, "
+                        "--draft-trunk and auto budgets do not apply\n");
+        return 2;
+    }
+    if (getenv("K3_EXPERT_Q8") && atoi(getenv("K3_EXPERT_Q8")) > 0) k3_expert_q8 = 1;
     if (ultra && budget_auto) {
         fprintf(stderr, "--ultra-low-memory uses explicit bounded budgets; use "
                         "--preset ultra or pass --trunk-gb/--cache-gb\n");
@@ -1211,7 +1221,15 @@ static int k3_main(int argc, char **argv)
     /* fa is sized for the released 24 MLA layers with generous headroom; k3_cfg_load
      * refuses a config that would overrun it rather than truncating the layer map. */
     K3Cfg c; static int fa[128];
-    if (!real_cfg(&c, fa, 128, dir, cfg_path)) {
+    static K3Gguf gg;
+    if (gguf) {
+        const double tg = now_s();
+        if (k3_gguf_open(&gg, dir) != 0 || !k3_gguf_cfg(&gg, &c, fa, 128)) {
+            fprintf(stderr, "ABORTED: %s could not be read as a kimi-k3 GGUF.\n", dir);
+            return 2;
+        }
+        printf("gguf: %d tensors from %d shards in %.2f s\n", gg.nt, gg.st.nshard, now_s() - tg);
+    } else if (!real_cfg(&c, fa, 128, dir, cfg_path)) {
         fprintf(stderr, "ABORTED: the model config could not be read with confidence.\n");
         return 2;
     }
@@ -1431,16 +1449,19 @@ static int k3_main(int argc, char **argv)
     printf("\n");
 
     K3St st;
+    memset(&st, 0, sizeof st);
     double t0 = now_s();
-    if (k3_st_open(&st, dir) != 0) return 1;
-    printf("indexed %d tensors from %d shards in %.2f s\n", st.nt, st.nshard, now_s() - t0);
+    if (!gguf) {
+        if (k3_st_open(&st, dir) != 0) return 1;
+        printf("indexed %d tensors from %d shards in %.2f s\n", st.nt, st.nshard, now_s() - t0);
+    }
 
     /* ---- how much will this take? Report BEFORE allocating, so a box that cannot
      * hold it fails with a number rather than an OOM kill. ---- */
     const int NL = (want_layers > 0 && want_layers < c.n_layers) ? want_layers : c.n_layers;
     int64_t total = 0; int missing = 0;
     for (int L = 0; L < NL; L++) {
-        const int64_t n = k3_bind_layer_bytes(&st, &c, L);
+        const int64_t n = gguf ? k3_gguf_layer_bytes(&gg, &c, L) : k3_bind_layer_bytes(&st, &c, L);
         if (n < 0) { missing++; continue; }
         total += n;
     }
@@ -1469,7 +1490,8 @@ static int k3_main(int argc, char **argv)
         const double w_model = ultra
             ? (double)K3_MODEL_STREAM_CHUNK + 2.0 * K3_ST_ALIGN + 3.0 * E64 * 4
             : 2.0 * (double)c.vocab * E64 * 2 + 3.0 * E64 * 4;
-        const double w_cache = experts_res
+        const double w_cache = gguf ? k3_gguf_experts_bytes(&gg, &c, NL)
+            : experts_res
             ? (double)k3_resident_bytes(&st, &c, 0, NL) / k3_tp.size : cache_gb * 1e9;
         const int Tm = np + gen + 1;
         const int mb = c.n_layers / c.attn_res_block + 2;
@@ -1543,7 +1565,8 @@ static int k3_main(int argc, char **argv)
         printf("trunk streaming enabled from %s in %.1f s\n", trunk_dir, now_s() - t0);
     } else {
         for (int L = 0; L < NL; L++) {
-            if (k3_bind_layer(&st, &c, L, &w.lay[L]) != 0) {
+            if ((gguf ? k3_gguf_bind_layer(&gg, &c, L, &w.lay[L])
+                      : k3_bind_layer(&st, &c, L, &w.lay[L])) != 0) {
                 fprintf(stderr, "bind failed at layer %d\n", L); return 1;
             }
             w.n_bound = L + 1;
@@ -1559,7 +1582,8 @@ static int k3_main(int argc, char **argv)
 
     t0 = now_s();
     w.ultra = ultra;
-    if (k3_bind_model_parts(&st, &c, !ultra, !ultra, &w.mb) != 0) return 1;
+    if ((gguf ? k3_gguf_bind_model(&gg, &c, &w.mb)
+              : k3_bind_model_parts(&st, &c, !ultra, !ultra, &w.mb)) != 0) return 1;
     if (ultra && k3_model_stream_init(&w.ms, &st, &c) != 0) return 1;
     human((double)w.mb.nbytes, b1, sizeof b1);
     if (ultra)
@@ -1570,7 +1594,14 @@ static int k3_main(int argc, char **argv)
 
     K3Cache cache;
     static K3Resident res;
-    if (experts_res) {
+    static K3GgufExperts gx;
+    if (gguf) {
+        memset(&cache, 0, sizeof cache);
+        t0 = now_s();
+        if (k3_gguf_experts_init(&gx, &gg, &c, NL) != 0) return 1;
+        printf("routed experts resident: %.1f GB in %.1f s\n", gx.bytes / 1e9, now_s() - t0);
+        w.esrc = &gx.src;
+    } else if (experts_res) {
         /* A zeroed cache is inert: its stats, report, dumps and free all see zero slots. */
         memset(&cache, 0, sizeof cache);
         if (k3_resident_init(&res, &st, &c, 0, NL) != 0) return 1;
@@ -1582,7 +1613,7 @@ static int k3_main(int argc, char **argv)
         printf("peak RSS after loading weights: %s  (the plan above is a forecast, "
                "this is measured)\n", rb);
     }
-    if (!experts_res)
+    if (!experts_res && !gguf)
         printf("expert cache: %d slots x %.2f MB = %.2f GB (%.2f%% of the 1.45 TB expert pool)\n\n",
                cache.nslot, (double)cache.slot_bytes / 1e6,
                (double)cache.nslot * cache.slot_bytes / 1e9,
@@ -1711,6 +1742,7 @@ static int k3_main(int argc, char **argv)
         free(w.layer_s);
         for (int L = 0; L < w.n_bound; L++) k3_bind_free(&w.lay[L]);
         free(w.lay); k3_bind_model_free(&w.mb); k3_st_close(&st);
+        if (gguf) { k3_gguf_experts_free(&gx); k3_gguf_close(&gg); }
         free(h); free(br); free(ks); free(sc); free(lg); free(seq); free(outtok);
         free(prompt); k3_chat_history_free(&chat_history);
         if (k3_expert_drops) {
@@ -1988,6 +2020,13 @@ static int k3_main(int argc, char **argv)
                 fprintf(stderr, "cannot open %s for the logits dump\n", logits_path);
             }
         }
+        /* K3_DUMP_ALL_LOGITS=1: also every later step, as <path>.<step> */
+        if (logits_path && g > 0 && k3_tp.rank == 0 && getenv("K3_DUMP_ALL_LOGITS")) {
+            char lp[1024];
+            snprintf(lp, sizeof lp, "%s.%d", logits_path, g);
+            FILE *lf = fopen(lp, "wb");
+            if (lf) { fwrite(lg, sizeof(float), (size_t)c.vocab, lf); fclose(lf); }
+        }
         const double dt = now_s() - ts;
         t_total += dt;
         if (g >= 1) { prof_wall += dt; prof_steps++; }
@@ -2108,11 +2147,14 @@ static int k3_main(int argc, char **argv)
          * experts of each MoE layer, and the lm_head. Under tensor parallelism these are
          * this rank's shares. */
         const double share = k3_tp.local ? 1.0 / k3_tp.size : 1.0;
-        double wb = (double)c.vocab * c.hidden * 2.0 * share;
+        double wb = (double)c.vocab * (gguf ? (double)k3_row_bytes(w.mb.wdt, c.hidden)
+                                            : c.hidden * 2.0) * share;
         for (int L = 0; L < NL; L++) {
             K3ExpertRef er;
             if (w.lay[L].blob) wb += (double)w.lay[L].nbytes;
-            if (!k3_is_dense(&c, L) && k3_expert_ref(&st, L, 0, &er) == 0)
+            if (gguf && !k3_is_dense(&c, L))
+                wb += (double)c.topk * (double)gx.ebytes[L];
+            else if (!k3_is_dense(&c, L) && k3_expert_ref(&st, L, 0, &er) == 0)
                 wb += (double)c.topk * (double)er.nbytes * (experts_res ? share : 1.0);
         }
         printf("  weights read per step %.2f GB%s -> %.1f GB/s effective\n",
@@ -2214,6 +2256,7 @@ static int k3_main(int argc, char **argv)
     k3_model_stream_free(&w.ms);
     k3_bind_model_free(&w.mb);
     k3_st_close(&st);
+    if (gguf) { k3_gguf_experts_free(&gx); k3_gguf_close(&gg); }
     free(h); free(br); free(ks); free(sc); free(lg); free(generated_text);
 
     /* A dropped expert means some token was computed with part of its routed sum

@@ -477,6 +477,7 @@ int k3_bind_layer(const K3St *s, const K3Cfg *c, int L, K3LayerBind *b)
     /* Tag the structs to match how their matrices were ACTUALLY stored, which is what
      * plan_resolve just decided, not what this function hoped for. */
     b->kda.wdt = b->mla.wdt = b->moe.wdt = b->lay.wdt = wdt;
+    b->kda.b_wdt = b->mla.kv_b_wdt = wdt;
 
     /* Exactly one of kda/mla is non-NULL; the decoder branches on that, not on a flag. */
     b->lay.kda = is_mla ? NULL : &b->kda;
@@ -630,6 +631,7 @@ int k3_bind_layer_mem(const K3Cfg *c, int L, K3LayerBind *b,
      * describes the layer. The two formats are never mixed within a packed trunk. */
     const int lw = i8_seen ? K3_WI8 : K3_WBF16;
     b->kda.wdt = b->mla.wdt = b->moe.wdt = b->lay.wdt = lw;
+    b->kda.b_wdt = b->mla.kv_b_wdt = lw;
     b->lay.kda = is_mla ? NULL : &b->kda;
     b->lay.mla = is_mla ? &b->mla : NULL;
     b->lay.moe = is_dense ? NULL : &b->moe;

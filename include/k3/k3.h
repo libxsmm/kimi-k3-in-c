@@ -350,6 +350,7 @@ typedef struct {
     const void  *o, *g;                 /* g may be NULL when the gate is disabled */
     const float *q_a_norm, *kv_a_norm;  /* elementwise in k3_rmsnorm: stays fp32   */
     int          wdt;
+    int          kv_b_wdt;              /* kv_b's own tag; binders set it with wdt  */
 } K3MlaW;
 
 size_t k3_mla_scratch(const K3Cfg *c, int T);
@@ -411,7 +412,7 @@ void k3_attn_res(float *out, const float *src, const float *fold,
  * never emitted directly and it carries no exactness contract, which is what lets it use
  * a fast, non-deterministic kernel. Each row is stored inline as [f32 scale][int8 * in],
  * so a matrix stays a single tagged pointer. Never tagged on the exact model. */
-enum { K3_WF32 = 0, K3_WBF16 = 1, K3_WI8 = 2 };
+enum { K3_WF32 = 0, K3_WBF16 = 1, K3_WI8 = 2, K3_WQ8_0 = 3 };
 
 /* bf16 -> f32 is a pure left shift: bf16 IS the top 16 bits of an f32. No rounding,
  * no table, no exponent rebias. */
@@ -428,6 +429,10 @@ void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out
  * No determinism contract (see K3_WI8): uses the fastest AVX2 form available. */
 void k3_matmul_q8(float *y, const float *x, const void *W, int in, int out);
 
+/* ggml Q8_0 rows (the GGUF trunk): per 32 weights an fp16 scale and 32 int8. Exact: equals
+ * dequantise-then-k3_matmul to the bit. in % 32 == 0. */
+void k3_matmul_q80(float *y, const float *x, const void *W, int in, int out);
+
 /* The one call every trunk matmul goes through. Dispatch is a predictable branch on a
  * per-layer flag, outside the inner loops, so it costs nothing measurable. Inside a
  * team (see K3_TEAM_IF) each thread computes its share of the rows, with no barrier. */
@@ -435,6 +440,7 @@ static inline void k3_mmw(float *y, const float *x, const void *W, int wdt,
                           int in, int out)
 {
     if (wdt == K3_WBF16)     k3_matmul_bf16(y, x, (const uint16_t *)W, in, out);
+    else if (wdt == K3_WQ8_0) k3_matmul_q80(y, x, W, in, out);
     else if (wdt == K3_WI8)  k3_matmul_q8(y, x, W, in, out);
     else                     k3_matmul(y, x, (const float *)W, in, out);
 }
@@ -444,6 +450,7 @@ static inline void k3_mmw(float *y, const float *x, const void *W, int wdt,
 static inline size_t k3_wsz(int wdt) { return wdt == K3_WBF16 ? 2u : 4u; }
 static inline size_t k3_row_bytes(int wdt, int in)
 {
+    if (wdt == K3_WQ8_0) return (size_t)in / 32 * 34;
     return wdt == K3_WI8 ? (size_t)4 + (size_t)in : (size_t)in * k3_wsz(wdt);
 }
 
@@ -470,7 +477,15 @@ typedef struct {
     const unsigned char *p3, *s3;        /* w3 up                                     */
     const unsigned char *p2, *s2;        /* w2 down                                   */
     int ilv;                             /* K3_MX_* layout of the packed rows         */
+    /* K3_EQ_* format of w1, w3, w2. GGUF formats carry their scales inline (s* unused). */
+    unsigned char qt1, qt3, qt2;
 } K3ExpertQ;
+
+enum { K3_EQ_MXFP4 = 0, K3_EQ_IQ2XS = 1, K3_EQ_IQ3XXS = 2 };
+
+/* 1: GGUF experts take int8 activations (VNNI dot products; deterministic but not
+ * bit-identical to fp32). Set before the forward pass (CLI: K3_EXPERT_Q8=1). */
+extern int k3_expert_q8;
 
 /* A source of experts. get() must leave the returned pointers valid until the caller
  * finishes the token; a cache satisfies that by pinning what the current token needs
@@ -609,7 +624,8 @@ typedef struct {
     /* Optional: q, k, v as ONE matrix, row 3*r + m = row r of q, k, v (m = 0, 1, 2),
      * so a thread's rows are one contiguous stream; q, k, v are then unused. */
     const void  *qkv;
-    int          wdt;                    /* q,k,v,g,o,f_a,f_b,b             */
+    int          wdt;                    /* q,k,v,g,o,f_a,f_b             */
+    int          b_wdt;                  /* b's own tag; binders set it with wdt */
 } K3KdaW;
 
 size_t k3_kda_scratch(const K3Cfg *c, int T);

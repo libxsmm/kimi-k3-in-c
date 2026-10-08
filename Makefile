@@ -154,10 +154,10 @@ INCLUDES := -Iinclude -Iinclude/k3 -Ithird_party \
             -Isrc/par
 
 # ----------------------------------------------------------------------------- files --
-ENGINE_SRC := src/core/k3_ops.c \
-              src/io/k3_st.c src/io/k3_load.c src/io/k3_trunk.c \
+ENGINE_SRC := src/core/k3_ops.c src/core/k3_gq.c \
+              src/io/k3_st.c src/io/k3_load.c src/io/k3_trunk.c src/io/k3_gguf.c \
               src/cache/k3_cache.c src/cache/k3_resident.c \
-              src/model/k3_bind.c
+              src/model/k3_bind.c src/model/k3_gguf_bind.c
 ifeq ($(MPI),1)
   ENGINE_SRC += src/par/k3_mpi.c
   CFLAGS     += -DK3_MPI
@@ -174,7 +174,7 @@ CHAT_SRC   := src/chat/k3_chat.c src/chat/k3_sampler.c
 CLI_BIN    := $(BIN)/k3
 
 # Tests that need no checkpoint. These run in CI on every push.
-UNIT_TESTS := test_ops test_cache test_st test_model_stream test_cfg test_tok test_chat scale_test k3_model test_trunk test_st_faults
+UNIT_TESTS := test_ops test_gguf test_cache test_st test_model_stream test_cfg test_tok test_chat scale_test k3_model test_trunk test_st_faults
 # Tests that need real shards. Built and run by `make test-all` with SHARD_DIR set;
 # see the weights-test target below.
 WEIGHT_TESTS := test_expert test_real_layer
@@ -209,20 +209,24 @@ $(BIN):
 	@mkdir -p $(BIN)
 
 # Each test links only what it needs, so a failure points at one subsystem.
-$(BIN)/test_ops: tests/unit/test_ops.c $(BUILD)/src/core/k3_ops.o | $(BIN)
+$(BIN)/test_ops: tests/unit/test_ops.c $(BUILD)/src/core/k3_ops.o $(BUILD)/src/core/k3_gq.o | $(BIN)
+	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
+
+$(BIN)/test_gguf: tests/unit/test_gguf.c $(BUILD)/src/io/k3_gguf.o $(BUILD)/src/io/k3_st.o \
+                  $(BUILD)/src/core/k3_ops.o $(BUILD)/src/core/k3_gq.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 $(BIN)/test_cache: tests/unit/test_cache.c $(BUILD)/src/cache/k3_cache.o \
                    $(BUILD)/src/cache/k3_resident.o \
                    $(BUILD)/src/io/k3_load.o $(BUILD)/src/io/k3_st.o \
-                   $(BUILD)/src/core/k3_ops.o | $(BIN)
+                   $(BUILD)/src/core/k3_ops.o $(BUILD)/src/core/k3_gq.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 $(BIN)/test_st: tests/unit/test_st.c $(BUILD)/src/io/k3_st.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 $(BIN)/test_model_stream: tests/unit/test_model_stream.c $(BUILD)/src/model/k3_bind.o \
-                          $(BUILD)/src/io/k3_st.o $(BUILD)/src/core/k3_ops.o | $(BIN)
+                          $(BUILD)/src/io/k3_st.o $(BUILD)/src/core/k3_ops.o $(BUILD)/src/core/k3_gq.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 $(BIN)/test_st_faults: tests/unit/test_st_faults.c $(BUILD)/src/io/k3_st.o | $(BIN)
@@ -236,12 +240,12 @@ $(BIN)/test_tok: tests/unit/test_tok.c | $(BIN)
 $(BIN)/test_chat: tests/unit/test_chat.c src/chat/k3_chat.c src/chat/k3_sampler.c | $(BIN)
 	$(CC) $(CFLAGS) -Wno-unused-function $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
-$(BIN)/test_cfg: tests/unit/test_cfg.c src/core/k3_ops.c | $(BIN)
+$(BIN)/test_cfg: tests/unit/test_cfg.c src/core/k3_ops.c src/core/k3_gq.c | $(BIN)
 	$(CC) -O2 -std=c99 $(WARN) -Wno-unused-function $(INCLUDES) $^ -o $@ -lm
 
 # Allocates at REAL model widths (a ~1.8 GB KDA layer), so it needs the optimised build
 # rather than the portable C99 one the tokenizer and config tests use.
-$(BIN)/scale_test: tests/unit/scale_test.c $(BUILD)/src/core/k3_ops.o | $(BIN)
+$(BIN)/scale_test: tests/unit/scale_test.c $(BUILD)/src/core/k3_ops.o $(BUILD)/src/core/k3_gq.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 $(BIN)/k3_model: tests/unit/k3_model.c $(ENGINE_OBJ) | $(BIN)
@@ -250,15 +254,15 @@ $(BIN)/k3_model: tests/unit/k3_model.c $(ENGINE_OBJ) | $(BIN)
 $(BIN)/test_trunk: tests/unit/test_trunk.c $(BUILD)/src/io/k3_trunk.o \
                    $(BUILD)/src/io/k3_st.o \
                    $(BUILD)/src/model/k3_bind.o \
-                   $(BUILD)/src/core/k3_ops.o | $(BIN)
+                   $(BUILD)/src/core/k3_ops.o $(BUILD)/src/core/k3_gq.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
-$(BIN)/bench_kernels: benchmarks/bench_kernels.c $(BUILD)/src/core/k3_ops.o | $(BIN)
+$(BIN)/bench_kernels: benchmarks/bench_kernels.c $(BUILD)/src/core/k3_ops.o $(BUILD)/src/core/k3_gq.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 # MPI builds only: latency of the collective shapes tensor parallelism uses.
 $(BIN)/bench_allgather: benchmarks/bench_allgather.c $(BUILD)/src/par/k3_mpi.o \
-                        $(BUILD)/src/core/k3_ops.o | $(BIN)
+                        $(BUILD)/src/core/k3_ops.o $(BUILD)/src/core/k3_gq.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 ## test: everything that needs no model weights
@@ -282,6 +286,7 @@ test: $(CLI_BIN) $(TEST_BINS)
 	      esac; \
 	  done; echo "  3 malformed stop lists refused, each for the right reason"
 	@echo "== op kernels ==";        ./$(BIN)/test_ops $(FIXTURES)/ops
+	@echo "== gguf ==";              ./$(BIN)/test_gguf $(BUILD)
 	@echo "== streaming cache ==";   ./$(BIN)/test_cache $(FIXTURES)/cache
 	@echo "== safetensors ==";       ./$(BIN)/test_st $(FIXTURES)/st $(BUILD)/st_index.json \
 	    plain.f32.2d plain.bf16.1d tricky.f16.1d packed.u8.2d scalar.f32 second.shard.f32
@@ -341,7 +346,7 @@ weights-test: $(WEIGHT_BINS)
 	./$(BIN)/test_real_layer "$(SHARD_DIR)" 1 4 8
 
 $(BIN)/test_expert: tests/unit/test_expert.c $(BUILD)/src/io/k3_load.o \
-                    $(BUILD)/src/io/k3_st.o $(BUILD)/src/core/k3_ops.o | $(BIN)
+                    $(BUILD)/src/io/k3_st.o $(BUILD)/src/core/k3_ops.o $(BUILD)/src/core/k3_gq.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 $(BIN)/test_real_layer: tests/unit/test_real_layer.c $(ENGINE_OBJ) | $(BIN)

@@ -50,6 +50,7 @@
 #include <string.h>          /* k3_embed_row uses memcpy on the fp32 path */
 
 #include "k3.h"
+#include "k3_gq.h"
 #include "k3_st.h"
 
 typedef struct {
@@ -148,7 +149,10 @@ size_t k3_bind_widen_bytes(const K3Cfg *c);
 static inline void k3_embed_row(float *dst, const void *table, int wdt,
                                 int64_t row, int hidden)
 {
-    if (wdt == K3_WBF16) {
+    if (wdt == K3_WQ8_0) {
+        k3_gq_dequant(K3_GG_Q8_0, (const unsigned char *)table + row * (int64_t)k3_row_bytes(wdt, hidden),
+                      dst, hidden);
+    } else if (wdt == K3_WBF16) {
         const uint16_t *p = (const uint16_t *)table + row * hidden;
         for (int i = 0; i < hidden; i++) dst[i] = k3_bf16f(p[i]);
     } else {
