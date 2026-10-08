@@ -164,6 +164,10 @@ static void run_case(const Case *c, int P)
     float *x = aligned_alloc(64, ((size_t)c->in * 4 + 127) & ~(size_t)63);
     float *y = aligned_alloc(64, ((size_t)rows * 4 + 127) & ~(size_t)63);
     for (int i = 0; i < c->in; i++) x[i] = (float)((i * 37) % 101 - 50) * 0.01f;
+    const int iq = c->type == K3_GG_IQ2_XS || c->type == K3_GG_IQ3_XXS;
+    int8_t *xq = iq ? aligned_alloc(64, ((size_t)c->in + 63) & ~(size_t)63) : NULL;
+    float *dx = iq ? malloc((size_t)c->in / 256 * 4 + 4) : NULL;
+    if (iq) k3_gq_quant_x(xq, dx, x, c->in);
     const long iters = nc * 4 > 64 ? (long)nc * 4 : 64;
     double t = 0;
 #pragma omp parallel
@@ -180,6 +184,8 @@ static void run_case(const Case *c, int P)
             if (it == 0) { k3_sync(); t0 = omp_get_wtime(); }
             const unsigned char *W = pool + (size_t)((it + nc) % nc) * stride;
             if (c->type == K3_GG_F32) k3_matmul(y, x, (const float *)W, c->in, rows);
+            else if (c->type == K3_GG_IQ2_XS) k3_iq2xs_rows_q8(y, xq, dx, W, c->in, lo, hi);
+            else if (c->type == K3_GG_IQ3_XXS) k3_iq3xxs_rows_q8(y, xq, dx, W, c->in, lo, hi);
             else                      k3_q80_rows(y, x, W, c->in, lo, hi);
             k3_sync();
         }
@@ -188,11 +194,12 @@ static void run_case(const Case *c, int P)
     const double us = t / iters * 1e6, gbs = (double)mat / (t / iters) / 1e9;
     const double ms_tok = us * c->count / 1e3;
     printf("%-16s %-8s %6d x %-6d %8.2f MB %4d %9.2f us %7.1f GB/s %5.1f%% %8.3f ms/tok  y0=%g\n",
-           c->name, c->type == K3_GG_F32 ? "f32" : "q8_0", rows, c->in, mat / 1e6, c->count,
+           c->name, c->type == K3_GG_F32 ? "f32" : c->type == K3_GG_Q8_0 ? "q8_0" : iq ? "iq int8" : "?",
+           rows, c->in, mat / 1e6, c->count,
            us, gbs, 100 * gbs / roof_gbs, ms_tok, y[0]);
     phase_add(c->phase, ms_tok, (double)mat * c->count / 1e9);
     munmap(pool, nc * stride);
-    free(x); free(y);
+    free(x); free(y); free(xq); free(dx);
 }
 
 /* ------------------------------------------------------------------ routed experts */
@@ -211,6 +218,7 @@ static int spans(int nq, int n, int *sj, int *s0, int *s1)
 
 static void run_experts(int xi, int P, int q8)
 {
+    const int xmerge = getenv("BENCH_XMERGE") != NULL, xseq = getenv("BENCH_XSEQ") != NULL;
     const int t = xcases[xi].type;
     const int ngu = (INTER + P - 1) / P, ndn = (LAT + P - 1) / P;
     const size_t rbg = k3_gq_row_bytes(t, LAT), rbd = k3_gq_row_bytes(t, INTER);
@@ -245,18 +253,30 @@ static void run_experts(int xi, int P, int q8)
             }
         }
         k3_sync();
-        int sj[2 * TOPK + 2], s0[2 * TOPK + 2], s1[2 * TOPK + 2];
+        int sj[4 * TOPK + 2], s0[4 * TOPK + 2], s1[4 * TOPK + 2];
         double a = 0, b = 0;
         uint64_t rng = 88172645463325252ull;
         for (long it = -(long)(ne / TOPK); it < iters; it++) {
             const unsigned char *sel[TOPK];
             for (int j = 0; j < TOPK; j++) {
                 rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
-                sel[j] = pool + (rng % ne) * rec;
+                sel[j] = pool + (xseq ? ((size_t)(it + ne) * TOPK + j) % ne : rng % ne) * rec;
             }
             k3_sync();
             const double t0 = omp_get_wtime();
-            int ns = spans(TOPK, ngu, sj, s0, s1);
+            int ns;
+            if (xmerge && q8) {   /* gate and up as 32 matrices in one split: fewer, longer runs */
+                ns = spans(2 * TOPK, ngu, sj, s0, s1);
+                for (int s = 0; s < ns; s++) {
+                    const int m = sj[s];
+                    const unsigned char *W = sel[m >> 1] + (m & 1) * gsz;
+                    float *g = gu + (size_t)(m >> 1) * 2 * INTER + (m & 1) * INTER;
+                    if (t == K3_GG_IQ2_XS) k3_iq2xs_rows_q8(g, zq, zdx, W, LAT, s0[s], s1[s]);
+                    else                   k3_iq3xxs_rows_q8(g, zq, zdx, W, LAT, s0[s], s1[s]);
+                }
+                ns = 0;
+            } else
+                ns = spans(TOPK, ngu, sj, s0, s1);
             for (int s = 0; s < ns; s++) {
                 const unsigned char *W = sel[sj[s]];
                 float *g = gu + (size_t)sj[s] * 2 * INTER;
@@ -321,12 +341,14 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "-g")) pool_bytes = (size_t)(atof(argv[i + 1]) * (1 << 30));
         else if (!strcmp(argv[i], "-t")) touch_t0 = !strcmp(argv[i + 1], "t0");
         else if (!strcmp(argv[i], "-f")) filter = argv[i + 1];
-        else if (!strcmp(argv[i], "-s")) {   /* rows,in[,f32]: one shape, rows per rank */
+        else if (!strcmp(argv[i], "-s")) {   /* rows,in[,f32|iq2|iq3]: one shape, rows per rank */
             char ty[8] = "";
             sscanf(argv[i + 1], "%d,%d,%7s", &custom.rows, &custom.in, ty);
             if (!strcmp(ty, "f32")) custom.type = K3_GG_F32;
+            else if (!strcmp(ty, "iq2")) custom.type = K3_GG_IQ2_XS;
+            else if (!strcmp(ty, "iq3")) custom.type = K3_GG_IQ3_XXS;
         }
-        else { fprintf(stderr, "usage: %s [-P ranks] [-g pool_GB] [-t rows|t0] [-f name] [-s rows,in[,f32]]\n", argv[0]); return 2; }
+        else { fprintf(stderr, "usage: %s [-P ranks] [-g pool_GB] [-t rows|t0] [-f name] [-s rows,in[,f32|iq2|iq3]]\n", argv[0]); return 2; }
     }
     if (P < 1) P = 1;
     printf("per-rank decode GEMVs at TP=%d, %d threads, pool %.1f GB per case, first touch %s, int8 kernels %s\n",

@@ -7,6 +7,10 @@
 
 #include "k3_mpi.h"
 
+#if defined(__AVX512F__)
+#include <immintrin.h>
+#endif
+
 #ifdef K3_UCX
 #include <ucp/api/ucp.h>
 #endif
@@ -93,6 +97,99 @@ static void mpi_barrier(void *ctx)
 {
     (void)ctx;
     MPI_Barrier(MPI_COMM_WORLD);
+}
+
+/* SHARED-MEMORY TRANSPORT (default when every rank is on one node; K3_TP_SHM=0 off): the
+ * same window layout and tagged words, but a put is plain 8-byte stores straight into the
+ * peer's window (an MPI-3 shared window, each rank's part first-touched by its owner), so
+ * it is complete on return and needs no flush. One lane per peer: P-1 team threads write
+ * in parallel. Payload bits are moved verbatim, so results are bit-identical. */
+static MPI_Win    sh_win = MPI_WIN_NULL;
+static MPI_Comm   sh_comm = MPI_COMM_NULL;
+static uint64_t **sh_peer;
+
+/* Whole aligned lines go as non-temporal stores, so the writer never has to take
+ * ownership of a line its reader is spinning on; every 8-byte word is still written
+ * whole, which is all the tagged protocol needs. */
+static void sh_copy(uint64_t *d, const uint64_t *s, int n)
+{
+    volatile uint64_t *v = d;
+    int i = 0;
+#if defined(__AVX512F__)
+    for (; i < n && ((uintptr_t)(d + i) & 63); i++) v[i] = s[i];
+    for (; i + 8 <= n; i += 8) _mm512_stream_si512((void *)(d + i), _mm512_loadu_si512(s + i));
+#endif
+    for (; i < n; i++) v[i] = s[i];
+#if defined(__AVX512F__)
+    _mm_sfence();
+#endif
+}
+
+static void sh_put(int lane, const uint64_t *src, int nw, long disp)
+{
+    const int P = k3_tp.size, me = k3_tp.rank, L = k3_tp.ll_nlanes;
+    const int k0 = 1 + (int)((long)(P - 1) * lane / L), k1 = 1 + (int)((long)(P - 1) * (lane + 1) / L);
+    for (int k = k0; k < k1; k++) sh_copy(sh_peer[(me + k) % P] + disp, src, nw);
+}
+
+static void sh_flush(int lane) { (void)lane; }
+
+static int sh_init(void)
+{
+    const int P = k3_tp.size;
+    MPI_Comm node;
+    int ns, one, all;
+    MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &node);
+    MPI_Comm_size(node, &ns);
+    one = ns == P;
+    MPI_Allreduce(&one, &all, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    if (!all) { MPI_Comm_free(&node); return -1; }
+    /* key 0: node ranks keep the world order, so node rank r is world rank r */
+    const size_t hw = (size_t)LL_MAXW + (size_t)P;
+    const MPI_Aint bytes = (MPI_Aint)(2 * hw * sizeof(uint64_t));
+    MPI_Info info;
+    MPI_Info_create(&info);
+    MPI_Info_set(info, "alloc_shared_noncontig", "true");
+    uint64_t *recv = NULL;
+    const int rc = MPI_Win_allocate_shared(bytes, sizeof(uint64_t), info, node, &recv, &sh_win);
+    MPI_Info_free(&info);
+    const char *le = getenv("K3_TP_SHM_LANES");
+    int L = le ? atoi(le) : P - 1;
+    if (L < 1) L = 1;
+    if (L > P - 1) L = P - 1;
+    const int nsend = 2;
+    uint64_t *send = rc == MPI_SUCCESS ? (uint64_t *)calloc((size_t)L * nsend * hw, sizeof(uint64_t)) : NULL;
+    sh_peer = (uint64_t **)calloc((size_t)P, sizeof *sh_peer);
+    one = rc == MPI_SUCCESS && send && sh_peer;
+    MPI_Allreduce(&one, &all, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    if (!all) {
+        if (rc == MPI_SUCCESS) MPI_Win_free(&sh_win);
+        sh_win = MPI_WIN_NULL;
+        free(send); free(sh_peer); sh_peer = NULL;
+        MPI_Comm_free(&node);
+        return -1;
+    }
+    memset(recv, 0, (size_t)bytes);
+    for (int r = 0; r < P; r++) {
+        MPI_Aint sz;
+        int du;
+        void *base;
+        MPI_Win_shared_query(sh_win, r, &sz, &du, &base);
+        sh_peer[r] = (uint64_t *)base;
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
+    sh_comm = node;
+    k3_tp.ll_recv = recv;
+    k3_tp.ll_send = send;
+    k3_tp.ll_hw = (int)hw;
+    k3_tp.ll_maxw = LL_MAXW;
+    k3_tp.ll_nsend = nsend;
+    k3_tp.ll_nlanes = L;
+    k3_tp.ll_flush = sh_flush;
+    k3_tp.ll_put = sh_put;
+    if (k3_tp.rank == 0)
+        fprintf(stderr, "k3_mpi: TP gather over node shared memory, %d ranks, %d writer lanes\n", P, L);
+    return 0;
 }
 
 #ifdef K3_UCX
@@ -384,7 +481,9 @@ int k3_mpi_init(int *argc, char ***argv)
     /* K3_TP_ONESIDED=0 keeps plain MPI_Allgatherv (see above); one-sided is the default. */
     const char *os = getenv("K3_TP_ONESIDED");
     const char *ux = getenv("K3_TP_UCX");
+    const char *sh = getenv("K3_TP_SHM");
     if (k3_tp.size > 1 && !(os && !strcmp(os, "0"))) {
+        if (!(sh && !strcmp(sh, "0")) && sh_init() == 0) return 0;
 #ifdef K3_UCX
         use_ucx = !(ux && !strcmp(ux, "0"));
         if (use_ucx) { ux_init(); return 0; }
@@ -399,6 +498,15 @@ int k3_mpi_init(int *argc, char ***argv)
 
 void k3_mpi_finalize(void)
 {
+    if (sh_win != MPI_WIN_NULL) {
+        MPI_Barrier(MPI_COMM_WORLD);
+        MPI_Win_free(&sh_win);
+        MPI_Comm_free(&sh_comm);
+        free(k3_tp.ll_send); free(sh_peer);
+        k3_tp.ll_put = NULL;
+        MPI_Finalize();
+        return;
+    }
 #ifdef K3_UCX
     if (use_ucx) { ux_fini(); MPI_Finalize(); return; }
 #endif

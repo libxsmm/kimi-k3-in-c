@@ -1188,8 +1188,28 @@ static void router_select(int *idx, float *w, const float *score, const float *b
      * in first-index order, matching a stable selection. */
     for (int j = 0; j < topk; j++) {
         int best = -1; float bv = -INFINITY;
+#if defined(K3_AVX512)
+        /* the same pick: the first index holding the largest value; NaN never wins
+         * (max(v, m) keeps m when v is NaN) */
+        {
+            __m512 m = _mm512_set1_ps(-INFINITY);
+            int e = 0;
+            for (; e + 16 <= n_experts; e += 16) m = _mm512_max_ps(_mm512_loadu_ps(choice + e), m);
+            bv = _mm512_reduce_max_ps(m);
+            for (; e < n_experts; e++) if (choice[e] > bv) bv = choice[e];
+            if (bv > -INFINITY) {
+                const __m512 b = _mm512_set1_ps(bv);
+                for (e = 0; e + 16 <= n_experts && best < 0; e += 16) {
+                    const __mmask16 k = _mm512_cmp_ps_mask(_mm512_loadu_ps(choice + e), b, _CMP_EQ_OQ);
+                    if (k) best = e + __builtin_ctz((unsigned)k);
+                }
+                for (; e < n_experts && best < 0; e++) if (choice[e] == bv) best = e;
+            }
+        }
+#else
         for (int e = 0; e < n_experts; e++)
             if (choice[e] > bv) { bv = choice[e]; best = e; }
+#endif
         if (best < 0) { idx[j] = 0; w[j] = 0.0f; continue; }
         idx[j] = best;
         w[j]   = score[best];              /* UNBIASED score, not choice[best] */
