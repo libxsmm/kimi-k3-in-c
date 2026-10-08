@@ -976,7 +976,12 @@ static int chat_run(Tok *tok, const K3ChatTemplate *tmpl, K3ChatHistory *history
  * middle restores the latest checkpoint at or before the cut and replays the tokens up
  * to it; checkpoints are taken after every multi-token batch (prompt ends: the point a
  * chat turn's re-rendered prompt diverges from what was generated). min_pos is the
- * oldest position a truncation can reach, reported so front ends do not ask for less. */
+ * oldest position a truncation can reach, reported so front ends do not ask for less.
+ * With --dspark, a one-token decode at the end also drafts a block and verifies it in
+ * the same sweep; the accepted tokens' logits are held, and a following decode of
+ * exactly that token at that position is answered from them without a forward. The
+ * client's sampler stays in charge: any other request first rewinds the engine to what
+ * the client has seen. */
 enum { SRV_INFO = 1, SRV_DECODE = 2, SRV_TRUNCATE = 3, SRV_RESET = 4, SRV_QUIT = 99 };
 #define SRV_MAXSNAP 16
 
@@ -994,21 +999,93 @@ static int srv_io(int fd, void *p, size_t n, int wr)
     return 0;
 }
 
-static int serve_run(const char *path, int ctx_cap, Weights *w, const K3Cfg *c,
-                     K3Cache *cache, int nl, int *tmax, float **h, float **br, float *ks,
-                     float **sc, float *lg, int **seq, int maxb, size_t kper)
-{
-    if (chat_resize(ctx_cap, tmax, nl, maxb, kper, w, c, h, br, sc, seq) != 0) return 1;
-    const size_t kst = kper * (size_t)nl;
-    memset(ks, 0, kst * sizeof(float));
-    w->cached = 0;
-    int nsnap_max = getenv("K3_SERVE_SNAPS") ? atoi(getenv("K3_SERVE_SNAPS")) : 4;
-    if (nsnap_max < 0) nsnap_max = 0;
-    if (nsnap_max > SRV_MAXSNAP) nsnap_max = SRV_MAXSNAP;
+typedef struct {
+    Weights *w; const K3Cfg *c; K3Cache *cache;
+    float *h, *br, *ks, *sc, *lg;
+    int *hist;                       /* the ids at positions 0..w->cached-1 */
+    size_t kst;                      /* floats of recurrent state */
+    K3DSpark *dsp;
     float *snap[SRV_MAXSNAP];
-    int snap_pos[SRV_MAXSNAP], nsnap = 0;
-    for (int i = 0; i < nsnap_max; i++)
-        if (!(snap[i] = (float *)malloc(kst * sizeof(float)))) { nsnap_max = i; break; }
+    int snap_pos[SRV_MAXSNAP], nsnap, nsnap_max;
+    float *spec_snap;
+    int spec_pos;                    /* spec_snap is the state before this position, or -1 */
+    long n_replay;
+} Srv;
+
+/* forward the next n history ids from w->cached, feeding the draft its context */
+static int srv_feed(Srv *s, int n)
+{
+    Weights *w = s->w;
+    const int p0 = w->cached;
+    if (forward(w, s->c, s->cache, s->hist + p0, n, s->lg, s->sc, s->h, s->br, s->ks, NULL) != 0)
+        return -1;
+    w->cached = p0 + n;
+    if (s->dsp && k3_dspark_context(s->dsp, w->taps, n, p0) != 0) return -1;
+    return 0;
+}
+
+static void srv_clear(Srv *s)
+{
+    memset(s->ks, 0, s->kst * sizeof(float));
+    s->w->cached = 0;
+    s->nsnap = 0;
+    s->spec_pos = -1;
+}
+
+/* Bring the state back to position p < w->cached: restore the latest checkpoint at or
+ * before p, replay the history up to p. 1 if no checkpoint reaches (state untouched),
+ * -5 if the replay failed (state cleared). */
+static int srv_rewind(Srv *s, int p)
+{
+    if (p <= 0) { srv_clear(s); return 0; }
+    int k = s->nsnap - 1;
+    while (k >= 0 && s->snap_pos[k] > p) k--;
+    const int sp = s->spec_pos >= 0 && s->spec_pos <= p ? s->spec_pos : -1;
+    if (k < 0 && sp < 0) return 1;
+    s->nsnap = k + 1;
+    s->spec_pos = sp;
+    if (sp >= 0 && (k < 0 || sp >= s->snap_pos[k])) {
+        par_copy(s->ks, s->spec_snap, s->kst);
+        s->w->cached = sp;
+    } else {
+        par_copy(s->ks, s->snap[k], s->kst);
+        s->w->cached = s->snap_pos[k];
+    }
+    const int n = p - s->w->cached;
+    if (n > 0) {
+        if (srv_feed(s, n) != 0) { srv_clear(s); return -5; }
+        s->n_replay += n;
+    }
+    return 0;
+}
+
+static int srv_minpos(const Srv *s, int vis)
+{
+    int m = vis > 0 ? vis - 1 : 0;
+    if (s->nsnap > 0 && s->snap_pos[0] < m) m = s->snap_pos[0];
+    if (s->spec_pos >= 0 && s->spec_pos < m) m = s->spec_pos;
+    return m;
+}
+
+static int serve_run(const char *path, Weights *w, const K3Cfg *c, K3Cache *cache, int tmax,
+                     float *h, float *br, float *ks, float *sc, float *lg, int *seq, size_t kst,
+                     K3DSpark *dsp, int spec_n, float *spec_snap)
+{
+    Srv s;
+    memset(&s, 0, sizeof s);
+    s.w = w; s.c = c; s.cache = cache;
+    s.h = h; s.br = br; s.ks = ks; s.sc = sc; s.lg = lg;
+    s.hist = seq; s.kst = kst; s.dsp = dsp; s.spec_snap = spec_snap;
+    if (!dsp || !spec_snap || (getenv("K3_SERVE_SPEC") && !atoi(getenv("K3_SERVE_SPEC"))))
+        spec_n = 0;
+    if (spec_n > K3_SPEC_MAX) spec_n = K3_SPEC_MAX;
+    srv_clear(&s);
+    int vis = 0;                       /* positions the client has seen; drafts may lie beyond */
+    s.nsnap_max = getenv("K3_SERVE_SNAPS") ? atoi(getenv("K3_SERVE_SNAPS")) : 4;
+    if (s.nsnap_max < 0) s.nsnap_max = 0;
+    if (s.nsnap_max > SRV_MAXSNAP) s.nsnap_max = SRV_MAXSNAP;
+    for (int i = 0; i < s.nsnap_max; i++)
+        if (!(s.snap[i] = (float *)malloc(kst * sizeof(float)))) { s.nsnap_max = i; break; }
     int lfd = -1;
     if (k3_tp.rank == 0) {
         lfd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -1022,20 +1099,22 @@ static int serve_run(const char *path, int ctx_cap, Weights *w, const K3Cfg *c,
             k3_mpi_abort(1);
             return 1;
         }
-        printf("serving on %s: %d positions, vocab %d, %d ranks, %d state checkpoints\n",
-               path, *tmax, c->vocab, k3_tp.size, nsnap_max);
+        printf("serving on %s: %d positions, vocab %d, %d ranks, %d state checkpoints",
+               path, tmax, c->vocab, k3_tp.size, s.nsnap_max);
+        if (spec_n) printf(", DSpark drafts %d per block", spec_n);
+        printf("\n");
         fflush(stdout);
     }
-    int *hist = *seq;                     /* the ids at positions 0..cached-1 */
-    int *ids = (int *)malloc((size_t)*tmax * sizeof(int));
-    uint8_t *want = (uint8_t *)malloc((size_t)*tmax);
+    int *ids = (int *)malloc((size_t)tmax * sizeof(int));
+    uint8_t *want = (uint8_t *)malloc((size_t)tmax);
     float *rows = NULL;
     size_t rows_cap = 0;
+    const float *la = NULL;            /* la[j]: logits after position la_base + j */
+    int la_base = 0;
     if (!ids || !want) return 1;
     int cfd = -1, rc = 0;
-    long n_req = 0, n_tok = 0, n_replay = 0;
+    long n_req = 0, n_tok = 0, n_spec = 0, n_drafted = 0, n_acc = 0, n_hit = 0;
     double t_busy = 0.0;
-#define SRV_MINPOS() (nsnap > 0 && snap_pos[0] < w->cached ? snap_pos[0] : (w->cached > 0 ? w->cached - 1 : 0))
     for (;;) {
         uint32_t hdr[4] = { 0, 0, 0, 0 };
         if (k3_tp.rank == 0) {
@@ -1046,7 +1125,11 @@ static int serve_run(const char *path, int ctx_cap, Weights *w, const K3Cfg *c,
             if (srv_io(cfd, hdr, sizeof hdr, 0) != 0) {
                 close(cfd); cfd = -1;
                 printf("serve: client gone after %ld requests, %ld tokens (%ld replayed), "
-                       "%.1f s busy\n", n_req, n_tok, n_replay, t_busy);
+                       "%.1f s busy", n_req, n_tok, s.n_replay, t_busy);
+                if (n_spec)
+                    printf("; DSpark %ld blocks, %.2f accepted/block, %ld answered from drafts",
+                           n_spec, (double)n_acc / n_spec, n_hit);
+                printf("\n");
                 fflush(stdout);
                 if (getenv("K3_SERVE_ONCE")) hdr[0] = SRV_QUIT;
                 else continue;
@@ -1054,41 +1137,27 @@ static int serve_run(const char *path, int ctx_cap, Weights *w, const K3Cfg *c,
         }
         k3_mpi_bcast(hdr, sizeof hdr);
         const uint32_t op = hdr[0], n = hdr[1], n_out = hdr[3];
-        int32_t pos0 = (int32_t)hdr[2];
+        const int32_t pos0 = (int32_t)hdr[2];
         if (op == SRV_QUIT) break;
         const double t0 = now_s();
         if (op == SRV_INFO) {
-            const int32_t r[5] = { c->vocab, *tmax, c->hidden, w->cached, SRV_MINPOS() };
+            const int32_t r[5] = { c->vocab, tmax, c->hidden, vis, srv_minpos(&s, vis) };
             if (k3_tp.rank == 0) srv_io(cfd, (void *)r, sizeof r, 1);
         } else if (op == SRV_RESET || (op == SRV_TRUNCATE && pos0 <= 0)) {
-            memset(ks, 0, kst * sizeof(float));
-            w->cached = 0;
-            nsnap = 0;
+            srv_clear(&s);
+            vis = 0;
             const int32_t r[3] = { 0, 0, 0 };
             if (k3_tp.rank == 0) srv_io(cfd, (void *)r, op == SRV_RESET ? 4 : 12, 1);
         } else if (op == SRV_TRUNCATE) {
             int32_t status = 0;
-            if (pos0 < w->cached) {
-                int s = nsnap - 1;
-                while (s >= 0 && snap_pos[s] > pos0) s--;
-                if (s < 0) status = 1;
-                else {
-                    memcpy(ks, snap[s], kst * sizeof(float));
-                    w->cached = snap_pos[s];
-                    nsnap = s + 1;
-                    if (pos0 > w->cached) {
-                        /* the MLA KV rows of the replayed positions are rewritten, so
-                         * nothing stale beyond the cut survives */
-                        if (forward(w, c, cache, hist + w->cached, pos0 - w->cached, lg, *sc,
-                                    *h, *br, ks, NULL) != 0) status = -5;
-                        else { n_replay += pos0 - w->cached; w->cached = pos0; }
-                    }
-                }
+            if (pos0 < vis) {
+                status = srv_rewind(&s, pos0);
+                vis = status == 0 ? pos0 : status < 0 ? 0 : vis;
             }
-            const int32_t r[3] = { status, w->cached, SRV_MINPOS() };
+            const int32_t r[3] = { status, vis, srv_minpos(&s, vis) };
             if (k3_tp.rank == 0) srv_io(cfd, (void *)r, sizeof r, 1);
         } else if (op == SRV_DECODE) {
-            if (n == 0 || n > (uint32_t)*tmax) { rc = 1; break; }
+            if (n == 0 || n > (uint32_t)tmax) { rc = 1; break; }
             uint32_t ok = 1;
             if (k3_tp.rank == 0) {
                 if (srv_io(cfd, ids, (size_t)n * sizeof(int), 0) || srv_io(cfd, want, n, 0)) ok = 0;
@@ -1097,58 +1166,126 @@ static int serve_run(const char *path, int ctx_cap, Weights *w, const K3Cfg *c,
             k3_mpi_bcast(&ok, sizeof ok);
             if (!ok) continue;                   /* the client vanished mid-request */
             int32_t status = 0;
-            if (pos0 < 0 || pos0 + (int)n > *tmax) status = -3;
+            if (pos0 < 0 || pos0 + (int)n > tmax) status = -3;
             else {
                 k3_mpi_bcast(ids, (size_t)n * sizeof(int));
                 k3_mpi_bcast(want, n);
-                if (pos0 == 0 && w->cached > 0) {   /* a fresh prompt */
-                    memset(ks, 0, kst * sizeof(float));
-                    w->cached = 0;
-                    nsnap = 0;
-                }
-                if (pos0 != w->cached) status = -2;
-                for (uint32_t i = 0; status == 0 && i < n; i++)
+                if (pos0 == 0 && vis > 0) { srv_clear(&s); vis = 0; }   /* a fresh prompt */
+                if (pos0 != vis) status = -2;
+                uint32_t nw = 0;
+                for (uint32_t i = 0; i < n; i++) {
+                    nw += want[i] != 0;
                     if (ids[i] < 0 || ids[i] >= c->vocab) status = -4;
+                }
+                if (nw != n_out) status = -4;
             }
-            if (status == 0) {
+            const float *out = rows;
+            if (status == 0 && n == 1 && vis < w->cached && la && vis >= la_base &&
+                ids[0] == s.hist[vis]) {
+                out = la + (size_t)(vis - la_base) * c->vocab;   /* drafted and verified */
+                vis++;
+                n_hit++;
+            } else if (status == 0) {
+                la = NULL;
+                if (vis < w->cached && srv_rewind(&s, vis) != 0) { srv_clear(&s); vis = 0; status = -5; }
+            }
+            int handled = status != 0 || out != rows;
+            if (!handled && spec_n > 0 && n == 1 && pos0 + spec_n + 1 <= w->kv_cap &&
+                pos0 + spec_n + 1 <= tmax) {
+                int d[K3_SPEC_MAX];
+                const int nd = k3_dspark_propose(dsp, ids[0], pos0, spec_n, w->mb.lm_head,
+                                                 w->mb.wdt, d);
+                if (nd > 0) {
+                    if ((size_t)(nd + 1) * c->vocab > rows_cap) {
+                        free(rows);
+                        rows_cap = (size_t)(nd + 1) * c->vocab;
+                        rows = (float *)malloc(rows_cap * sizeof(float));
+                        if (!rows) { rc = 1; break; }
+                    }
+                    uint8_t all[K3_SPEC_MAX + 1];
+                    memset(all, 1, sizeof all);
+                    s.hist[pos0] = ids[0];
+                    memcpy(s.hist + pos0 + 1, d, (size_t)nd * sizeof(int));
+                    par_copy(spec_snap, ks, kst);
+                    s.spec_pos = pos0;
+                    if (!getenv("K3_SPEC_REPLAY")) k3_kda_record_arm(nd + 1);
+                    w->lg_rows = rows;
+                    w->lg_want = all;
+                    int frc = forward(w, c, cache, s.hist + pos0, nd + 1, lg, sc, h, br, ks, NULL);
+                    w->lg_rows = NULL;
+                    w->lg_want = NULL;
+                    int m = 0;
+                    if (frc == 0) {
+                        while (m < nd && argmax_(rows + (size_t)m * c->vocab, c->vocab) == d[m]) m++;
+                        if (m == nd) {
+                            w->cached = pos0 + nd + 1;
+                            if (k3_dspark_context(dsp, w->taps, nd + 1, pos0) != 0) frc = -1;
+                        } else {
+                            /* the recurrent state absorbed rejected drafts */
+                            par_copy(ks, spec_snap, kst);
+                            if (k3_kda_rollback(c, m + 1) == 0) {
+                                w->cached = pos0 + m + 1;
+                                if (k3_dspark_context(dsp, w->taps, m + 1, pos0) != 0) frc = -1;
+                            } else {
+                                w->cached = pos0;
+                                frc = srv_feed(&s, m + 1);
+                            }
+                        }
+                    }
+                    k3_kda_record_arm(0);
+                    if (frc != 0) { srv_clear(&s); vis = 0; status = -5; }
+                    else {
+                        la = rows + c->vocab;
+                        la_base = pos0 + 1;
+                        vis = pos0 + 1;
+                        n_spec++; n_drafted += nd; n_acc += m;
+                        out = rows;
+                    }
+                    handled = 1;
+                }
+            }
+            if (!handled) {
                 if ((size_t)n_out * c->vocab > rows_cap) {
                     free(rows);
                     rows_cap = (size_t)(n_out ? n_out : 1) * c->vocab;
                     rows = (float *)malloc(rows_cap * sizeof(float));
                     if (!rows) { rc = 1; break; }
                 }
+                out = rows;
+                memcpy(s.hist + pos0, ids, (size_t)n * sizeof(int));
                 w->lg_rows = rows;
                 w->lg_want = want;
-                const int frc = forward(w, c, cache, ids, (int)n, lg, *sc, *h, *br, ks, NULL);
+                const int frc = srv_feed(&s, (int)n);
                 w->lg_rows = NULL;
                 w->lg_want = NULL;
-                if (frc != 0) status = -5;
-                else { memcpy(hist + pos0, ids, (size_t)n * sizeof(int)); w->cached += (int)n; }
-                n_tok += n;
-                if (frc == 0 && n > 1 && nsnap_max > 0) {
-                    if (nsnap == nsnap_max) {    /* drop the oldest */
-                        float *f = snap[0];
-                        memmove(snap, snap + 1, (size_t)(nsnap - 1) * sizeof snap[0]);
-                        memmove(snap_pos, snap_pos + 1, (size_t)(nsnap - 1) * sizeof snap_pos[0]);
-                        snap[nsnap - 1] = f;
-                        nsnap--;
+                if (frc != 0) { srv_clear(&s); vis = 0; status = -5; }
+                else {
+                    vis = w->cached;
+                    if (n > 1 && s.nsnap_max > 0) {
+                        if (s.nsnap == s.nsnap_max) {    /* drop the oldest */
+                            float *f = s.snap[0];
+                            memmove(s.snap, s.snap + 1, (size_t)(s.nsnap - 1) * sizeof s.snap[0]);
+                            memmove(s.snap_pos, s.snap_pos + 1, (size_t)(s.nsnap - 1) * sizeof s.snap_pos[0]);
+                            s.snap[s.nsnap - 1] = f;
+                            s.nsnap--;
+                        }
+                        par_copy(s.snap[s.nsnap], ks, kst);
+                        s.snap_pos[s.nsnap++] = w->cached;
                     }
-                    memcpy(snap[nsnap], ks, kst * sizeof(float));
-                    snap_pos[nsnap++] = w->cached;
                 }
             }
+            if (status == 0) n_tok += n;
             if (k3_tp.rank == 0) {
-                const int32_t r[2] = { status, SRV_MINPOS() };
+                const int32_t r[2] = { status, srv_minpos(&s, vis) };
                 srv_io(cfd, (void *)r, sizeof r, 1);
-                if (status == 0 && n_out) srv_io(cfd, rows, (size_t)n_out * c->vocab * sizeof(float), 1);
+                if (status == 0 && n_out) srv_io(cfd, (void *)out, (size_t)n_out * c->vocab * sizeof(float), 1);
             }
         }
         t_busy += now_s() - t0;
         n_req++;
     }
-#undef SRV_MINPOS
     if (k3_tp.rank == 0) { if (cfd >= 0) close(cfd); close(lfd); unlink(path); }
-    for (int i = 0; i < nsnap_max; i++) free(snap[i]);
+    for (int i = 0; i < s.nsnap_max; i++) free(s.snap[i]);
     free(ids); free(want); free(rows);
     return rc;
 }
@@ -2028,20 +2165,6 @@ static int k3_main(int argc, char **argv)
         }
     }
 
-    if (serve_path) {
-        const int rc = serve_run(serve_path, serve_ctx, &w, &c, &cache, NL, &Tmax, &h, &br,
-                                 ks, &sc, lg, &seq, maxb, kper);
-        free(w.kvc); free(w.ropec); free(w.mla_slot);
-        k3_cache_free(&cache);
-        if (experts_res) k3_resident_free(&res);
-        free(w.layer_s);
-        for (int L = 0; L < w.n_bound; L++) k3_bind_free(&w.lay[L]);
-        free(w.lay); k3_bind_model_free(&w.mb); k3_st_close(&st);
-        if (gguf) { k3_gguf_experts_free(&gx); k3_gguf_close(&gg); }
-        free(h); free(br); free(ks); free(sc); free(lg); free(seq); free(outtok); free(prompt);
-        return rc;
-    }
-
     if (chat) {
         const int rc = chat_run(&tok, &chat_template, &chat_history, &chat_opts, history_path,
                                 &prompt, np, gen, incremental, greedy, temperature,
@@ -2071,6 +2194,9 @@ static int k3_main(int argc, char **argv)
     const size_t kperP  = (size_t)c.kda_heads * c.kda_head_dim;
     const size_t kper_f = kperP * c.kda_head_dim + 3 * kperP * (c.conv_k - 1);
     float *spec_snap = NULL;
+    /* before the draft sizes its context cache from kv_cap */
+    if (serve_path && chat_resize(serve_ctx, &Tmax, NL, maxb, kper, &w, &c, &h, &br, &sc, &seq) != 0)
+        return 1;
     if (dspark_dir) {
         if (!incremental || draft_dir || ultra || load_state || chat) {
             fprintf(stderr, "--dspark needs --incremental and excludes --draft-trunk, "
@@ -2170,6 +2296,23 @@ static int k3_main(int argc, char **argv)
         dsp_on = 1;
         printf("speculative decode: DSpark drafts %d tokens per block, verified batched\n\n",
                spec_n);
+    }
+
+    if (serve_path) {
+        const int rc = serve_run(serve_path, &w, &c, &cache, Tmax, h, br, ks, sc, lg, seq,
+                                 kper_f * (size_t)w.n_bound, dsp_on ? &dsp : NULL, spec_n,
+                                 spec_snap);
+        if (dsp_on) k3_dspark_close(&dsp);
+        free(w.taps); free(spec_snap);
+        free(w.kvc); free(w.ropec); free(w.mla_slot);
+        k3_cache_free(&cache);
+        if (experts_res) k3_resident_free(&res);
+        free(w.layer_s);
+        for (int L = 0; L < w.n_bound; L++) k3_bind_free(&w.lay[L]);
+        free(w.lay); k3_bind_model_free(&w.mb); k3_st_close(&st);
+        if (gguf) { k3_gguf_experts_free(&gx); k3_gguf_close(&gg); }
+        free(h); free(br); free(ks); free(sc); free(lg); free(seq); free(outtok); free(prompt);
+        return rc;
     }
 
     /* --tf-check: teacher-forced agreement over the whole --ids sequence in ONE sweep.
