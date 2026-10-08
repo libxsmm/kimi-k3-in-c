@@ -436,10 +436,78 @@ static void tp_pack_words(uint64_t *o, const K3Seg *seg, int nseg, uint64_t tag)
     }
 }
 
+/* Words [w0, w1) of this rank's block as tagged words (tp_pack_words, by range). */
+static void tp_pack_range(uint64_t *o, const K3Seg *seg, int nseg, uint64_t tag, int w0, int w1)
+{
+    int off = 0;
+    for (int s = 0; s < nseg && off < w1; s++) {
+        int lo, hi; k3_tp_part(seg[s].n / seg[s].unit, &lo, &hi);
+        const float *p = seg[s].p + (size_t)lo * seg[s].unit;
+        const int n = (hi - lo) * seg[s].unit, lp = seg_lp(&seg[s]);
+        const int nw = lp ? (n + 1) >> 1 : n;
+        const int a = w0 > off ? w0 - off : 0, b = w1 - off < nw ? w1 - off : nw;
+        for (int i = a; i < b; i++) {
+            if (lp) {
+                const uint16_t b0 = k3_f2bf(p[2 * i]), b1 = 2 * i + 1 < n ? k3_f2bf(p[2 * i + 1]) : 0;
+                *o++ = tag | (uint32_t)b1 << 16 | b0;
+            } else {
+                uint32_t u;
+                memcpy(&u, p + i, 4);
+                *o++ = tag | u;
+            }
+        }
+        off += nw;
+    }
+}
+
+static void tp_stream(uint64_t *d, const uint64_t *s, int n)
+{
+    volatile uint64_t *v = d;
+    int i = 0;
+#if defined(__AVX512F__)
+    for (; i < n && ((uintptr_t)(d + i) & 63); i++) v[i] = s[i];
+    for (; i + 8 <= n; i += 8) _mm512_stream_si512((void *)(d + i), _mm512_loadu_si512(s + i));
+#endif
+    for (; i < n; i++) v[i] = s[i];
+}
+
+/* Shared-memory windows: every team thread packs its share of this rank's block once and
+ * streams it into every peer's window. */
+static void tp_put_direct(const K3Seg *seg, int nseg)
+{
+    const int P = k3_tp.size, me = k3_tp.rank;
+    int dsp = 0, cnt = 0;
+    for (int r = 0; r <= me; r++)
+        for (int s = 0; s < nseg; s++) {
+            const int b = tp_blk(&seg[s], r, 1, NULL);
+            if (r < me) dsp += b; else cnt += b;
+        }
+    const uint64_t tag = (uint64_t)tp_seq << 32;
+    const long half = (long)(tp_seq & 1) * k3_tp.ll_hw;
+    if (cnt == 0) {
+        if (k3_tid() == 0)
+            for (int k = 1; k < P; k++)
+                ((volatile uint64_t *)k3_tp.ll_dst((me + k) % P))[half + k3_tp.ll_maxw + me] = tag;
+        return;
+    }
+    uint64_t buf[512] __attribute__((aligned(64)));
+    int a, b;
+    k3_split(cnt, &a, &b);
+    for (int w = a; w < b; w += 512) {
+        const int n = b - w < 512 ? b - w : 512;
+        tp_pack_range(buf, seg, nseg, tag, w, w + n);
+        for (int k = 1; k < P; k++) tp_stream(k3_tp.ll_dst((me + k) % P) + half + dsp + w, buf, n);
+    }
+#if defined(__AVX512F__)
+    _mm_sfence();
+#endif
+}
+
 /* One-sided send: each sending thread packs this rank's block into its lanes' own send
  * rings (see k3_mpi.c: one flush per lap covers a ring) and puts it to their peers. */
 static void tp_put_lanes(const K3Seg *seg, int nseg)
 {
+    if (k3_tp.ll_dst) { tp_put_direct(seg, nseg); return; }
     const int S = tp_senders(), t = k3_tid();
     if (t >= S) return;
     const double t0 = k3_prof_on && t == 0 ? k3_prof_now() : 0.0;

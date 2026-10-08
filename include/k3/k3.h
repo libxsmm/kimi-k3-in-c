@@ -230,6 +230,9 @@ typedef struct {
     void (*ll_flush)(int lane);            /* local completion of every put issued */
     void (*ll_poll)(int lane);             /* optional: cheap progress while spinning */
     void (*ll_done)(int lane);             /* optional: once a gather is received */
+    /* optional: rank r's window when it is plain node shared memory; then the whole team
+     * packs and stores this rank's block straight into every peer's window */
+    uint64_t *(*ll_dst)(int rank);
     /* Optional node-shared regions for large gathers (k3_mpi.c): big[r] is rank r's
      * region of big_cap floats, readable by every rank; NULL when absent. */
     float **big;

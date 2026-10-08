@@ -618,14 +618,15 @@ int k3_dspark_propose(K3DSpark *d, int anchor, int pos, int nq, const void *lm_h
             k3_mmw(lg + (size_t)t * V, hs + (size_t)t * H, lm_head, lm_wdt, H, V);
         v0 = 0; v1 = V;
     }
-    if (k3_tp.size > 1 && (v0 != 0 || v1 != V)) {
+    const int sliced = k3_tp.size > 1 && (v0 != 0 || v1 != V);
+    const int dump = d->dump && d->steps == 0 && k3_tp.rank == 0;
+    if (sliced && d->dump) {
         K3Seg seg[K3_DSPARK_MAXT];
         for (int t = 0; t < nq; t++) { seg[t].p = lg + (size_t)t * V; seg[t].n = V; seg[t].unit = 1; seg[t].exact = 1; }
         k3_tp_gather(seg, nq);
     }
 
     /* sequential Markov stage: bias from the previously chosen token, greedy */
-    const int dump = d->dump && d->steps == 0 && k3_tp.rank == 0;
     if (dump) {
         dump_f(d->dump, "hs", hs, (size_t)nq * H * sizeof(float));
         dump_f(d->dump, "base", lg, (size_t)nq * V * sizeof(float));
@@ -641,18 +642,34 @@ int k3_dspark_propose(K3DSpark *d, int anchor, int pos, int nq, const void *lm_h
         k3_mmw_tp(bias, hs, lm_head, lm_wdt, H, V);   /* the gather is collective */
     }
     int prev = anchor;
+    /* with the logits still vocab-sliced, each rank takes its slice's argmax and the
+     * (value, index) pairs are gathered: the first maximum overall, as argmax_f */
+    const int m0 = sliced && !d->dump ? v0 : 0, m1 = sliced && !d->dump ? v1 : V;
     for (int i = 0; i < nq; i++) {
         float e[512];
         for (int r = 0; r < d->mrank; r++) e[r] = bf(d->mw1[(size_t)prev * d->mrank + r]);
         #pragma omp parallel
         {
             int lo, hi;
-            k3_split(V, &lo, &hi);
-            gemm_bf16_rows(bias, V, e, d->mrank, 1, d->mw2, d->mrank, lo, hi);
+            k3_split(m1 - m0, &lo, &hi);
+            gemm_bf16_rows(bias, V, e, d->mrank, 1, d->mw2, d->mrank, m0 + lo, m0 + hi);
         }
         float *li = lg + (size_t)i * V;
-        for (int v = 0; v < V; v++) li[v] += bias[v];
-        out[i] = prev = argmax_f(li, V);
+        for (int v = m0; v < m1; v++) li[v] += bias[v];
+        const int best = m0 + argmax_f(li + m0, m1 - m0);
+        if (m1 - m0 < V) {
+            float pr[2 * 64];
+            if (k3_tp.size > 64) return -1;
+            pr[2 * k3_tp.rank] = li[best];
+            pr[2 * k3_tp.rank + 1] = (float)best;
+            const K3Seg s = { pr, 2 * k3_tp.size, 2, 1 };
+            k3_tp_gather(&s, 1);
+            int r = 0;
+            for (int k = 1; k < k3_tp.size; k++) if (pr[2 * k] > pr[2 * r]) r = k;
+            out[i] = prev = (int)pr[2 * r + 1];
+        } else {
+            out[i] = prev = best;
+        }
     }
     if (dump) {
         dump_f(d->dump, "tok", out, (size_t)nq * sizeof(int));

@@ -133,6 +133,7 @@ static void sh_put(int lane, const uint64_t *src, int nw, long disp)
 }
 
 static void sh_flush(int lane) { (void)lane; }
+static uint64_t *sh_dst(int rank) { return sh_peer[rank]; }
 
 static int sh_init(void)
 {
@@ -187,6 +188,7 @@ static int sh_init(void)
     k3_tp.ll_nlanes = L;
     k3_tp.ll_flush = sh_flush;
     k3_tp.ll_put = sh_put;
+    if (!(getenv("K3_TP_DIRECT") && !strcmp(getenv("K3_TP_DIRECT"), "0"))) k3_tp.ll_dst = sh_dst;
     if (k3_tp.rank == 0)
         fprintf(stderr, "k3_mpi: TP gather over node shared memory, %d ranks, %d writer lanes\n", P, L);
     return 0;

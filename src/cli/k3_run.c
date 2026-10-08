@@ -1967,6 +1967,9 @@ static int k3_main(int argc, char **argv)
     double prof_wall = 0.0;
     int prof_steps = 0;
     const int prof_prefill = getenv("K3_PROF_PREFILL") != NULL;   /* profile step 0 too */
+    /* ranks finish loading at different times (the draft model especially); without this
+     * the first gather of step 0 absorbs the skew and the prefill looks seconds slower */
+    if (k3_tp.size > 1 && k3_tp.barrier) k3_tp.barrier(k3_tp.ctx);
     for (int g = 0; nout < gen || (incremental && g == 0); g++) {
         k3_cache_reset_stats(&cache);
         if (g == 1 && k3_prof_on && !prof_prefill) {   /* step 0 is prefill or cold: keep it out */
@@ -1988,7 +1991,10 @@ static int k3_main(int argc, char **argv)
             const int nT0 = T - base;
             frc = forward(&w, &c, &cache, seq + base, nT0, lg, sc, h, br, ks, NULL);
             if (frc == 0) { w.cached = base + nT0; emit[emitn++] = argmax_(lg, c.vocab); }
+            const double tfw = now_s();
             if (dsp_on && frc == 0 && k3_dspark_context(&dsp, w.taps, nT0, base) != 0) frc = -1;
+            if (dsp_on && k3_tp.rank == 0)
+                printf("prefill: forward %.2f s, DSpark context %.2f s\n", tfw - ts, now_s() - tfw);
             if (dsp_on && frc == 0 && dsp.dump && k3_tp.rank == 0) {
                 char tp_[4096];
                 snprintf(tp_, sizeof tp_, "%s.taps", dsp.dump);
