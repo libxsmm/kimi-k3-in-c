@@ -894,7 +894,7 @@ static __thread struct { const float *x; int ldx, T, in, slot; unsigned long bar
 static int q8x_team(float *Y, int ldy, const float *X, int ldx, int T, const void *W, int in,
                     int lo, int hi)
 {
-    if (T > 16 || in > Q8X_MAXIN || in % 32 || !k3_act_q8_on()) return -1;
+    if (T > 16 || in > Q8X_MAXIN || in % 32 || !k3_act_q8_T(T)) return -1;
     const int team = k3_nth() > 1;
 #ifdef _OPENMP
     const int reuse = team && q8x_k.x == X && q8x_k.ldx == ldx && q8x_k.T == T && q8x_k.in == in &&
@@ -926,7 +926,7 @@ static __thread struct { const float *x; int ldx, T, in; unsigned long bar, gen;
 static int q8x_self(float *Y, int ldy, const float *X, int ldx, int T, const void *W, int in,
                     int lo, int hi)
 {
-    if (T > 16 || in > Q8X_MAXIN || in % 32 || !k3_act_q8_on()) return -1;
+    if (T > 16 || in > Q8X_MAXIN || in % 32 || !k3_act_q8_T(T)) return -1;
     if (!q8s_xq) {
         void *a = NULL, *b = NULL;
         if (posix_memalign(&a, 64, (size_t)16 * Q8X_MAXIN) ||

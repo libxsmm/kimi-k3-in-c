@@ -46,9 +46,12 @@ void k3_q80_rows(float *y, const float *x, const void *W, int in, int o0, int o1
 void k3_q80_rows_T(float *Y, int ldy, const float *X, int ldx, int T, const void *W, int in,
                    int o0, int o1);
 /* K3_ACT_Q8=1 (and AMX-INT8 present): both of the above quantize activations to int8 per
- * 32 and run k3_amx_q80_rows. k3_act_q8 < 0 until first use; set it to force a mode. */
+ * 32 and run k3_amx_q80_rows. k3_act_q8 < 0 until first use; set it to force a mode.
+ * K3_ACT_Q8=2 restricts it to multi-token batches (speculative verify, short prefill
+ * chunks); one-token decode then stays on the fp32-activation path. */
 extern int k3_act_q8;
 int  k3_act_q8_on(void);
+int  k3_act_q8_T(int T);   /* whether a T-token Q8_0 matmul uses int8 activations */
 void k3_iq2xs_rows(float *y, const float *x, const void *W, int in, int o0, int o1);
 void k3_iq3xxs_rows(float *y, const float *x, const void *W, int in, int o0, int o1);
 

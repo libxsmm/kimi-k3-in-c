@@ -15,9 +15,16 @@ int k3_act_q8_on(void)
 {
     if (k3_act_q8 < 0) {
         const char *e = getenv("K3_ACT_Q8");
-        k3_act_q8 = e && atoi(e) > 0 && k3_amx_q8_ok();
+        const int m = e ? atoi(e) : 0;
+        k3_act_q8 = m > 0 && k3_amx_q8_ok() ? (m == 2 ? 2 : 1) : 0;
     }
     return k3_act_q8;
+}
+
+int k3_act_q8_T(int T)
+{
+    const int m = k3_act_q8_on();
+    return m == 1 || (m == 2 && T > 1);
 }
 
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
@@ -324,7 +331,7 @@ static inline __attribute__((always_inline)) void q80_row_g(float *Y, int ldy, c
 void k3_q80_rows_T(float *Y, int ldy, const float *X, int ldx, int T, const void *W, int in,
                    int o0, int o1)
 {
-    if (k3_act_q8_on() && k3_amx_q80_rows(Y, ldy, X, ldx, T, W, in, o0, o1) == 0) return;
+    if (k3_act_q8_T(T) && k3_amx_q80_rows(Y, ldy, X, ldx, T, W, in, o0, o1) == 0) return;
 #if defined(K3_GQ_AVX512)
     if (in % 64 == 0) {
         const size_t rb = k3_gq_row_bytes(K3_GG_Q8_0, in);
@@ -364,7 +371,7 @@ static int q80_nr(void)
 
 void k3_q80_rows(float *y, const float *x, const void *W, int in, int o0, int o1)
 {
-    if (k3_act_q8_on() && k3_amx_q80_rows(y, 0, x, 0, 1, W, in, o0, o1) == 0) return;
+    if (k3_act_q8_T(1) && k3_amx_q80_rows(y, 0, x, 0, 1, W, in, o0, o1) == 0) return;
 #if defined(K3_GQ_AVX512)
     if (in % 64 == 0) {
         const size_t rb = k3_gq_row_bytes(K3_GG_Q8_0, in);

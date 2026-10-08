@@ -1114,7 +1114,8 @@ static int serve_run(const char *path, Weights *w, const K3Cfg *c, K3Cache *cach
     if (!ids || !want) return 1;
     int cfd = -1, rc = 0;
     long n_req = 0, n_tok = 0, n_spec = 0, n_drafted = 0, n_acc = 0, n_hit = 0;
-    double t_busy = 0.0;
+    double t_busy = 0.0, t_batch = 0.0, t_verify = 0.0;
+    const int slog = k3_tp.rank == 0 && getenv("K3_SERVE_LOG") && atoi(getenv("K3_SERVE_LOG")) > 0;
     for (;;) {
         uint32_t hdr[4] = { 0, 0, 0, 0 };
         if (k3_tp.rank == 0) {
@@ -1127,8 +1128,12 @@ static int serve_run(const char *path, Weights *w, const K3Cfg *c, K3Cache *cach
                 printf("serve: client gone after %ld requests, %ld tokens (%ld replayed), "
                        "%.1f s busy", n_req, n_tok, s.n_replay, t_busy);
                 if (n_spec)
-                    printf("; DSpark %ld blocks, %.2f accepted/block, %ld answered from drafts",
-                           n_spec, (double)n_acc / n_spec, n_hit);
+                    printf("; DSpark %ld blocks, %.2f accepted/block, %ld answered from drafts, "
+                           "draft %.1f ms/block, verify+fix %.1f ms/block",
+                           n_spec, (double)n_acc / n_spec, n_hit, 1e3 * dsp->t_draft / n_spec,
+                           1e3 * t_verify / n_spec);
+                printf("; batches %.1f s", t_batch);
+                if (dsp) printf(" (draft context %.2f s)", dsp->t_ctx);
                 printf("\n");
                 fflush(stdout);
                 if (getenv("K3_SERVE_ONCE")) hdr[0] = SRV_QUIT;
@@ -1209,6 +1214,7 @@ static int serve_run(const char *path, Weights *w, const K3Cfg *c, K3Cache *cach
                     par_copy(spec_snap, ks, kst);
                     s.spec_pos = pos0;
                     if (!getenv("K3_SPEC_REPLAY")) k3_kda_record_arm(nd + 1);
+                    const double tv = now_s();
                     w->lg_rows = rows;
                     w->lg_want = all;
                     int frc = forward(w, c, cache, s.hist + pos0, nd + 1, lg, sc, h, br, ks, NULL);
@@ -1233,6 +1239,7 @@ static int serve_run(const char *path, Weights *w, const K3Cfg *c, K3Cache *cach
                         }
                     }
                     k3_kda_record_arm(0);
+                    t_verify += now_s() - tv;
                     if (frc != 0) { srv_clear(&s); vis = 0; status = -5; }
                     else {
                         la = rows + c->vocab;
@@ -1255,7 +1262,13 @@ static int serve_run(const char *path, Weights *w, const K3Cfg *c, K3Cache *cach
                 memcpy(s.hist + pos0, ids, (size_t)n * sizeof(int));
                 w->lg_rows = rows;
                 w->lg_want = want;
+                const double tb = now_s();
+                const double tc0 = dsp ? dsp->t_ctx : 0.0;
                 const int frc = srv_feed(&s, (int)n);
+                if (n > 1) t_batch += now_s() - tb;
+                if (slog && n > 1)
+                    printf("serve: batch of %u at %d: %.1f ms (draft context %.1f ms)\n", n, pos0,
+                           1e3 * (now_s() - tb), dsp ? 1e3 * (dsp->t_ctx - tc0) : 0.0);
                 w->lg_rows = NULL;
                 w->lg_want = NULL;
                 if (frc != 0) { srv_clear(&s); vis = 0; status = -5; }
@@ -1495,7 +1508,8 @@ static int k3_main(int argc, char **argv)
     }
     if (getenv("K3_EXPERT_Q8") && atoi(getenv("K3_EXPERT_Q8")) > 0) k3_expert_q8 = 1;
     if (getenv("K3_ACT_Q8") && atoi(getenv("K3_ACT_Q8")) > 0)
-        printf("Q8_0 matmuls: %s\n", k3_act_q8_on() ? "int8 activations per 32 on AMX-INT8"
+        printf("Q8_0 matmuls: %s\n", k3_act_q8_on() == 2 ? "int8 activations per 32 on AMX-INT8, multi-token batches only"
+                                    : k3_act_q8_on() ? "int8 activations per 32 on AMX-INT8"
                                                     : "K3_ACT_Q8 ignored, no AMX-INT8 here");
     if (ultra && budget_auto) {
         fprintf(stderr, "--ultra-low-memory uses explicit bounded budgets; use "
