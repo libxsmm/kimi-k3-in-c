@@ -103,7 +103,8 @@ add_library(k3 STATIC
   src/cache/k3_cache.c
   src/cache/k3_resident.c
   src/model/k3_bind.c
-  src/model/k3_gguf_bind.c)
+  src/model/k3_gguf_bind.c
+  src/model/k3_dspark.c)
 
 target_include_directories(k3 PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include

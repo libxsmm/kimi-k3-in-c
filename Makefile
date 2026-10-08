@@ -157,7 +157,7 @@ INCLUDES := -Iinclude -Iinclude/k3 -Ithird_party \
 ENGINE_SRC := src/core/k3_ops.c src/core/k3_gq.c src/core/k3_amx.c \
               src/io/k3_st.c src/io/k3_load.c src/io/k3_trunk.c src/io/k3_gguf.c \
               src/cache/k3_cache.c src/cache/k3_resident.c \
-              src/model/k3_bind.c src/model/k3_gguf_bind.c
+              src/model/k3_bind.c src/model/k3_gguf_bind.c src/model/k3_dspark.c
 ifeq ($(MPI),1)
   ENGINE_SRC += src/par/k3_mpi.c
   CFLAGS     += -DK3_MPI

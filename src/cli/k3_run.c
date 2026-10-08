@@ -65,6 +65,7 @@
 #include "k3_cache.h"
 #include "k3_resident.h"
 #include "k3_gguf_bind.h"
+#include "k3_dspark.h"
 #include "k3_trunk.h"
 #include "k3_tok.h"   /* text in/out; the --ids path never touches it */
 #include "k3_chat.h"
@@ -401,6 +402,11 @@ static void usage(FILE *f)
 "                        serial decode by construction; needs --incremental. An extra\n"
 "                        verified position costs ~22%% of a serial token when the trunk\n"
 "                        streams, so repetitive text decodes up to several times faster\n"
+"  --dspark DIR          speculative decode with the DSpark draft model (e.g.\n"
+"                        Inferact/Kimi-K3-DSpark: config.json + model.safetensors): it\n"
+"                        drafts a block from the target's hidden states, the target\n"
+"                        verifies it as with --spec. Needs --incremental; also under TP\n"
+"  --dspark-n N          tokens drafted per block (default 7, at most 7)\n"
 "  --tok DIR             directory with tiktoken.model and tokenizer_config.json\n"
 "\n"
 "chat (text-only Kimi K3 XTML):\n"
@@ -555,6 +561,11 @@ typedef struct {
     int          draft_mode;   /* 1 for the hybrid draft: cache-only expert routing */
     K3ExpertSrc *esrc;         /* when set, experts come from here instead of the cache */
     double      *layer_s;      /* [n_bound] per-layer wall time, filled when profiling */
+    /* DSpark taps: the residual stream after layers tap_layer[0..ntap) for every fed
+     * position, as [T][ntap][hidden]; NULL when no draft model consumes it. */
+    float       *taps;
+    const int   *tap_layer;
+    int          ntap;
 } Weights;
 
 /* One full forward over T tokens, writing logits for the LAST position only. Every
@@ -651,6 +662,11 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
             return -1;
         }
         w->layers_completed = L + 1;
+        for (int j = 0; w->taps && j < w->ntap; j++)
+            if (w->tap_layer[j] == L)
+                for (int t = 0; t < T; t++)
+                    memcpy(w->taps + ((size_t)t * w->ntap + j) * E, h + (size_t)t * E,
+                           (size_t)E * sizeof(float));
         if (k3_prof_on && w->layer_s) w->layer_s[L] += k3_prof_now() - t_layer;
     }
 
@@ -934,6 +950,8 @@ static int k3_main(int argc, char **argv)
     int tf_check = 0;
     const char *draft_dir = NULL;
     double draft_gb = 6.0;
+    const char *dspark_dir = NULL;
+    int dspark_n = 7;
     const char *load_state = NULL, *save_state = NULL;
     const char *preset_name = NULL;
     int incremental = 0, ultra = 0, chat = 0, greedy = 0;
@@ -992,6 +1010,8 @@ static int k3_main(int argc, char **argv)
         else if (!strcmp(argv[i], "--save-state") && i + 1 < argc) save_state = argv[++i];
         else if (!strcmp(argv[i], "--draft-trunk") && i + 1 < argc) draft_dir = argv[++i];
         else if (!strcmp(argv[i], "--draft-trunk-gb") && i + 1 < argc) draft_gb = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--dspark") && i + 1 < argc) dspark_dir = argv[++i];
+        else if (!strcmp(argv[i], "--dspark-n") && i + 1 < argc) dspark_n = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--trunk-gb") && i + 1 < argc) {
             const char *v = argv[++i];
             if (!strcmp(v, "auto")) budget_auto = 1;
@@ -1073,8 +1093,8 @@ static int k3_main(int argc, char **argv)
                 "use deterministic serial decode\n");
         return 2;
     }
-    if (k3_tp.size > 1 && (ultra || spec_n > 0 || draft_dir || chat || load_state ||
-                           save_state)) {
+    if (k3_tp.size > 1 && (ultra || (spec_n > 0 && !dspark_dir) || draft_dir || chat ||
+                           load_state || save_state)) {
         fprintf(stderr, "tensor parallel (%d ranks) does not yet support --ultra-low-memory, "
                         "--spec, --draft-trunk, --chat or state files\n", k3_tp.size);
         return 2;
@@ -1759,6 +1779,16 @@ static int k3_main(int argc, char **argv)
     const size_t kperP  = (size_t)c.kda_heads * c.kda_head_dim;
     const size_t kper_f = kperP * c.kda_head_dim + 3 * kperP * (c.conv_k - 1);
     float *spec_snap = NULL;
+    if (dspark_dir) {
+        if (!incremental || draft_dir || ultra || load_state || chat) {
+            fprintf(stderr, "--dspark needs --incremental and excludes --draft-trunk, "
+                            "--ultra-low-memory, --load-state and --chat\n");
+            return 2;
+        }
+        if (dspark_n < 1) dspark_n = 1;
+        if (dspark_n > 7) dspark_n = 7;
+        spec_n = dspark_n;
+    }
     if (spec_n > 0) {
         if (!incremental) {
             fprintf(stderr, "--spec needs --incremental; ignoring --spec\n");
@@ -1822,6 +1852,31 @@ static int k3_main(int argc, char **argv)
                    "tokens per sweep;\n               the exact model verifies every one "
                    "before it is emitted\n\n", draft_dir, draft_gb, spec_n);
         }
+    }
+
+    /* ---- DSpark: a block-parallel draft model fed by the target's hidden states ----
+     * Every fed position's residual stream after the draft's target layers is tapped in
+     * forward() and handed to the draft as context; the drafts then go through the same
+     * batched greedy verification as --spec, so the output is the exact model's. */
+    static K3DSpark dsp;
+    int dsp_on = 0;
+    long dsp_rounds = 0, dsp_drafted = 0, dsp_accepted = 0;
+    if (dspark_dir) {
+        if (k3_dspark_open(&dsp, dspark_dir, c.vocab, c.hidden, w.kv_cap + K3_SPEC_MAX + 1) != 0)
+            return 1;
+        for (int j = 0; j < dsp.ntgt; j++)
+            if (dsp.tgt[j] < 0 || dsp.tgt[j] >= w.n_bound) {
+                fprintf(stderr, "--dspark: target layer %d is not bound\n", dsp.tgt[j]);
+                return 2;
+            }
+        const int tcap = Tmax > K3_SPEC_MAX + 1 ? Tmax : K3_SPEC_MAX + 1;
+        w.taps = (float *)malloc((size_t)tcap * dsp.ntgt * E * sizeof(float));
+        if (!w.taps) { fprintf(stderr, "OOM for the DSpark taps\n"); return 1; }
+        w.tap_layer = dsp.tgt;
+        w.ntap = dsp.ntgt;
+        dsp_on = 1;
+        printf("speculative decode: DSpark drafts %d tokens per block, verified batched\n\n",
+               spec_n);
     }
 
     /* --tf-check: teacher-forced agreement over the whole --ids sequence in ONE sweep.
@@ -1898,6 +1953,16 @@ static int k3_main(int argc, char **argv)
             const int nT0 = T - base;
             frc = forward(&w, &c, &cache, seq + base, nT0, lg, sc, h, br, ks, NULL);
             if (frc == 0) { w.cached = base + nT0; emit[emitn++] = argmax_(lg, c.vocab); }
+            if (dsp_on && frc == 0 && k3_dspark_context(&dsp, w.taps, nT0, base) != 0) frc = -1;
+            if (dsp_on && frc == 0 && dsp.dump && k3_tp.rank == 0) {
+                char tp_[4096];
+                snprintf(tp_, sizeof tp_, "%s.taps", dsp.dump);
+                FILE *tf = fopen(tp_, "wb");
+                if (tf) {
+                    fwrite(w.taps, sizeof(float), (size_t)nT0 * dsp.ntgt * E, tf);
+                    fclose(tf);
+                }
+            }
             /* The draft model must absorb the same context, or its first proposals
              * come from a shorter one; one draft sweep, paid once. Saved state does
              * not include the draft's, so a resumed run replays the WHOLE sequence
@@ -1930,6 +1995,12 @@ static int k3_main(int argc, char **argv)
                     }
                     hyb_rounds  += 1;
                     hyb_drafted += nd;
+                } else if (dsp_on) {
+                    nd = k3_dspark_propose(&dsp, seq[base], base, spec_n, w.mb.lm_head,
+                                           w.mb.wdt, d);
+                    if (nd < 0) nd = 0;
+                    dsp_rounds  += 1;
+                    dsp_drafted += nd;
                 } else {
                     nd = spec_draft(seq, T, spec_n, d);
                 }
@@ -1949,6 +2020,8 @@ static int k3_main(int argc, char **argv)
                     if (m == nd) {
                         /* every fed position had true context; state is exact */
                         w.cached = base + nd + 1;
+                        if (dsp_on && k3_dspark_context(&dsp, w.taps, nd + 1, base) != 0)
+                            frc = -1;
                     } else {
                         /* the recurrent state absorbed rejected tokens: restore, then
                          * replay only the accepted prefix. The replay also rewrites the
@@ -1958,7 +2031,11 @@ static int k3_main(int argc, char **argv)
                         frc = forward(&w, &c, &cache, seq + base, m + 1, lg, sc, h, br,
                                       ks, NULL);
                         if (frc == 0) w.cached = base + m + 1;
+                        if (dsp_on && frc == 0 &&
+                            k3_dspark_context(&dsp, w.taps, m + 1, base) != 0)
+                            frc = -1;
                     }
+                    if (dsp_on) dsp_accepted += m;
                     /* Resync the draft model to the ACCEPTED sequence. On full
                      * acceptance its state already contains every fed token except
                      * the last draft, so one step closes the gap; on partial
@@ -1987,6 +2064,8 @@ static int k3_main(int argc, char **argv)
             } else {
                 frc = forward(&w, &c, &cache, seq + base, 1, lg, sc, h, br, ks, NULL);
                 if (frc == 0) { w.cached = base + 1; emit[emitn++] = argmax_(lg, c.vocab); }
+                if (dsp_on && frc == 0 && k3_dspark_context(&dsp, w.taps, 1, base) != 0)
+                    frc = -1;
                 /* keep the draft in lockstep through non-drafted steps */
                 if (dw.trunk && frc == 0) {
                     if (forward(&dw, &c, &cache, seq + base, 1, lg, sc, h, br,
@@ -2077,6 +2156,17 @@ static int k3_main(int argc, char **argv)
         }
     }
 
+    if (dsp_on) {
+        if (dsp_rounds > 0)
+            printf("DSpark: %ld blocks, %ld drafted, %ld accepted (%.2f per block, %.2f tokens "
+                   "per verify incl. the bonus); draft %.1f ms/block, context %.1f ms total\n",
+                   dsp_rounds, dsp_drafted, dsp_accepted, (double)dsp_accepted / dsp_rounds,
+                   1.0 + (double)dsp_accepted / dsp_rounds, 1e3 * dsp.t_draft / dsp.steps,
+                   1e3 * dsp.t_ctx);
+        k3_dspark_close(&dsp);
+        free(w.taps);
+        w.taps = NULL;
+    }
     if (dw.trunk && hyb_rounds > 0) {
         printf("\nhybrid decode: %ld rounds, %ld drafted, %ld accepted (%.1f%%), "
                "mean accepted run %.2f\n",
