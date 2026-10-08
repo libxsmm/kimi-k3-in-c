@@ -384,6 +384,89 @@ void k3_iq3xxs_rows(float *y, const float *x, const void *W, int in, int o0, int
 #endif
 }
 
+/* ------------------------------------------------------------- bf16 panels */
+static inline uint16_t f2bf_rne(float f)
+{
+    uint32_t u;
+    memcpy(&u, &f, 4);
+    return (uint16_t)((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
+}
+
+#if defined(K3_GQ_AVX512) && defined(__AVX512BF16__)
+static inline void put_bf16x32(uint16_t *dst, __m512 lo, __m512 hi)
+{
+    _mm512_storeu_si512((void *)dst, (__m512i)_mm512_cvtne2ps_pbh(hi, lo));
+}
+#endif
+
+void k3_gq_to_bf16(int t, const void *src, int64_t n, uint16_t *dst, size_t stride)
+{
+    const unsigned char *p = (const unsigned char *)src;
+#if defined(K3_GQ_AVX512) && defined(__AVX512BF16__)
+    if (t == K3_GG_Q8_0) {
+        for (int64_t i = 0; i < n / 32; i++) {
+            const BQ80 *b = (const BQ80 *)p + i;
+            const __m512 d = _mm512_set1_ps(h2f(b->d));
+            put_bf16x32(dst + (size_t)i * stride,
+                _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)b->qs))), d),
+                _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)(b->qs + 16)))), d));
+        }
+        return;
+    }
+    if (t == K3_GG_IQ2_XS) {
+        for (int64_t i = 0; i < n / K3_GQ_QK; i++) {
+            const BIQ2XS *b = (const BIQ2XS *)p + i;
+            const float d = h2f(b->d);
+            for (int j = 0; j < 4; j++) {
+                const __m512i mag = iq2xs_mag(b->qs + 8 * j);
+                const __m512i w = _mm512_mask_sub_epi8(mag, iq2xs_neg(b->qs + 8 * j), _mm512_setzero_si512(), mag);
+                const uint8_t s0 = b->sc[2 * j], s1 = b->sc[2 * j + 1];
+                uint16_t *o = dst + (size_t)(i * 8 + 2 * j) * stride;
+                put_bf16x32(o, _mm512_mul_ps(I8X16(w, 0), _mm512_set1_ps(d * (0.5f + (s0 & 0xf)) * 0.25f)),
+                               _mm512_mul_ps(I8X16(w, 1), _mm512_set1_ps(d * (0.5f + (s0 >> 4)) * 0.25f)));
+                put_bf16x32(o + stride, _mm512_mul_ps(I8X16(w, 2), _mm512_set1_ps(d * (0.5f + (s1 & 0xf)) * 0.25f)),
+                                        _mm512_mul_ps(I8X16(w, 3), _mm512_set1_ps(d * (0.5f + (s1 >> 4)) * 0.25f)));
+            }
+        }
+        return;
+    }
+    if (t == K3_GG_F32) {
+        const float *f = (const float *)src;
+        for (int64_t i = 0; i < n / 32; i++)
+            put_bf16x32(dst + (size_t)i * stride, _mm512_loadu_ps(f + i * 32), _mm512_loadu_ps(f + i * 32 + 16));
+        return;
+    }
+    if (t == K3_GG_IQ3_XXS) {
+        for (int64_t i = 0; i < n / K3_GQ_QK; i++) {
+            const BIQ3XXS *b = (const BIQ3XXS *)p + i;
+            const float d = h2f(b->d);
+            const uint8_t *sas = b->qs + K3_GQ_QK / 4;
+            for (int j = 0; j < 4; j++) {
+                uint32_t a0, a1;
+                memcpy(&a0, sas + 8 * j, 4);
+                memcpy(&a1, sas + 8 * j + 4, 4);
+                const __m512i mag = iq3xxs_mag(b->qs + 16 * j);
+                const __m512i w = _mm512_mask_sub_epi8(mag, iq3xxs_neg(a0, a1), _mm512_setzero_si512(), mag);
+                const __m512 d0 = _mm512_set1_ps(d * (0.5f + (a0 >> 28)) * 0.5f);
+                const __m512 d1 = _mm512_set1_ps(d * (0.5f + (a1 >> 28)) * 0.5f);
+                uint16_t *o = dst + (size_t)(i * 8 + 2 * j) * stride;
+                put_bf16x32(o, _mm512_mul_ps(I8X16(w, 0), d0), _mm512_mul_ps(I8X16(w, 1), d0));
+                put_bf16x32(o + stride, _mm512_mul_ps(I8X16(w, 2), d1), _mm512_mul_ps(I8X16(w, 3), d1));
+            }
+        }
+        return;
+    }
+#endif
+    float tmp[K3_GQ_QK];
+    const int blk = t == K3_GG_IQ2_XS || t == K3_GG_IQ3_XXS ? K3_GQ_QK : 32;
+    const size_t bb = k3_gq_row_bytes(t, blk);
+    for (int64_t i = 0; i < n / blk; i++) {
+        k3_gq_dequant(t, p + (size_t)i * bb, tmp, blk);
+        for (int k = 0; k < blk; k++)
+            dst[(size_t)((i * blk + k) / 32) * stride + (k & 31)] = f2bf_rne(tmp[k]);
+    }
+}
+
 /* ------------------------------------------------------------ int8 activations */
 void k3_gq_quant_x(int8_t *xq, float *dx, const float *x, int n)
 {

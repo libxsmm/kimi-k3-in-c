@@ -51,6 +51,10 @@ void k3_gq_mxfp4_to_k3(unsigned char *dst, const unsigned char *src, int rows, i
 /* Dequantise n weights (a block multiple) of type t to fp32, exactly as ggml does. */
 void k3_gq_dequant(int t, const void *src, float *dst, int64_t n);
 
+/* Dequantise n weights (a block multiple, n % 32 == 0) to bf16 (round to nearest even),
+ * 32 at a time: weights [32i, 32i + 32) go to dst + i * stride. */
+void k3_gq_to_bf16(int t, const void *src, int64_t n, uint16_t *dst, size_t stride);
+
 /* int8 activations: xq[n] and one scale per 256 (dx[n/256]); n % 256 == 0. */
 void k3_gq_quant_x(int8_t *xq, float *dx, const float *x, int n);
 /* 1 when this build has the integer kernels (AVX-512 VNNI). */

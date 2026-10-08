@@ -1876,9 +1876,10 @@ static int k3_main(int argc, char **argv)
      * whose recurrent state is exact rather than one generated token past the end. */
     double prof_wall = 0.0;
     int prof_steps = 0;
+    const int prof_prefill = getenv("K3_PROF_PREFILL") != NULL;   /* profile step 0 too */
     for (int g = 0; nout < gen || (incremental && g == 0); g++) {
         k3_cache_reset_stats(&cache);
-        if (g == 1 && k3_prof_on) {   /* step 0 is prefill or cold: keep it out */
+        if (g == 1 && k3_prof_on && !prof_prefill) {   /* step 0 is prefill or cold: keep it out */
             memset(k3_prof_s, 0, sizeof k3_prof_s);
             k3_tp.calls = 0; k3_tp.floats = 0.0;
             memset(w.layer_s, 0, (size_t)NL * sizeof(double));
@@ -2029,7 +2030,7 @@ static int k3_main(int argc, char **argv)
         }
         const double dt = now_s() - ts;
         t_total += dt;
-        if (g >= 1) { prof_wall += dt; prof_steps++; }
+        if (g >= 1 || prof_prefill) { prof_wall += dt; prof_steps++; }
         const uint64_t req = cache.hits + cache.misses;
         printf("%-6d %-10d %-12.2f %-10.1f %-10.2f %.3f\n", g, nxt, dt,
                req ? 100.0 * cache.hits / req : 0.0,

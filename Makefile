@@ -154,7 +154,7 @@ INCLUDES := -Iinclude -Iinclude/k3 -Ithird_party \
             -Isrc/par
 
 # ----------------------------------------------------------------------------- files --
-ENGINE_SRC := src/core/k3_ops.c src/core/k3_gq.c \
+ENGINE_SRC := src/core/k3_ops.c src/core/k3_gq.c src/core/k3_amx.c \
               src/io/k3_st.c src/io/k3_load.c src/io/k3_trunk.c src/io/k3_gguf.c \
               src/cache/k3_cache.c src/cache/k3_resident.c \
               src/model/k3_bind.c src/model/k3_gguf_bind.c
@@ -209,24 +209,24 @@ $(BIN):
 	@mkdir -p $(BIN)
 
 # Each test links only what it needs, so a failure points at one subsystem.
-$(BIN)/test_ops: tests/unit/test_ops.c $(BUILD)/src/core/k3_ops.o $(BUILD)/src/core/k3_gq.o | $(BIN)
+$(BIN)/test_ops: tests/unit/test_ops.c $(BUILD)/src/core/k3_ops.o $(BUILD)/src/core/k3_gq.o $(BUILD)/src/core/k3_amx.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 $(BIN)/test_gguf: tests/unit/test_gguf.c $(BUILD)/src/io/k3_gguf.o $(BUILD)/src/io/k3_st.o \
-                  $(BUILD)/src/core/k3_ops.o $(BUILD)/src/core/k3_gq.o | $(BIN)
+                  $(BUILD)/src/core/k3_ops.o $(BUILD)/src/core/k3_gq.o $(BUILD)/src/core/k3_amx.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 $(BIN)/test_cache: tests/unit/test_cache.c $(BUILD)/src/cache/k3_cache.o \
                    $(BUILD)/src/cache/k3_resident.o \
                    $(BUILD)/src/io/k3_load.o $(BUILD)/src/io/k3_st.o \
-                   $(BUILD)/src/core/k3_ops.o $(BUILD)/src/core/k3_gq.o | $(BIN)
+                   $(BUILD)/src/core/k3_ops.o $(BUILD)/src/core/k3_gq.o $(BUILD)/src/core/k3_amx.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 $(BIN)/test_st: tests/unit/test_st.c $(BUILD)/src/io/k3_st.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 $(BIN)/test_model_stream: tests/unit/test_model_stream.c $(BUILD)/src/model/k3_bind.o \
-                          $(BUILD)/src/io/k3_st.o $(BUILD)/src/core/k3_ops.o $(BUILD)/src/core/k3_gq.o | $(BIN)
+                          $(BUILD)/src/io/k3_st.o $(BUILD)/src/core/k3_ops.o $(BUILD)/src/core/k3_gq.o $(BUILD)/src/core/k3_amx.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 $(BIN)/test_st_faults: tests/unit/test_st_faults.c $(BUILD)/src/io/k3_st.o | $(BIN)
@@ -240,12 +240,12 @@ $(BIN)/test_tok: tests/unit/test_tok.c | $(BIN)
 $(BIN)/test_chat: tests/unit/test_chat.c src/chat/k3_chat.c src/chat/k3_sampler.c | $(BIN)
 	$(CC) $(CFLAGS) -Wno-unused-function $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
-$(BIN)/test_cfg: tests/unit/test_cfg.c src/core/k3_ops.c src/core/k3_gq.c | $(BIN)
+$(BIN)/test_cfg: tests/unit/test_cfg.c src/core/k3_ops.c src/core/k3_gq.c src/core/k3_amx.c | $(BIN)
 	$(CC) -O2 -std=c99 $(WARN) -Wno-unused-function $(INCLUDES) $^ -o $@ -lm
 
 # Allocates at REAL model widths (a ~1.8 GB KDA layer), so it needs the optimised build
 # rather than the portable C99 one the tokenizer and config tests use.
-$(BIN)/scale_test: tests/unit/scale_test.c $(BUILD)/src/core/k3_ops.o $(BUILD)/src/core/k3_gq.o | $(BIN)
+$(BIN)/scale_test: tests/unit/scale_test.c $(BUILD)/src/core/k3_ops.o $(BUILD)/src/core/k3_gq.o $(BUILD)/src/core/k3_amx.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 $(BIN)/k3_model: tests/unit/k3_model.c $(ENGINE_OBJ) | $(BIN)
@@ -254,19 +254,23 @@ $(BIN)/k3_model: tests/unit/k3_model.c $(ENGINE_OBJ) | $(BIN)
 $(BIN)/test_trunk: tests/unit/test_trunk.c $(BUILD)/src/io/k3_trunk.o \
                    $(BUILD)/src/io/k3_st.o \
                    $(BUILD)/src/model/k3_bind.o \
-                   $(BUILD)/src/core/k3_ops.o $(BUILD)/src/core/k3_gq.o | $(BIN)
+                   $(BUILD)/src/core/k3_ops.o $(BUILD)/src/core/k3_gq.o $(BUILD)/src/core/k3_amx.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
-$(BIN)/bench_kernels: benchmarks/bench_kernels.c $(BUILD)/src/core/k3_ops.o $(BUILD)/src/core/k3_gq.o | $(BIN)
+$(BIN)/bench_kernels: benchmarks/bench_kernels.c $(BUILD)/src/core/k3_ops.o $(BUILD)/src/core/k3_gq.o $(BUILD)/src/core/k3_amx.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 # Per-rank decode GEMVs of the GGUF model at TP shapes, streamed from DRAM.
-$(BIN)/bench_gemv_tp: benchmarks/bench_gemv_tp.c $(BUILD)/src/core/k3_ops.o $(BUILD)/src/core/k3_gq.o | $(BIN)
+$(BIN)/bench_gemv_tp: benchmarks/bench_gemv_tp.c $(BUILD)/src/core/k3_ops.o $(BUILD)/src/core/k3_gq.o $(BUILD)/src/core/k3_amx.o | $(BIN)
+	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
+
+# Prefill GEMM on AMX against the per-token GEMV path.
+$(BIN)/bench_amx: benchmarks/bench_amx.c $(BUILD)/src/core/k3_amx.o $(BUILD)/src/core/k3_ops.o $(BUILD)/src/core/k3_gq.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 # MPI builds only: latency of the collective shapes tensor parallelism uses.
 $(BIN)/bench_allgather: benchmarks/bench_allgather.c $(BUILD)/src/par/k3_mpi.o \
-                        $(BUILD)/src/core/k3_ops.o $(BUILD)/src/core/k3_gq.o | $(BIN)
+                        $(BUILD)/src/core/k3_ops.o $(BUILD)/src/core/k3_gq.o $(BUILD)/src/core/k3_amx.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 ## test: everything that needs no model weights
@@ -350,7 +354,7 @@ weights-test: $(WEIGHT_BINS)
 	./$(BIN)/test_real_layer "$(SHARD_DIR)" 1 4 8
 
 $(BIN)/test_expert: tests/unit/test_expert.c $(BUILD)/src/io/k3_load.o \
-                    $(BUILD)/src/io/k3_st.o $(BUILD)/src/core/k3_ops.o $(BUILD)/src/core/k3_gq.o | $(BIN)
+                    $(BUILD)/src/io/k3_st.o $(BUILD)/src/core/k3_ops.o $(BUILD)/src/core/k3_gq.o $(BUILD)/src/core/k3_amx.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 $(BIN)/test_real_layer: tests/unit/test_real_layer.c $(ENGINE_OBJ) | $(BIN)

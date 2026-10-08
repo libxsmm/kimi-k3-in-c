@@ -32,9 +32,11 @@
 #define _POSIX_C_SOURCE 200809L   /* clock_gettime under -std=c99 */
 
 #include "k3.h"
+#include "k3_amx.h"
 #include "k3_gq.h"
 
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -185,6 +187,61 @@ static inline int tp_blk(const K3Seg *s, int r, int ll, int *nf)
 
 static int tp_is_ll(int total) { return k3_tp.ll_put && total <= k3_tp.ll_maxw; }
 
+/* LARGE GATHERS over node shared memory (k3_tp.big, K3_TP_BIG=0 off): the team writes
+ * this rank's blocks into its region (alternating halves), one barrier across the ranks,
+ * then the team copies every peer's blocks out. Raw floats, so the same bits as
+ * allgatherv; complete when begin returns. */
+static int tp_big(int total, int ll)
+{
+    static int off = -1;
+    if (off < 0) off = getenv("K3_TP_BIG") && !strcmp(getenv("K3_TP_BIG"), "0");
+    return !off && !ll && k3_tp.big && 2L * total <= k3_tp.big_cap;
+}
+
+static __thread unsigned tp_big_turn;
+static void tp_big_gather(const K3Seg *seg, int nseg, int total)
+{
+    const int P = k3_tp.size, me = k3_tp.rank;
+    const long base = (long)(tp_big_turn++ & 1) * (k3_tp.big_cap / 2);
+    k3_sync();                                   /* every thread's rows are written */
+    const double t0 = k3_prof_on && k3_tid() == 0 ? k3_prof_now() : 0.0;
+    {
+        float *dst = k3_tp.big[me] + base;
+        for (int s = 0; s < nseg; s++) {
+            const int nu = seg[s].n / seg[s].unit;
+            const long lo = (long)nu * me / P * seg[s].unit, hi = (long)nu * (me + 1) / P * seg[s].unit;
+            int a, b;
+            k3_split((int)(hi - lo), &a, &b);
+            float *p = seg[s].p + lo;
+            if (seg_lp(&seg[s]))
+                for (int i = a; i < b; i++) p[i] = k3_bf16f(k3_f2bf(p[i]));
+            if (b > a) memcpy(dst + a, p + a, (size_t)(b - a) * sizeof(float));
+            dst += hi - lo;
+        }
+    }
+    k3_sync();
+    if (k3_tid() == 0) k3_tp.barrier(k3_tp.ctx);
+    k3_sync();
+    for (int r = 0; r < P; r++) {
+        if (r == me) continue;
+        const float *src = k3_tp.big[r] + base;
+        for (int s = 0; s < nseg; s++) {
+            const int nu = seg[s].n / seg[s].unit;
+            const long lo = (long)nu * r / P * seg[s].unit, hi = (long)nu * (r + 1) / P * seg[s].unit;
+            int a, b;
+            k3_split((int)(hi - lo), &a, &b);
+            if (b > a) memcpy(seg[s].p + lo + a, src + a, (size_t)(b - a) * sizeof(float));
+            src += hi - lo;
+        }
+    }
+    k3_sync();
+    if (k3_tid() == 0) {
+        k3_tp.calls++;
+        k3_tp.floats += (double)total;
+        if (k3_prof_on) k3_prof_s[K3P_COMM] += k3_prof_now() - t0;
+    }
+}
+
 /* Transport units of a gather, and whether it goes one-sided. */
 static int tp_units(const K3Seg *seg, int nseg, int *ll)
 {
@@ -234,6 +291,7 @@ void k3_tp_gather_begin(const K3Seg *seg, int nseg)
     }
     int ll;
     const int total = tp_units(seg, nseg, &ll);
+    if (tp_big(total, ll)) { tp_big_gather(seg, nseg, total); return; }
     if (ll && k3_tid() == 0 && ++tp_seq == 0) tp_seq = 1;   /* 0 is what a fresh window holds */
     k3_sync();
     if (k3_tid() == 0) tp_send(seg, nseg, total, ll);
@@ -245,6 +303,7 @@ void k3_tp_gather_end(const K3Seg *seg, int nseg)
     if (k3_tp.size <= 1) { if (k3_act_bf16 & K3_BF16_TP) k3_sync(); return; }
     int ll;
     const int total = tp_units(seg, nseg, &ll);
+    if (tp_big(total, ll)) return;               /* complete since begin */
     if (!ll) k3_sync();
     const double t0 = k3_prof_on && k3_tid() == 0 ? k3_prof_now() : 0.0;
     tp_recv(seg, nseg, total, ll);
@@ -486,7 +545,8 @@ static void k3_fatal_bound(const char *what, long value, long limit)
  * 64-byte aligned) and is never freed. The main thread is tid 0 both inside and outside
  * a team, so a slot must not be live across a call that uses the same slot. */
 enum { K3S_MLA_SC, K3S_MOE_AN, K3S_ROUTER_CHOICE, K3S_ROUTER_SCORE, K3S_MOE_SCORE,
-       K3S_MXFP4_XD, K3S_PREFILL, K3S_SEGS, K3S_KDA_STATE, K3S_XBF, K3S_QKV, K3S_XQ8, K3S_N };
+       K3S_MXFP4_XD, K3S_PREFILL, K3S_SEGS, K3S_KDA_STATE, K3S_XBF, K3S_QKV, K3S_XQ8,
+       K3S_AMX0, K3S_AMX1, K3S_AMXB, K3S_AMXE, K3S_AR, K3S_N };
 #define K3S_MAXT 1024
 static void  *k3s_buf[K3S_MAXT][K3S_N];
 static size_t k3s_cap[K3S_MAXT][K3S_N];
@@ -686,6 +746,50 @@ static void mmw_part(float *y, const float *x, const void *W, int wdt, int in,
     else                    matmul_f32_rows(y + r0, x, (const float *)Wr, in, 0, r1 - r0);
 }
 
+/* PREFILL ON AMX (K3_PREFILL_AMX=1): the projections of a chunk of T >= K3_AMX_MIN_T
+ * tokens run as bf16 GEMMs (k3_amx.h), each weight panel decoded once for the whole
+ * chunk. NOT bit-identical to the per-token GEMVs; the router stays fp32 and exact. */
+static int amx_on, amx_min_t = 32;
+static pthread_once_t amx_once = PTHREAD_ONCE_INIT;
+static void amx_init(void)
+{
+    const char *e = getenv("K3_PREFILL_AMX"), *m = getenv("K3_AMX_MIN_T");
+    amx_on = e && strcmp(e, "0") && k3_amx_ok();
+    if (m && atoi(m) > 0) amx_min_t = atoi(m);
+}
+static int amx_prefill(int T)
+{
+    pthread_once(&amx_once, amx_init);
+    return amx_on && T >= amx_min_t;
+}
+
+static int amx_wt(int wdt)
+{
+    return wdt == K3_WQ8_0 ? K3_GG_Q8_0 : wdt == K3_WF32 ? K3_GG_F32 : wdt == K3_WBF16 ? K3_GG_BF16 : -1;
+}
+
+/* Team: X [T][ldx] packed for the GEMMs into shared slot s (0 or 1); syncs before (X
+ * complete) and after (Xv complete). */
+static uint16_t *amx_xv[2];
+static float *amx_attn_buf;                /* thread 0's K3S_AMXE in MLA, published by a barrier */
+static float *moe_amx_buf;                 /* thread 0's K3S_AMXB, published by a barrier */
+static const uint16_t *amx_pack(int s, const float *X, int ldx, int T, int in)
+{
+    if (k3_tid() == 0)
+        amx_xv[s] = (uint16_t *)k3_scratch(K3S_AMX0 + s, k3_amx_xv_elems(T, in) * 2, "AMX activations");
+    k3_sync();
+    k3_amx_pack_x(amx_xv[s], X, ldx, T, in);
+    k3_sync();
+    return amx_xv[s];
+}
+
+/* Team: Y[t][r] for rows [r0, r1) of W, sliced like mmw_rows; no barrier at the end. */
+static void amx_rows(float *Y, int ldy, const uint16_t *Xv, int T, const void *W, int wdt,
+                     int in, int r0, int r1)
+{
+    k3_amx_gemm(Y, ldy, Xv, T, W, amx_wt(wdt), in, k3_tp.local ? r0 : 0, r0, r1);
+}
+
 /* This thread's k3_split share of rows [r0, r1) of q, k and v, the split mmw_rows uses,
  * read from the row-interleaved bf16 qkv matrix as one contiguous run. */
 static void qkv_rows(float *q, float *k, float *v, const float *x, const void *W, int in,
@@ -713,14 +817,23 @@ void k3_mmw_tp(float *y, const float *x, const void *W, int wdt, int in, int out
 }
 
 /* Gather `rows` consecutive vectors of n floats, each partitioned in blocks of unit. */
-static void tp_gather_rows(float *p, int rows, int n, int unit)
+static void tp_gather_rows_ex(float *p, int rows, int n, int unit, int exact)
 {
     if ((k3_tp.size <= 1 && !(k3_act_bf16 & K3_BF16_TP)) || rows <= 0) { k3_sync(); return; }
-    K3Seg *s = (K3Seg *)k3_scratch(K3S_SEGS, (size_t)rows * sizeof(K3Seg), "TP gather segments");
-    for (int r = 0; r < rows; r++) {
-        s[r].p = p + (size_t)r * n; s[r].n = n; s[r].unit = unit; s[r].exact = 0;
+    K3Seg *s = (K3Seg *)k3_scratch(K3S_SEGS, (size_t)TP_MAXSEG * sizeof(K3Seg), "TP gather segments");
+    /* at most TP_MAXSEG segments per gather: a long prompt is gathered in groups of rows */
+    for (int g = 0; g < rows; g += TP_MAXSEG) {
+        const int ng = rows - g < TP_MAXSEG ? rows - g : TP_MAXSEG;
+        for (int r = 0; r < ng; r++) {
+            s[r].p = p + (size_t)(g + r) * n; s[r].n = n; s[r].unit = unit; s[r].exact = exact;
+        }
+        k3_tp_gather(s, ng);
     }
-    k3_tp_gather(s, rows);
+}
+
+static void tp_gather_rows(float *p, int rows, int n, int unit)
+{
+    tp_gather_rows_ex(p, rows, n, unit, 0);
 }
 
 void k3_situ_glu(float *y, const float *x, int n, float b1, float b2)
@@ -1024,6 +1137,35 @@ static void mla_team(float *out, const float *x, const K3MlaW *w, const K3Cfg *c
 
     /* ---- per-token projections ---- */
     double tp = k3_prof_t0();
+    const int amx = amx_prefill(T) && amx_wt(w->wdt) >= 0 && amx_wt(w->kv_b_wdt) >= 0 &&
+                    E % 32 == 0 && c->q_lora % 32 == 0 && c->kv_lora % 32 == 0 && (H * vh) % 32 == 0;
+    float *QL = NULL, *CT = NULL, *GB = NULL, *AC = NULL;
+    if (amx) {
+        if (k3_tid() == 0)
+            moe_amx_buf = (float *)k3_scratch(K3S_AMXB, (size_t)T * (c->q_lora + kvw + 2 * (size_t)H * vh) *
+                                              sizeof(float), "AMX prefill MLA");
+        const uint16_t *xv = amx_pack(0, x, E, T, E);    /* syncs: moe_amx_buf is published */
+        QL = moe_amx_buf; CT = QL + (size_t)T * c->q_lora;
+        GB = CT + (size_t)T * kvw; AC = GB + (size_t)T * H * vh;
+        amx_rows(QL, c->q_lora, xv, T, w->q_a, w->wdt, E, a0, a1);
+        amx_rows(CT, kvw, xv, T, w->kv_a, w->wdt, E, b0, b1);
+        if (w->g) amx_rows(GB, H * vh, xv, T, w->g, w->wdt, E, h0 * vh, h1 * vh);
+        tp_gather_rows(QL, T, c->q_lora, 1);
+        tp_gather_rows(CT, T, kvw, 1);
+        int lo, hi;
+        k3_split(T, &lo, &hi);
+        for (int t = lo; t < hi; t++) {
+            float *qlt = QL + (size_t)t * c->q_lora, *ctt = CT + (size_t)t * kvw;
+            rmsnorm_serial(qlt, qlt, w->q_a_norm, c->q_lora, c->rms_eps);
+            rmsnorm_serial(ctt, ctt, w->kv_a_norm, c->kv_lora, c->rms_eps);   /* latent only */
+            memcpy(K3_ROPE_AT(cached + t), ctt + c->kv_lora, (size_t)qr * sizeof(float));
+        }
+        const uint16_t *qv = amx_pack(1, QL, c->q_lora, T, c->q_lora);
+        amx_rows(q, H * qh, qv, T, w->q_b, w->wdt, c->q_lora, h0 * qh, h1 * qh);
+        const uint16_t *cv = amx_pack(0, CT, kvw, T, c->kv_lora);
+        amx_rows(K3_KV_AT(cached), H * kvd, cv, T, w->kv_b, w->kv_b_wdt, c->kv_lora, h0 * kvd, h1 * kvd);
+        k3_sync();
+    } else
     for (int t = 0; t < T; t++) {
         const int p = cached + t;
         const float *xt = x + (size_t)t * E;
@@ -1053,6 +1195,50 @@ static void mla_team(float *out, const float *x, const K3MlaW *w, const K3Cfg *c
     k3_prof_add(K3P_MLA_PROJ, tp);
 
     /* ---- attention, per head, causal; heads split over the team ---- */
+    if (amx) {
+        /* per head two GEMMs: scores = Q K^T over every cached position, a causal fp32
+         * softmax, then P V (V transposed so positions are the reduction) */
+        tp = k3_prof_t0();
+        const int S = cached + T, Sp = (S + 31) / 32 * 32;
+        if (k3_tid() == 0)
+            amx_attn_buf = (float *)k3_scratch(K3S_AMXE, ((size_t)S * qh + (size_t)vh * Sp + (size_t)T * Sp) *
+                                               sizeof(float), "AMX MLA attention");
+        k3_sync();
+        float *KH = amx_attn_buf, *VT = KH + (size_t)S * qh, *SP = VT + (size_t)vh * Sp;
+        for (int h = h0; h < h1; h++) {
+            int lo, hi;
+            k3_split(Sp, &lo, &hi);
+            for (int s = lo; s < hi; s++) {
+                if (s < S) {
+                    const float *kv = K3_KV_AT(s) + (size_t)h * kvd;
+                    memcpy(KH + (size_t)s * qh, kv, (size_t)qn * sizeof(float));
+                    memcpy(KH + (size_t)s * qh + qn, K3_ROPE_AT(s), (size_t)qr * sizeof(float));
+                    for (int j = 0; j < vh; j++) VT[(size_t)j * Sp + s] = kv[qn + j];
+                } else {
+                    for (int j = 0; j < vh; j++) VT[(size_t)j * Sp + s] = 0.0f;
+                }
+            }
+            const uint16_t *qv = amx_pack(0, q + (size_t)h * qh, H * qh, T, qh);
+            k3_amx_gemm(SP, Sp, qv, T, KH, K3_GG_F32, qh, 0, 0, S);
+            k3_sync();
+            k3_split(T, &lo, &hi);
+            for (int t = lo; t < hi; t++) {
+                float *r = SP + (size_t)t * Sp;
+                const int p = cached + t;                /* causal: s <= p */
+                float m = -INFINITY;
+                for (int s = 0; s <= p; s++) { r[s] *= scale; if (r[s] > m) m = r[s]; }
+                double z = 0.0;
+                for (int s = 0; s <= p; s++) { r[s] = expf(r[s] - m); z += r[s]; }
+                const float iz = (float)(1.0 / z);
+                for (int s = 0; s <= p; s++) r[s] *= iz;
+                for (int s = p + 1; s < Sp; s++) r[s] = 0.0f;
+            }
+            const uint16_t *pv = amx_pack(1, SP, Sp, T, Sp);
+            k3_amx_gemm(AC + (size_t)h * vh, H * vh, pv, T, VT, K3_GG_F32, Sp, 0, 0, vh);
+            k3_sync();                           /* KH, VT and SP are rewritten for the next head */
+        }
+        k3_prof_add(K3P_MLA_CORE, tp);
+    } else
     for (int t = 0; t < T; t++) {
         const int p = cached + t;
         tp = k3_prof_t0();
@@ -1078,7 +1264,7 @@ static void mla_team(float *out, const float *x, const K3MlaW *w, const K3Cfg *c
             double z = 0.0;
             for (int s = 0; s <= p; s++) { scp[s] = expf(scp[s] - m); z += scp[s]; }
 
-            float *o = acc + (size_t)h * vh;
+            float *o = (amx ? AC + (size_t)t * H * vh : acc) + (size_t)h * vh;
             for (int j = 0; j < vh; j++) o[j] = 0.0f;
             for (int s = 0; s <= p; s++) {
                 const float pr = (float)(scp[s] / z);
@@ -1087,6 +1273,7 @@ static void mla_team(float *out, const float *x, const K3MlaW *w, const K3Cfg *c
             }
         }
         k3_prof_add(K3P_MLA_CORE, tp);
+        if (amx) continue;
 
         /* ---- output gate then projection. Gate BEFORE o_proj, and no norm on it,
          * unlike KDA which norms first. :470-473 ---- */
@@ -1104,6 +1291,22 @@ static void mla_team(float *out, const float *x, const K3MlaW *w, const K3Cfg *c
         mmw_rows(out + (size_t)t * E, acc, w->o, w->wdt, H * vh, e0, e1);
         const K3Seg so = { out + (size_t)t * E, E, 1, 0 };
         k3_tp_gather(&so, 1);
+        k3_prof_add(K3P_MLA_OUT, tp);
+    }
+    if (amx) {
+        tp = k3_prof_t0();
+        k3_sync();
+        if (w->g) {
+            int lo, hi;
+            k3_split(T, &lo, &hi);
+            for (int t = lo; t < hi; t++)
+                for (int i = h0 * vh; i < h1 * vh; i++)
+                    AC[(size_t)t * H * vh + i] *= 1.0f / (1.0f + expf(-GB[(size_t)t * H * vh + i]));
+        }
+        tp_gather_rows(AC, T, H * vh, vh);
+        const uint16_t *av = amx_pack(1, AC, H * vh, T, H * vh);
+        amx_rows(out, E, av, T, w->o, w->wdt, H * vh, e0, e1);
+        tp_gather_rows(out, T, E, 1);
         k3_prof_add(K3P_MLA_OUT, tp);
     }
     #undef K3_KV_AT
@@ -1291,6 +1494,53 @@ static void attn_res_v(float *out, const float *const *v, const float *fold,
         }
         if (opart) opart[c] = rc_sq(out, c, n);
     }
+}
+
+/* attn_res_v by ONE thread for one token: the same canonical sums in the same order, so
+ * the same bits; part holds 2*nsrc*rc_n(n) doubles, opart rc_n(n). */
+static void attn_res_serial(float *out, const float *const *v, const float *fold,
+                            int nsrc, int n, float eps, double *part, double *opart)
+{
+    const int nc = rc_n(n);
+    for (int s = 0; s < nsrc; s++)
+        for (int c = 0; c < nc; c++) {
+            const int i0 = c * K3_RC, i1 = i0 + K3_RC < n ? i0 + K3_RC : n;
+            double q = 0.0, d = 0.0;
+            for (int i = i0; i < i1; i++) {
+                q += (double)v[s][i] * (double)v[s][i];
+                d += (double)v[s][i] * (double)fold[i];
+            }
+            part[s * nc + c] = q;
+            part[nsrc * nc + s * nc + c] = d;
+        }
+    float p[K3_AR_MAXSRC];
+    for (int s = 0; s < nsrc; s++) {
+        const float inv = (float)(1.0 / sqrt(rc_total(part + s * nc, nc) / (double)n
+                                             + (double)eps));
+        p[s] = (float)((double)inv * rc_total(part + (nsrc + s) * nc, nc));
+    }
+    float m = p[0];
+    for (int s = 1; s < nsrc; s++) if (p[s] > m) m = p[s];
+    double z = 0.0;
+    for (int s = 0; s < nsrc; s++) { p[s] = expf(p[s] - m); z += p[s]; }
+    for (int s = 0; s < nsrc; s++) p[s] = (float)(p[s] / z);
+    for (int c = 0; c < nc; c++) {
+        const int i0 = c * K3_RC, i1 = i0 + K3_RC < n ? i0 + K3_RC : n;
+        for (int i = i0; i < i1; i++) {
+            float a = 0.0f;
+            for (int s = 0; s < nsrc; s++) a += p[s] * v[s][i];
+            out[i] = a;
+        }
+        opart[c] = rc_sq(out, c, n);
+    }
+}
+
+/* Long prompts: threads take whole tokens (K3_AR_BATCH=0: the per-token team form). */
+static int ar_batched(int T)
+{
+    static int off = -1;
+    if (off < 0) off = getenv("K3_AR_BATCH") && !strcmp(getenv("K3_AR_BATCH"), "0");
+    return !off && T >= 2 * k3_nth() && k3_nth() > 1;
 }
 
 void k3_attn_res(float *out, const float *src, const float *fold,
@@ -1546,9 +1796,79 @@ static int       moe_idx[K3_MAX_TOPK];
 static int       moe_nq;
 static float    *moe_score;                /* router scores when they do not fit scratch */
 
+/* Thread 0: the top-k of one token's scores, resolved through the source into moe_q /
+ * moe_idx / moe_wq / moe_nq; accL[0..L) is cleared for the routed sum. */
+static void moe_select(int *idx, float *wt, const float *score, const K3MoeW *w,
+                       const K3Cfg *c, float *accL)
+{
+    const int L = c->latent, NE = c->n_experts;
+    router_select(idx, wt, score, w->bias, NE, c->topk, c->moe_renorm, c->routed_scale);
+    int nk = c->topk;
+    /* Draft cache-only routing: keep only the top-k experts already resident, and
+     * renormalise their weights so the mixture still sums as intended. This makes
+     * a draft token read ZERO new expert bytes. It is an approximation, which is
+     * exactly what a draft is; the exact model verifies every proposed token. */
+    if (w->cache_only && w->src && w->src->resident) {
+        int m = 0; float wsum = 0.0f;
+        for (int j = 0; j < c->topk; j++) {
+            if (w->src->resident(w->src, w->layer, idx[j], NULL)) {
+                idx[m] = idx[j]; wt[m] = wt[j]; wsum += wt[j]; m++;
+            }
+        }
+        nk = m;
+        if (wsum > 0.0f) for (int j = 0; j < nk; j++) wt[j] /= wsum;
+    }
+    for (int i = 0; i < L; i++) accL[i] = 0.0f;
+    /* Hand the WHOLE top-k to the source first, so its reads can overlap. Without
+     * this the loop below misses, blocks on a 17.55 MB read, computes, misses
+     * again: a queue depth of one against a drive that needs depth to reach its
+     * rated bandwidth. getmany is optional and may be NULL, in which case nothing
+     * changes and the loop reads them one at a time exactly as before. */
+    if (!w->cache_only && w->src && w->src->getmany)
+        w->src->getmany(w->src, w->layer, idx, nk);
+    if (w->src) {
+        /* Streamed: the experts stay MXFP4 and the matmuls read nibbles. Resolve
+         * the whole top-k first; the source keeps every pointer valid for the
+         * token. In cache-only mode every idx[j] is known resident, so resident()
+         * serves it with no disk read; otherwise get() may read it. */
+        int nq = 0;
+        for (int j = 0; j < nk; j++) {
+            int miss = w->cache_only
+                ? !w->src->resident(w->src, w->layer, idx[j], &moe_q[nq])
+                : (w->src->get(w->src, w->layer, idx[j], &moe_q[nq]) != 0);
+            if (miss) {
+                /* A cache-only draft filtered to resident experts already, so a
+                 * miss here is a benign race at worst; skip it, since the draft is
+                 * approximate by construction and the exact model verifies. On
+                 * the exact path a miss is the unacceptable silent-corruption
+                 * case: count it in k3_expert_drops so the caller fails the run
+                 * (see docs/API.md). */
+                if (w->cache_only) continue;
+                k3_expert_drops++;
+                fprintf(stderr, "EXPERT DROP: layer %d expert %d failed to load; "
+                                "this token is CORRUPT\n", w->layer, idx[j]);
+                continue;
+            }
+            moe_wq[nq++] = wt[j];
+        }
+        moe_nq = nq;
+    } else {
+        for (int j = 0; j < nk; j++) { moe_idx[j] = idx[j]; moe_wq[j] = wt[j]; }
+        moe_nq = nk;
+    }
+}
+
+static void moe_team_amx(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
+                         int T, int *idx, float *wt, float *scratch);
+
 static void moe_team(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
                      int T, int *idx, float *wt, float *scratch)
 {
+    if (amx_prefill(T) && amx_wt(w->wdt) >= 0 && !w->cache_only && c->hidden % 32 == 0 &&
+        c->latent % 32 == 0 && (c->moe_inter * c->n_shared) % 32 == 0) {
+        moe_team_amx(out, x, w, c, T, idx, wt, scratch);
+        return;
+    }
     const int E = c->hidden, L = c->latent, I = c->moe_inter;
     const int SI = I * c->n_shared, NE = c->n_experts;
 
@@ -1610,62 +1930,7 @@ static void moe_team(float *out, const float *x, const K3MoeW *w, const K3Cfg *c
         /* Selection, and resolving experts through the source (which may do I/O and is
          * not thread safe), on thread 0; the team picks the result up after the barrier. */
         tp = k3_prof_t0();
-        if (k3_tid() == 0) {
-            router_select(idx, wt, score, w->bias, NE, c->topk, c->moe_renorm, c->routed_scale);
-            int nk = c->topk;
-            /* Draft cache-only routing: keep only the top-k experts already resident, and
-             * renormalise their weights so the mixture still sums as intended. This makes
-             * a draft token read ZERO new expert bytes. It is an approximation, which is
-             * exactly what a draft is; the exact model verifies every proposed token. */
-            if (w->cache_only && w->src && w->src->resident) {
-                int m = 0; float wsum = 0.0f;
-                for (int j = 0; j < c->topk; j++) {
-                    if (w->src->resident(w->src, w->layer, idx[j], NULL)) {
-                        idx[m] = idx[j]; wt[m] = wt[j]; wsum += wt[j]; m++;
-                    }
-                }
-                nk = m;
-                if (wsum > 0.0f) for (int j = 0; j < nk; j++) wt[j] /= wsum;
-            }
-            for (int i = 0; i < L; i++) accL[i] = 0.0f;
-            /* Hand the WHOLE top-k to the source first, so its reads can overlap. Without
-             * this the loop below misses, blocks on a 17.55 MB read, computes, misses
-             * again: a queue depth of one against a drive that needs depth to reach its
-             * rated bandwidth. getmany is optional and may be NULL, in which case nothing
-             * changes and the loop reads them one at a time exactly as before. */
-            if (!w->cache_only && w->src && w->src->getmany)
-                w->src->getmany(w->src, w->layer, idx, nk);
-            if (w->src) {
-                /* Streamed: the experts stay MXFP4 and the matmuls read nibbles. Resolve
-                 * the whole top-k first; the source keeps every pointer valid for the
-                 * token. In cache-only mode every idx[j] is known resident, so resident()
-                 * serves it with no disk read; otherwise get() may read it. */
-                int nq = 0;
-                for (int j = 0; j < nk; j++) {
-                    int miss = w->cache_only
-                        ? !w->src->resident(w->src, w->layer, idx[j], &moe_q[nq])
-                        : (w->src->get(w->src, w->layer, idx[j], &moe_q[nq]) != 0);
-                    if (miss) {
-                        /* A cache-only draft filtered to resident experts already, so a
-                         * miss here is a benign race at worst; skip it, since the draft is
-                         * approximate by construction and the exact model verifies. On
-                         * the exact path a miss is the unacceptable silent-corruption
-                         * case: count it in k3_expert_drops so the caller fails the run
-                         * (see docs/API.md). */
-                        if (w->cache_only) continue;
-                        k3_expert_drops++;
-                        fprintf(stderr, "EXPERT DROP: layer %d expert %d failed to load; "
-                                        "this token is CORRUPT\n", w->layer, idx[j]);
-                        continue;
-                    }
-                    moe_wq[nq++] = wt[j];
-                }
-                moe_nq = nq;
-            } else {
-                for (int j = 0; j < nk; j++) { moe_idx[j] = idx[j]; moe_wq[j] = wt[j]; }
-                moe_nq = nk;
-            }
-        }
+        if (k3_tid() == 0) moe_select(idx, wt, score, w, c, accL);
         k3_prof_add(K3P_ROUTER, tp);
         k3_sync();
 
@@ -1721,6 +1986,266 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
     K3_TEAM_IF(1, moe_team(out, x, w, c, T, idx, wt, scratch));
 }
 
+/* Routed experts of T tokens at once on AMX: thread 0 selects every token's top-k and
+ * groups the (token, slot) pairs by expert; each expert's gate|up then runs as one GEMM
+ * over its tokens (its rows decoded once), act is gathered across ranks in one go, and
+ * the down projections run the same way. accL[t] sums the slots in top-k order, as
+ * moe_routed does. AC [T][L] gets the gathered aggregate. Returns 0 (nothing done) when a
+ * selected expert is not in a GEMM format (MXFP4) or there is no source. */
+static struct {
+    int *sel, *pos, *mapz, *mapa, ng, npad, np, ok;
+    float *wq;
+    K3AmxGroup *gu, *dn;
+    float *g1, *g3, *actT, *edn;
+} mx;
+#define K3_AMX_SITU_MAX 512
+#define K3_AMX_MOE_CHUNK 1024
+
+static int moe_experts_amx(float *AC, const float *Z, const float *SC, int T,
+                           const K3MoeW *w, const K3Cfg *c)
+{
+    const int L = c->latent, I = c->moe_inter, NE = c->n_experts, K = c->topk;
+    int i0, i1, l0, l1;
+    k3_tp_part(I, &i0, &i1);
+    k3_tp_part(L, &l0, &l1);
+    const int ni = i1 - i0, nl = l1 - l0;
+    const int sliced = w->src && w->src->sliced;
+
+    if (k3_tid() == 0) {
+        mx.ok = 0;
+        static int *cnt, *gstart;
+        static size_t cap_i;
+        static K3ExpertQ *eq;
+        const size_t NP = (size_t)T * K, NPAD = NP + (size_t)NE * 15;
+        if (cap_i < NPAD) {
+            free(mx.sel); free(mx.pos); free(mx.mapz); free(mx.mapa); free(mx.wq);
+            free(mx.gu); free(mx.dn); free(cnt); free(gstart); free(eq);
+            mx.sel = malloc(NP * sizeof(int)); mx.pos = malloc(NP * sizeof(int));
+            mx.wq = malloc(NP * sizeof(float));
+            mx.mapz = malloc(NPAD * sizeof(int)); mx.mapa = malloc(NPAD * sizeof(int));
+            mx.gu = malloc(2 * (size_t)NE * sizeof(K3AmxGroup)); mx.dn = malloc((size_t)NE * sizeof(K3AmxGroup));
+            cnt = malloc((size_t)NE * sizeof(int)); gstart = malloc((size_t)NE * sizeof(int));
+            eq = malloc((size_t)NE * sizeof(K3ExpertQ));
+            if (!mx.sel || !mx.pos || !mx.wq || !mx.mapz || !mx.mapa || !mx.gu || !mx.dn || !cnt || !gstart || !eq)
+                k3_fatal_oom("AMX expert plan", NPAD * 16);
+            cap_i = NPAD;
+        }
+        if (w->src && w->src->get && !w->cache_only) {
+            memset(cnt, 0, (size_t)NE * sizeof(int));
+            for (int t = 0; t < T; t++) {
+                router_select(mx.sel + (size_t)t * K, mx.wq + (size_t)t * K, SC + (size_t)t * NE, w->bias,
+                              NE, K, c->moe_renorm, c->routed_scale);
+                for (int j = 0; j < K; j++) cnt[mx.sel[(size_t)t * K + j]]++;
+            }
+            int ok = 1, pad = 0, ng = 0;
+            for (int e = 0; e < NE && ok; e++) {
+                gstart[e] = -1;
+                if (!cnt[e]) continue;
+                if (w->src->get(w->src, w->layer, e, &eq[e]) != 0 ||
+                    eq[e].qt1 == K3_EQ_MXFP4 || eq[e].qt3 == K3_EQ_MXFP4 || eq[e].qt2 == K3_EQ_MXFP4) { ok = 0; break; }
+                const int n = cnt[e];
+                const int tt = eq[e].qt1 == K3_EQ_IQ2XS ? K3_GG_IQ2_XS : K3_GG_IQ3_XXS;
+                const int t3 = eq[e].qt3 == K3_EQ_IQ2XS ? K3_GG_IQ2_XS : K3_GG_IQ3_XXS;
+                const int t2 = eq[e].qt2 == K3_EQ_IQ2XS ? K3_GG_IQ2_XS : K3_GG_IQ3_XXS;
+                mx.gu[2 * ng]     = (K3AmxGroup){ eq[e].p1, tt, sliced ? i0 : 0, NULL, ni, i0, pad, n };
+                mx.gu[2 * ng + 1] = (K3AmxGroup){ eq[e].p3, t3, sliced ? i0 : 0, NULL, ni, i0, pad, n };
+                mx.dn[ng]         = (K3AmxGroup){ eq[e].p2, t2, sliced ? l0 : 0, NULL, nl, l0, pad, n };
+                gstart[e] = pad;
+                for (int i = 0; i < (n + 15) / 16 * 16; i++) { mx.mapz[pad + i] = -1; mx.mapa[pad + i] = -1; }
+                cnt[e] = 0;                               /* now the fill cursor */
+                pad += (n + 15) / 16 * 16;
+                ng++;
+            }
+            if (ok) {
+                /* pairs in (expert, token, slot) order */
+                for (int t = 0; t < T; t++)
+                    for (int j = 0; j < K; j++) {
+                        const int e = mx.sel[(size_t)t * K + j], p = gstart[e] + cnt[e]++;
+                        mx.mapz[p] = t;
+                        mx.pos[(size_t)t * K + j] = p;
+                    }
+                /* compact column of padded position p: the running count of valid pairs */
+                int col = 0;
+                for (int p = 0; p < pad; p++) if (mx.mapz[p] >= 0) mx.mapa[p] = col++;
+                mx.ng = ng; mx.npad = pad; mx.np = col; mx.ok = 1;
+            }
+        }
+    }
+    k3_sync();
+    if (!mx.ok) return 0;
+
+    /* buffers: g1, g3 [npad][ni], actT [I][np], edn [npad][nl] */
+    if (k3_tid() == 0) {
+        float *b = (float *)k3_scratch(K3S_AMXE, ((size_t)mx.npad * (2 * ni + nl) + (size_t)I * mx.np) *
+                                       sizeof(float), "AMX experts");
+        mx.g1 = b; mx.g3 = b + (size_t)mx.npad * ni; mx.edn = mx.g3 + (size_t)mx.npad * ni;
+        mx.actT = mx.edn + (size_t)mx.npad * nl;
+        for (int g = 0; g < mx.ng; g++) {
+            mx.gu[2 * g].Y = mx.g1; mx.gu[2 * g + 1].Y = mx.g3; mx.dn[g].Y = mx.edn;
+        }
+        amx_xv[0] = (uint16_t *)k3_scratch(K3S_AMX0, k3_amx_xv_elems(mx.npad, L) * 2, "AMX activations");
+        amx_xv[1] = (uint16_t *)k3_scratch(K3S_AMX1, k3_amx_xv_elems(mx.npad, I) * 2, "AMX activations");
+    }
+    k3_sync();
+
+    /* gate|up: every expert's tokens through its rows [i0, i1) */
+    k3_amx_pack_rows(amx_xv[0], Z, L, mx.mapz, mx.npad, L);
+    k3_amx_gemm_groups(mx.gu, 2 * mx.ng, amx_xv[0], L, i0, i1);
+    k3_sync();
+    {
+        int lo, hi;
+        k3_split(mx.npad, &lo, &hi);
+        for (int p = lo; p < hi; p++) {
+            const int col = mx.mapa[p];
+            if (col < 0) continue;
+            float tmp[K3_AMX_SITU_MAX];
+            for (int r0 = 0; r0 < ni; r0 += K3_AMX_SITU_MAX) {
+                const int n = ni - r0 < K3_AMX_SITU_MAX ? ni - r0 : K3_AMX_SITU_MAX;
+                situ_range(tmp, mx.g1 + (size_t)p * ni + r0, mx.g3 + (size_t)p * ni + r0, n,
+                           c->situ_b1, c->situ_b2);
+                for (int i = 0; i < n; i++) mx.actT[(size_t)(i0 + r0 + i) * mx.np + col] = tmp[i];
+            }
+        }
+    }
+    {
+        const K3Seg sa = { mx.actT, I * mx.np, mx.np, 0 };   /* rank r owns act rows [i0, i1) */
+        k3_tp_gather(&sa, 1);
+    }
+
+    /* down: every expert's act through its rows [l0, l1) */
+    k3_amx_pack_cols(amx_xv[1], mx.actT, mx.np, mx.mapa, mx.npad, I);
+    k3_amx_gemm_groups(mx.dn, mx.ng, amx_xv[1], I, l0, l1);
+    k3_sync();
+    {
+        int lo, hi;
+        k3_split(T, &lo, &hi);
+        for (int t = lo; t < hi; t++)
+            for (int l = l0; l < l1; l++) {
+                float a = 0.0f;
+                for (int j = 0; j < K; j++)
+                    a += mx.wq[(size_t)t * K + j] * mx.edn[(size_t)mx.pos[(size_t)t * K + j] * nl + l - l0];
+                AC[(size_t)t * L + l] = a;
+            }
+    }
+    tp_gather_rows(AC, T, L, 1);
+    return 1;
+}
+
+/* Prefill MoE with the trunk matmuls batched on AMX: router (fp32, the per-token GEMV per
+ * row, so the same bits and the same picks), latent down, shared gate|up, the routed
+ * experts grouped per expert (moe_experts_amx, else token by token as in moe_team), then
+ * latent up and shared down batched. */
+static void moe_team_amx(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
+                         int T, int *idx, float *wt, float *scratch)
+{
+    const int E = c->hidden, L = c->latent, I = c->moe_inter;
+    const int SI = I * c->n_shared, NE = c->n_experts;
+    int x0, x1, l0, l1, s0, s1, o0, o1;
+    k3_tp_part(NE, &x0, &x1);
+    k3_tp_part(L, &l0, &l1);
+    k3_tp_part(SI, &s0, &s1);
+    k3_tp_part(E, &o0, &o1);
+
+    if (k3_tid() == 0)
+        moe_amx_buf = (float *)k3_scratch(K3S_AMXB, (size_t)T * (NE + 3 * (size_t)L + 3 * (size_t)SI + E)
+                                          * sizeof(float), "AMX prefill MoE");
+    k3_sync();
+    float *SC = moe_amx_buf;                  /* [T][NE]   router scores        */
+    float *Z  = SC + (size_t)T * NE;          /* [T][L]    latent input         */
+    float *AC = Z  + (size_t)T * L;           /* [T][L]    routed aggregate     */
+    float *AN = AC + (size_t)T * L;           /* [T][L]    normalised aggregate */
+    float *SG = AN + (size_t)T * L;           /* [T][2SI]  shared gate|up       */
+    float *SA = SG + (size_t)T * 2 * SI;      /* [T][SI]   shared act           */
+    float *SD = SA + (size_t)T * SI;          /* [T][E]    shared down          */
+    float *xbuf = scratch + 3 * (size_t)L + 3 * (size_t)I + 3 * (size_t)SI + E;   /* as in moe_team */
+    if ((size_t)(xbuf - scratch) & 1) xbuf++;
+
+    double tp = k3_prof_t0();
+    {
+        int lo, hi;
+        k3_split(x1 - x0, &lo, &hi);
+        for (int t = 0; t < T; t++)
+            router_scores_part(SC + (size_t)t * NE, x + (size_t)t * E, w->gate, E, x0, x0 + lo, x0 + hi);
+    }
+    k3_prof_add(K3P_ROUTER, tp);
+    tp = k3_prof_t0();
+    const uint16_t *xv = amx_pack(0, x, E, T, E);
+    amx_rows(Z, L, xv, T, w->down, w->wdt, E, l0, l1);
+    k3_prof_add(K3P_MOE_DOWN, tp);
+    tp = k3_prof_t0();
+    amx_rows(SG, 2 * SI, xv, T, w->sh1, w->wdt, E, s0, s1);
+    amx_rows(SG + SI, 2 * SI, xv, T, w->sh3, w->wdt, E, s0, s1);
+    k3_sync();
+    {
+        int lo, hi;
+        k3_split(T, &lo, &hi);
+        for (int t = lo; t < hi; t++)
+            situ_range(SA + (size_t)t * SI + s0, SG + (size_t)t * 2 * SI + s0,
+                       SG + (size_t)t * 2 * SI + SI + s0, s1 - s0, c->situ_b1, c->situ_b2);
+    }
+    k3_prof_add(K3P_SHARED, tp);
+    tp = k3_prof_t0();
+    tp_gather_rows_ex(SC, T, NE, 1, 1);       /* scores pick experts: fp32 */
+    tp_gather_rows(Z, T, L, 1);
+    k3_prof_add(K3P_MOE_DOWN, tp);
+
+    tp = k3_prof_t0();
+    int batched = 1;
+    for (int t0 = 0; t0 < T && batched; t0 += K3_AMX_MOE_CHUNK) {   /* bounds the act gather */
+        const int tc = T - t0 < K3_AMX_MOE_CHUNK ? T - t0 : K3_AMX_MOE_CHUNK;
+        batched = moe_experts_amx(AC + (size_t)t0 * L, Z + (size_t)t0 * L, SC + (size_t)t0 * NE, tc, w, c);
+    }
+    k3_prof_add(K3P_EXPERTS, tp);
+    if (batched) {
+        tp = k3_prof_t0();
+        tp_gather_rows(SA, T, SI, 1);
+        k3_prof_add(K3P_SHARED, tp);
+    } else
+    for (int t = 0; t < T; t++) {
+        float *accL = AC + (size_t)t * L;
+        tp = k3_prof_t0();
+        if (k3_tid() == 0) moe_select(idx, wt, SC + (size_t)t * NE, w, c, accL);
+        k3_prof_add(K3P_ROUTER, tp);
+        k3_sync();
+        tp = k3_prof_t0();
+        const K3Seg shared_act = { SA + (size_t)t * SI, SI, 1, 0 };
+        moe_routed(accL, Z + (size_t)t * L, w, w->src ? moe_q : NULL, moe_idx, moe_wq, moe_nq, c,
+                   xbuf, shared_act);
+        const K3Seg sa = { accL, L, 1, 0 };
+        k3_tp_gather_end(&sa, 1);
+        k3_prof_add(K3P_EXPERTS, tp);
+    }
+
+    tp = k3_prof_t0();
+    {
+        int lo, hi;
+        k3_split(T, &lo, &hi);
+        for (int t = lo; t < hi; t++) {
+            if (c->latent_norm)
+                rmsnorm_serial(AN + (size_t)t * L, AC + (size_t)t * L, w->latent_norm, L, c->rms_eps);
+            else
+                memcpy(AN + (size_t)t * L, AC + (size_t)t * L, (size_t)L * sizeof(float));
+        }
+    }
+    const uint16_t *av = amx_pack(1, AN, L, T, L);
+    amx_rows(out, E, av, T, w->up, w->wdt, L, o0, o1);
+    k3_prof_add(K3P_MOE_UP, tp);
+    tp = k3_prof_t0();
+    const uint16_t *sv = amx_pack(0, SA, SI, T, SI);
+    amx_rows(SD, E, sv, T, w->sh2, w->wdt, SI, o0, o1);
+    k3_sync();
+    {
+        int lo, hi;
+        k3_split(T, &lo, &hi);
+        for (int t = lo; t < hi; t++)
+            for (int i = o0; i < o1; i++) out[(size_t)t * E + i] += SD[(size_t)t * E + i];
+    }
+    k3_prof_add(K3P_SHARED, tp);
+    tp = k3_prof_t0();
+    tp_gather_rows(out, T, E, 1);
+    k3_prof_add(K3P_MOE_UP, tp);
+}
+
 size_t k3_moe_scratch(const K3Cfg *c)
 {
     const int SI = c->moe_inter * c->n_shared;
@@ -1764,7 +2289,8 @@ static int moe_batched(const K3MoeW *w, int T)
     /* cache_only renormalises per token over the resident subset, which the per-token
      * path already does; the draft's prompt prefill is one-time, so defer rather than
      * duplicate the renorm in the batch. */
-    return !(!w->src || T <= 1 || no_batch || w->cache_only || k3_tp.size > 1);
+    return !(!w->src || T <= 1 || no_batch || w->cache_only || k3_tp.size > 1 ||
+             (amx_prefill(T) && amx_wt(w->wdt) >= 0));
 }
 
 void k3_moe_prefill(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
@@ -1949,6 +2475,19 @@ static void kda_layer_team(float *out, const float *x, const K3KdaW *w, const K3
 
     /* 1. projections */
     double tp = k3_prof_t0();
+    const int amx = amx_prefill(T) && !w->qkv && amx_wt(w->wdt) >= 0 && amx_wt(w->b_wdt) >= 0 &&
+                    E % 32 == 0 && D % 32 == 0 && P % 32 == 0;
+    if (amx) {
+        const uint16_t *xv = amx_pack(0, x, E, T, E);
+        amx_rows(q, P, xv, T, w->q, w->wdt, E, c0, c1);
+        amx_rows(k, P, xv, T, w->k, w->wdt, E, c0, c1);
+        amx_rows(v, P, xv, T, w->v, w->wdt, E, c0, c1);
+        amx_rows(bt, H, xv, T, w->b, w->b_wdt, E, h0, h1);
+        amx_rows(o, D, xv, T, w->f_a, w->wdt, E, 0, D);      /* o is free until step 6 */
+        const uint16_t *fv = amx_pack(1, o, D, T, D);
+        amx_rows(z, P, fv, T, w->f_b, w->wdt, D, c0, c1);
+        k3_sync();                          /* the GEMM row split is not the k3_split below */
+    } else
     for (int t = 0; t < T; t++) {
         const float *xt = x + (size_t)t * E;
         if (w->qkv) {
@@ -2018,7 +2557,12 @@ static void kda_layer_team(float *out, const float *x, const K3KdaW *w, const K3
      * own t in order; per-element arithmetic is untouched, so the results are
      * bit-identical to the serial form at any thread count. 96 heads alone left a
      * 64-thread socket with two uneven waves. */
-    const int CB = D <= K3_KDA_STEP_DV ? (D >= 64 ? 32 : D) : K3_KDA_STEP_DV;
+    /* Column blocks of 32 (K3_KDA_CB overrides; 64 measured slower at TP=6 although it
+     * halves the task count). */
+    static int cb_env = -1;
+    if (cb_env < 0) cb_env = getenv("K3_KDA_CB") ? atoi(getenv("K3_KDA_CB")) : 0;
+    int CB = cb_env > 0 ? (cb_env < D ? cb_env : D) : (D >= 64 ? 32 : D);
+    if (CB > K3_KDA_STEP_DV) CB = K3_KDA_STEP_DV;
     const int nbc = (D + CB - 1) / CB;
     K3_TEAM_IF(1, int lo, hi; k3_split(nh * nbc, &lo, &hi);
     for (int task = lo; task < hi; task++) {
@@ -2037,6 +2581,25 @@ static void kda_layer_team(float *out, const float *x, const K3KdaW *w, const K3
     tp = k3_prof_t0();
 
     /* 7/8/9. head-wise RMSNorm, THEN the gate, THEN the output projection */
+    if (amx) {
+        /* z held the decay pre-activation, dead after step 2: the gate goes there */
+        const uint16_t *xv = amx_pack(0, x, E, T, E);
+        amx_rows(z, P, xv, T, w->g, w->wdt, E, c0, c1);
+        k3_sync();
+        int lo, hi;
+        k3_split(T * nh, &lo, &hi);
+        for (int th = lo; th < hi; th++) {
+            const size_t off = (size_t)(th / nh) * P + (size_t)(h0 + th % nh) * D;
+            rmsnorm_serial(o + off, o + off, w->o_norm, D, c->rms_eps);
+            for (int i = 0; i < D; i++) o[off + i] *= sigmoidf_(z[off + i]);
+        }
+        tp_gather_rows(o, T, P, D);
+        const uint16_t *ov = amx_pack(1, o, P, T, P);
+        amx_rows(out, E, ov, T, w->o, w->wdt, P, e0, e1);
+        tp_gather_rows(out, T, E, 1);
+        k3_prof_add(K3P_KDA_OUT, tp);
+        return;
+    }
     for (int t = 0; t < T; t++) {
         const float *xt = x + (size_t)t * E;
         float *ot = o + (size_t)t * P;
@@ -2130,6 +2693,29 @@ static void layer_team(float *h, float *block_residual, int *n_blocks,
         const float *v[K3_AR_MAXSRC];
         if (nb + 1 > K3_AR_MAXSRC) k3_fatal_bound("AttnRes sources", nb + 1, K3_AR_MAXSRC);
         const int boundary = layer_idx % c->attn_res_block == 0;
+        if (ar_batched(T)) {
+            const int nc = rc_n(E);
+            double *arp = (double *)k3_scratch(K3S_AR, (size_t)(2 * (nb + 1) + 1) * nc * sizeof(double),
+                                                "AttnRes sums");
+            double *hp = arp + (size_t)2 * (nb + 1) * nc;
+            int tl, th;
+            k3_split(T, &tl, &th);
+            for (int t = tl; t < th; t++) {
+                float *ht = h + (size_t)t * E;
+                if (nb > 0) {
+                    for (int b = 0; b < nb; b++) v[b] = block_residual + ((size_t)t * maxb + b) * E;
+                    v[nb] = pref + (size_t)t * E;
+                    attn_res_serial(ht, v, foldA, nb + 1, E, c->rms_eps, arp, hp);
+                } else {
+                    for (int ci = 0; ci < nc; ci++) hp[ci] = rc_sq(ht, ci, E);
+                }
+                if (boundary)
+                    memcpy(block_residual + ((size_t)t * maxb + nb) * E, pref + (size_t)t * E,
+                           (size_t)E * sizeof(float));
+                const float inv = rms_inv(hp, E, c->rms_eps);
+                for (int i = 0; i < E; i++) hin[(size_t)t * E + i] = w->in_norm[i] * ht[i] * inv;
+            }
+        } else
         for (int t = 0; t < T; t++) {
             float *ht = h + (size_t)t * E;
             double *hp = rc_parts(rc_n(E));
@@ -2172,6 +2758,22 @@ static void layer_team(float *h, float *block_residual, int *n_blocks,
 
         /* aggregation before the MLP, whose mix leaves the chunk sums for the post norm.
          * NO emptiness guard in the reference. */
+        if (ar_batched(T)) {
+            const int nc = rc_n(E);
+            double *arp = (double *)k3_scratch(K3S_AR, (size_t)(2 * (nb + 1) + 1) * nc * sizeof(double),
+                                                "AttnRes sums");
+            double *hp = arp + (size_t)2 * (nb + 1) * nc;
+            int tl, th;
+            k3_split(T, &tl, &th);
+            for (int t = tl; t < th; t++) {
+                float *ht = h + (size_t)t * E;
+                for (int b = 0; b < nb; b++) v[b] = block_residual + ((size_t)t * maxb + b) * E;
+                v[nb] = pref + (size_t)t * E;
+                attn_res_serial(ht, v, foldM, nb + 1, E, c->rms_eps, arp, hp);
+                const float inv = rms_inv(hp, E, c->rms_eps);
+                for (int i = 0; i < E; i++) hin[(size_t)t * E + i] = w->post_norm[i] * ht[i] * inv;
+            }
+        } else
         for (int t = 0; t < T; t++) {
             float *ht = h + (size_t)t * E;
             double *hp = rc_parts(rc_n(E));

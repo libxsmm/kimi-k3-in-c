@@ -192,6 +192,47 @@ static int sh_init(void)
     return 0;
 }
 
+/* Large gathers (prefill) over node shared memory: rank r's region k3_tp.big[r] holds
+ * k3_tp.big_cap floats, first touched by r. The team writes its own blocks there, one
+ * barrier, then copies every peer's blocks out (k3_ops.c). K3_TP_BIG_MB (default 1024)
+ * per rank, 0 off. */
+static MPI_Win big_win = MPI_WIN_NULL;
+
+static void big_init(void)
+{
+    const char *e = getenv("K3_TP_BIG_MB");
+    const long mb = e ? atol(e) : 1024;
+    if (mb <= 0 || sh_comm == MPI_COMM_NULL) return;
+    const int P = k3_tp.size;
+    float *mine = NULL;
+    const MPI_Aint bytes = (MPI_Aint)mb << 20;
+    MPI_Info info;
+    MPI_Info_create(&info);
+    MPI_Info_set(info, "alloc_shared_noncontig", "true");
+    const int rc = MPI_Win_allocate_shared(bytes, sizeof(float), info, sh_comm, &mine, &big_win);
+    MPI_Info_free(&info);
+    float **peer = (float **)calloc((size_t)P, sizeof *peer);
+    int one = rc == MPI_SUCCESS && peer, all;
+    MPI_Allreduce(&one, &all, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    if (!all) {
+        if (rc == MPI_SUCCESS) MPI_Win_free(&big_win);
+        big_win = MPI_WIN_NULL;
+        free(peer);
+        return;
+    }
+    memset(mine, 0, (size_t)bytes);                 /* first touch by the owner */
+    for (int r = 0; r < P; r++) {
+        MPI_Aint sz;
+        int du;
+        void *base;
+        MPI_Win_shared_query(big_win, r, &sz, &du, &base);
+        peer[r] = (float *)base;
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
+    k3_tp.big = peer;
+    k3_tp.big_cap = (long)(bytes / (MPI_Aint)sizeof(float));
+}
+
 #ifdef K3_UCX
 /* The same one-sided protocol straight on UCP (default in UCX builds; K3_TP_UCX=0 uses
  * osc/ucx): same window layout, same
@@ -483,7 +524,7 @@ int k3_mpi_init(int *argc, char ***argv)
     const char *ux = getenv("K3_TP_UCX");
     const char *sh = getenv("K3_TP_SHM");
     if (k3_tp.size > 1 && !(os && !strcmp(os, "0"))) {
-        if (!(sh && !strcmp(sh, "0")) && sh_init() == 0) return 0;
+        if (!(sh && !strcmp(sh, "0")) && sh_init() == 0) { big_init(); return 0; }
 #ifdef K3_UCX
         use_ucx = !(ux && !strcmp(ux, "0"));
         if (use_ucx) { ux_init(); return 0; }
@@ -498,6 +539,12 @@ int k3_mpi_init(int *argc, char ***argv)
 
 void k3_mpi_finalize(void)
 {
+    if (big_win != MPI_WIN_NULL) {
+        MPI_Barrier(MPI_COMM_WORLD);
+        MPI_Win_free(&big_win);
+        free(k3_tp.big);
+        k3_tp.big = NULL;
+    }
     if (sh_win != MPI_WIN_NULL) {
         MPI_Barrier(MPI_COMM_WORLD);
         MPI_Win_free(&sh_win);

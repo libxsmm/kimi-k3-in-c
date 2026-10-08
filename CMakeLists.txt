@@ -95,6 +95,7 @@ endif()
 add_library(k3 STATIC
   src/core/k3_ops.c
   src/core/k3_gq.c
+  src/core/k3_amx.c
   src/io/k3_gguf.c
   src/io/k3_st.c
   src/io/k3_load.c
