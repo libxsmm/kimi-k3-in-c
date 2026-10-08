@@ -901,14 +901,18 @@ static int chat_run(Tok *tok, const K3ChatTemplate *tmpl, K3ChatHistory *history
  * and HTTP; every decode comes here. Rank 0 serves one client at a time on a UNIX
  * socket and broadcasts each request, so all ranks run the same forward.
  * Protocol (little endian): request u32 op, u32 n, i32 pos0, u32 n_out, then
- *   INFO      -> i32 vocab, i32 n_ctx, i32 hidden, i32 cached
- *   DECODE    i32 ids[n], u8 want[n] -> i32 status, then n_out * vocab floats
- *   TRUNCATE  pos0 -> i32 status (0 ok), i32 cached
+ *   INFO      -> i32 vocab, i32 n_ctx, i32 hidden, i32 cached, i32 min_pos
+ *   DECODE    i32 ids[n], u8 want[n] -> i32 status, i32 min_pos, then n_out * vocab floats
+ *   TRUNCATE  pos0 -> i32 status (0 ok), i32 cached, i32 min_pos
  *   RESET     -> i32 status
  * One sequence, appended in order: a decode must start at the cached length (or at 0,
- * which resets). Truncation succeeds at the cached length or 0; anything else needs
- * a state checkpoint, which the front end handles by clearing and re-processing. */
+ * which resets). The KDA/ShortConv state is not positional, so truncating into the
+ * middle restores the latest checkpoint at or before the cut and replays the tokens up
+ * to it; checkpoints are taken after every multi-token batch (prompt ends: the point a
+ * chat turn's re-rendered prompt diverges from what was generated). min_pos is the
+ * oldest position a truncation can reach, reported so front ends do not ask for less. */
 enum { SRV_INFO = 1, SRV_DECODE = 2, SRV_TRUNCATE = 3, SRV_RESET = 4, SRV_QUIT = 99 };
+#define SRV_MAXSNAP 16
 
 static int srv_io(int fd, void *p, size_t n, int wr)
 {
@@ -929,8 +933,16 @@ static int serve_run(const char *path, int ctx_cap, Weights *w, const K3Cfg *c,
                      float **sc, float *lg, int **seq, int maxb, size_t kper)
 {
     if (chat_resize(ctx_cap, tmax, nl, maxb, kper, w, c, h, br, sc, seq) != 0) return 1;
-    memset(ks, 0, kper * (size_t)nl * sizeof(float));
+    const size_t kst = kper * (size_t)nl;
+    memset(ks, 0, kst * sizeof(float));
     w->cached = 0;
+    int nsnap_max = getenv("K3_SERVE_SNAPS") ? atoi(getenv("K3_SERVE_SNAPS")) : 4;
+    if (nsnap_max < 0) nsnap_max = 0;
+    if (nsnap_max > SRV_MAXSNAP) nsnap_max = SRV_MAXSNAP;
+    float *snap[SRV_MAXSNAP];
+    int snap_pos[SRV_MAXSNAP], nsnap = 0;
+    for (int i = 0; i < nsnap_max; i++)
+        if (!(snap[i] = (float *)malloc(kst * sizeof(float)))) { nsnap_max = i; break; }
     int lfd = -1;
     if (k3_tp.rank == 0) {
         lfd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -944,18 +956,20 @@ static int serve_run(const char *path, int ctx_cap, Weights *w, const K3Cfg *c,
             k3_mpi_abort(1);
             return 1;
         }
-        printf("serving on %s: %d positions, vocab %d, %d ranks\n", path, *tmax, c->vocab,
-               k3_tp.size);
+        printf("serving on %s: %d positions, vocab %d, %d ranks, %d state checkpoints\n",
+               path, *tmax, c->vocab, k3_tp.size, nsnap_max);
         fflush(stdout);
     }
+    int *hist = *seq;                     /* the ids at positions 0..cached-1 */
     int *ids = (int *)malloc((size_t)*tmax * sizeof(int));
     uint8_t *want = (uint8_t *)malloc((size_t)*tmax);
     float *rows = NULL;
     size_t rows_cap = 0;
     if (!ids || !want) return 1;
     int cfd = -1, rc = 0;
-    long n_req = 0, n_tok = 0;
+    long n_req = 0, n_tok = 0, n_replay = 0;
     double t_busy = 0.0;
+#define SRV_MINPOS() (nsnap > 0 && snap_pos[0] < w->cached ? snap_pos[0] : (w->cached > 0 ? w->cached - 1 : 0))
     for (;;) {
         uint32_t hdr[4] = { 0, 0, 0, 0 };
         if (k3_tp.rank == 0) {
@@ -965,8 +979,8 @@ static int serve_run(const char *path, int ctx_cap, Weights *w, const K3Cfg *c,
             }
             if (srv_io(cfd, hdr, sizeof hdr, 0) != 0) {
                 close(cfd); cfd = -1;
-                printf("serve: client gone after %ld requests, %ld tokens, %.1f s busy\n",
-                       n_req, n_tok, t_busy);
+                printf("serve: client gone after %ld requests, %ld tokens (%ld replayed), "
+                       "%.1f s busy\n", n_req, n_tok, n_replay, t_busy);
                 fflush(stdout);
                 if (getenv("K3_SERVE_ONCE")) hdr[0] = SRV_QUIT;
                 else continue;
@@ -974,41 +988,62 @@ static int serve_run(const char *path, int ctx_cap, Weights *w, const K3Cfg *c,
         }
         k3_mpi_bcast(hdr, sizeof hdr);
         const uint32_t op = hdr[0], n = hdr[1], n_out = hdr[3];
-        const int32_t pos0 = (int32_t)hdr[2];
+        int32_t pos0 = (int32_t)hdr[2];
         if (op == SRV_QUIT) break;
         const double t0 = now_s();
         if (op == SRV_INFO) {
-            const int32_t r[4] = { c->vocab, *tmax, c->hidden, w->cached };
+            const int32_t r[5] = { c->vocab, *tmax, c->hidden, w->cached, SRV_MINPOS() };
             if (k3_tp.rank == 0) srv_io(cfd, (void *)r, sizeof r, 1);
         } else if (op == SRV_RESET || (op == SRV_TRUNCATE && pos0 <= 0)) {
-            memset(ks, 0, kper * (size_t)nl * sizeof(float));
+            memset(ks, 0, kst * sizeof(float));
             w->cached = 0;
-            const int32_t r[2] = { 0, 0 };
-            if (k3_tp.rank == 0) srv_io(cfd, (void *)r, op == SRV_RESET ? 4 : 8, 1);
+            nsnap = 0;
+            const int32_t r[3] = { 0, 0, 0 };
+            if (k3_tp.rank == 0) srv_io(cfd, (void *)r, op == SRV_RESET ? 4 : 12, 1);
         } else if (op == SRV_TRUNCATE) {
-            const int32_t r[2] = { pos0 >= w->cached ? 0 : 1, w->cached };
+            int32_t status = 0;
+            if (pos0 < w->cached) {
+                int s = nsnap - 1;
+                while (s >= 0 && snap_pos[s] > pos0) s--;
+                if (s < 0) status = 1;
+                else {
+                    memcpy(ks, snap[s], kst * sizeof(float));
+                    w->cached = snap_pos[s];
+                    nsnap = s + 1;
+                    if (pos0 > w->cached) {
+                        /* the MLA KV rows of the replayed positions are rewritten, so
+                         * nothing stale beyond the cut survives */
+                        if (forward(w, c, cache, hist + w->cached, pos0 - w->cached, lg, *sc,
+                                    *h, *br, ks, NULL) != 0) status = -5;
+                        else { n_replay += pos0 - w->cached; w->cached = pos0; }
+                    }
+                }
+            }
+            const int32_t r[3] = { status, w->cached, SRV_MINPOS() };
             if (k3_tp.rank == 0) srv_io(cfd, (void *)r, sizeof r, 1);
         } else if (op == SRV_DECODE) {
             if (n == 0 || n > (uint32_t)*tmax) { rc = 1; break; }
+            uint32_t ok = 1;
             if (k3_tp.rank == 0) {
-                if (srv_io(cfd, ids, (size_t)n * sizeof(int), 0) || srv_io(cfd, want, n, 0)) {
-                    close(cfd); cfd = -1;
-                    hdr[0] = 0;
-                }
+                if (srv_io(cfd, ids, (size_t)n * sizeof(int), 0) || srv_io(cfd, want, n, 0)) ok = 0;
+                if (!ok) { close(cfd); cfd = -1; }
             }
-            k3_mpi_bcast(hdr, sizeof hdr);
-            if (hdr[0] == 0) continue;           /* the client vanished mid-request */
-            k3_mpi_bcast(ids, (size_t)n * sizeof(int));
-            k3_mpi_bcast(want, n);
+            k3_mpi_bcast(&ok, sizeof ok);
+            if (!ok) continue;                   /* the client vanished mid-request */
             int32_t status = 0;
-            if (pos0 == 0 && w->cached > 0) {   /* a fresh prompt */
-                memset(ks, 0, kper * (size_t)nl * sizeof(float));
-                w->cached = 0;
+            if (pos0 < 0 || pos0 + (int)n > *tmax) status = -3;
+            else {
+                k3_mpi_bcast(ids, (size_t)n * sizeof(int));
+                k3_mpi_bcast(want, n);
+                if (pos0 == 0 && w->cached > 0) {   /* a fresh prompt */
+                    memset(ks, 0, kst * sizeof(float));
+                    w->cached = 0;
+                    nsnap = 0;
+                }
+                if (pos0 != w->cached) status = -2;
+                for (uint32_t i = 0; status == 0 && i < n; i++)
+                    if (ids[i] < 0 || ids[i] >= c->vocab) status = -4;
             }
-            if (pos0 != w->cached) status = -2;
-            else if (pos0 + (int)n > *tmax) status = -3;
-            for (uint32_t i = 0; status == 0 && i < n; i++)
-                if (ids[i] < 0 || ids[i] >= c->vocab) status = -4;
             if (status == 0) {
                 if ((size_t)n_out * c->vocab > rows_cap) {
                     free(rows);
@@ -1022,18 +1057,32 @@ static int serve_run(const char *path, int ctx_cap, Weights *w, const K3Cfg *c,
                 w->lg_rows = NULL;
                 w->lg_want = NULL;
                 if (frc != 0) status = -5;
-                else w->cached += (int)n;
+                else { memcpy(hist + pos0, ids, (size_t)n * sizeof(int)); w->cached += (int)n; }
                 n_tok += n;
+                if (frc == 0 && n > 1 && nsnap_max > 0) {
+                    if (nsnap == nsnap_max) {    /* drop the oldest */
+                        float *f = snap[0];
+                        memmove(snap, snap + 1, (size_t)(nsnap - 1) * sizeof snap[0]);
+                        memmove(snap_pos, snap_pos + 1, (size_t)(nsnap - 1) * sizeof snap_pos[0]);
+                        snap[nsnap - 1] = f;
+                        nsnap--;
+                    }
+                    memcpy(snap[nsnap], ks, kst * sizeof(float));
+                    snap_pos[nsnap++] = w->cached;
+                }
             }
             if (k3_tp.rank == 0) {
-                srv_io(cfd, &status, sizeof status, 1);
+                const int32_t r[2] = { status, SRV_MINPOS() };
+                srv_io(cfd, (void *)r, sizeof r, 1);
                 if (status == 0 && n_out) srv_io(cfd, rows, (size_t)n_out * c->vocab * sizeof(float), 1);
             }
         }
         t_busy += now_s() - t0;
         n_req++;
     }
+#undef SRV_MINPOS
     if (k3_tp.rank == 0) { if (cfd >= 0) close(cfd); close(lfd); unlink(path); }
+    for (int i = 0; i < nsnap_max; i++) free(snap[i]);
     free(ids); free(want); free(rows);
     return rc;
 }
