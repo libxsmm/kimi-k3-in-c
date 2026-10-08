@@ -832,45 +832,44 @@ void k3_kda_decay(float *g, float *alpha, const float *z, const float *A_log,
 /* Columns [j0, j1) of one step; j1 - j0 <= K3_KDA_STEP_DV. Every step below touches
  * column j only through S[.][j], u[j], v[j] and o[j], so column blocks are independent
  * and a caller may run them on different threads with bit-identical results. */
-static void kda_step_cols(float *S, float *o, const float *q, const float *k,
+static void kda_step_cols(float *restrict S, float *restrict o, const float *q, const float *k,
                           const float *v, const float *alpha, float beta,
                           int dk, int dv, int j0, int j1)
 {
-    /* 1. channel-wise decay: scale ROW i of S by alpha[i]. The gate is per key
-     *    channel, not a scalar, which is what "channel-wise forget gate" means. */
-    for (int i = 0; i < dk; i++) {
-        float *row = S + (size_t)i * dv;
-        const float a = alpha[i];
-        for (int j = j0; j < j1; j++) row[j] *= a;
-    }
-
-    /* 2. read the state along k:  u = S^T k. Automatic storage: this runs once per head
-     *    per token per KDA layer from inside an OpenMP loop. */
+    /* Two passes over S instead of four: decay fused with the read u = S^T k, and the
+     * delta write fused with o = S^T q. Every element sees the same operations in the
+     * same order (row i is final once written, u is complete before the second pass),
+     * so the bits do not change. */
     float u[K3_KDA_STEP_DV];
     for (int j = j0; j < j1; j++) u[j - j0] = 0.0f;
+    /* 1. channel-wise decay: scale ROW i of S by alpha[i]. The gate is per key
+     *    channel, not a scalar, which is what "channel-wise forget gate" means.
+     * 2. read the decayed state along k:  u = S^T k. */
     for (int i = 0; i < dk; i++) {
-        const float ki = k[i];
-        if (ki == 0.0f) continue;
-        const float *row = S + (size_t)i * dv;
-        for (int j = j0; j < j1; j++) u[j - j0] += ki * row[j];
+        float *row = S + (size_t)i * dv;
+        const float a = alpha[i], ki = k[i];
+        if (ki == 0.0f) {
+            for (int j = j0; j < j1; j++) row[j] *= a;
+            continue;
+        }
+        for (int j = j0; j < j1; j++) {
+            const float r = row[j] * a;
+            row[j] = r;
+            u[j - j0] += ki * r;
+        }
     }
 
     /* 3. rank-one delta write. (v - u) is the prediction error: this is what makes
-     *    it a DELTA rule rather than plain accumulation. */
-    for (int i = 0; i < dk; i++) {
-        const float ki = k[i];
-        if (ki == 0.0f) continue;
-        float *row = S + (size_t)i * dv;
-        for (int j = j0; j < j1; j++) row[j] += ki * beta * (v[j] - u[j - j0]);
-    }
-
-    /* 4. output from the ALREADY UPDATED state: o = S^T q */
+     *    it a DELTA rule rather than plain accumulation.
+     * 4. output from the ALREADY UPDATED state: o = S^T q */
     for (int j = j0; j < j1; j++) o[j] = 0.0f;
     for (int i = 0; i < dk; i++) {
-        const float qi = q[i];
-        if (qi == 0.0f) continue;
-        const float *row = S + (size_t)i * dv;
-        for (int j = j0; j < j1; j++) o[j] += qi * row[j];
+        const float ki = k[i], qi = q[i];
+        float *row = S + (size_t)i * dv;
+        if (ki != 0.0f)
+            for (int j = j0; j < j1; j++) row[j] += ki * beta * (v[j] - u[j - j0]);
+        if (qi != 0.0f)
+            for (int j = j0; j < j1; j++) o[j] += qi * row[j];
     }
 }
 
