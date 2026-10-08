@@ -1348,6 +1348,41 @@ static size_t moe_batch_floats(const K3Cfg *c)
  * BIT-IDENTICAL to the per-expert loop: every output row goes through the same row
  * kernel with the same input, SiTU is the same elementwise function, and accL is summed
  * per element in the original top-k order j = 0..nq-1. */
+/* This thread's share of nq experts x n rows as (expert, [r0, r1)) spans, rows relative to
+ * the rank's part. The nq*n rows are split evenly over the team, so every thread streams at
+ * most a few contiguous runs whatever the thread count (64 tasks on 60 cores ran twice the
+ * makespan). K3_EXPERT_TASKS=1: the older split into ceil(nth/nq) blocks per expert. */
+#define K3_MAX_SPANS (2 * K3_MAX_TOPK + 2)
+static int expert_spans(int nq, int n, int *sj, int *s0, int *s1)
+{
+    static int tasks = -1;
+    if (tasks < 0) tasks = getenv("K3_EXPERT_TASKS") != NULL;
+    int ns = 0;
+    if (n <= 0 || nq <= 0) return 0;
+    if (tasks) {
+        const int nb = (k3_nth() + nq - 1) / nq;
+        int t0, t1;
+        k3_split(nq * nb, &t0, &t1);
+        for (int task = t0; task < t1 && ns < K3_MAX_SPANS; task++) {
+            const int b = task % nb;
+            sj[ns] = task / nb;
+            s0[ns] = (int)((long)n * b / nb);
+            s1[ns] = (int)((long)n * (b + 1) / nb);
+            ns++;
+        }
+        return ns;
+    }
+    int lo, hi;
+    k3_split(nq * n, &lo, &hi);
+    for (int s = lo; s < hi && ns < K3_MAX_SPANS; ) {
+        const int j = s / n, e = (j + 1) * n < hi ? (j + 1) * n : hi;
+        sj[ns] = j; s0[ns] = s - j * n; s1[ns] = e - j * n;
+        ns++;
+        s = e;
+    }
+    return ns;
+}
+
 static void moe_routed(float *accL, const float *z, const K3MoeW *w, const K3ExpertQ *q,
                        const int *eidx, const float *wq, int nq, const K3Cfg *c,
                        float *buf, K3Seg extra)
@@ -1407,12 +1442,10 @@ static void moe_routed(float *accL, const float *z, const K3MoeW *w, const K3Exp
      * streams two long contiguous runs rather than a few rows of every expert, and SiTU
      * on the same rows by the same thread: no barrier between them */
     {
-        const int nb = ni > 0 ? (k3_nth() + nq - 1) / (nq > 0 ? nq : 1) : 0;
-        int t0, t1;
-        k3_split(nq * nb, &t0, &t1);
-        for (int task = t0; task < t1; task++) {
-            const int j = task / nb, b = task % nb;
-            const int r0 = i0 + (int)((long)ni * b / nb), r1 = i0 + (int)((long)ni * (b + 1) / nb);
+        int sj[K3_MAX_SPANS], s0[K3_MAX_SPANS], s1[K3_MAX_SPANS];
+        const int ns = expert_spans(nq, ni, sj, s0, s1);
+        for (int t = 0; t < ns; t++) {
+            const int j = sj[t], r0 = i0 + s0[t], r1 = i0 + s1[t];
             if (r1 <= r0) continue;
             float *g = gu + (size_t)j * 2 * I;
             if (q) {
@@ -1461,12 +1494,10 @@ static void moe_routed(float *accL, const float *z, const K3MoeW *w, const K3Exp
      * gate|up; the weighted sum then crosses threads, so it follows a barrier, per
      * element in top-k order */
     {
-        const int nb = nl > 0 ? (k3_nth() + nq - 1) / (nq > 0 ? nq : 1) : 0;
-        int t0, t1;
-        k3_split(nq * nb, &t0, &t1);
-        for (int task = t0; task < t1; task++) {
-            const int j = task / nb, b = task % nb;
-            const int r0 = l0 + (int)((long)nl * b / nb), r1 = l0 + (int)((long)nl * (b + 1) / nb);
+        int sj[K3_MAX_SPANS], s0[K3_MAX_SPANS], s1[K3_MAX_SPANS];
+        const int ns = expert_spans(nq, nl, sj, s0, s1);
+        for (int t = 0; t < ns; t++) {
+            const int j = sj[t], r0 = l0 + s0[t], r1 = l0 + s1[t];
             if (r1 <= r0) continue;
             if (q)
                 eq_rows(edn + (size_t)j * L, act + (size_t)j * I, ad ? ad + (size_t)j * I : NULL,
