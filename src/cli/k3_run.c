@@ -57,6 +57,9 @@
 #include <psapi.h>
 #else
 #include <sys/resource.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
 #endif
 
 #include "k3_portable_io.h"   /* getline() shim for MinGW; see the header for why */
@@ -386,6 +389,9 @@ static void usage(FILE *f)
 "                        .json says 163585 ([EOS]), and the model emits 163585.\n"
 "                        Pass both to stop on either\n"
 "  --incremental         carry KV cache and recurrent state between tokens\n"
+"  --serve SOCKET        be the compute backend of an external front end (llama.cpp with\n"
+"                        LLAMA_REMOTE_BACKEND=SOCKET): decode requests over a UNIX socket\n"
+"  --serve-ctx N         positions held for the served sequence (default 8192)\n"
 "  --save-state PATH     write the carried state after the run, so the next turn of a\n"
 "                        conversation resumes instead of re-reading the whole prompt\n"
 "  --load-state PATH     resume from a saved state; the prompt given now is treated as\n"
@@ -555,6 +561,8 @@ typedef struct {
     int          draft_mode;   /* 1 for the hybrid draft: cache-only expert routing */
     K3ExpertSrc *esrc;         /* when set, experts come from here instead of the cache */
     double      *layer_s;      /* [n_bound] per-layer wall time, filled when profiling */
+    float       *lg_rows;      /* when set, logits of every lg_want[t] row, in order */
+    const uint8_t *lg_want;
 } Weights;
 
 /* One full forward over T tokens, writing logits for the LAST position only. Every
@@ -671,6 +679,16 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
     }
 
     float *nrm = scratch;
+    if (w->lg_rows) {
+        int k = 0;
+        for (int t = 0; t < T; t++) {
+            if (!w->lg_want[t]) continue;
+            k3_rmsnorm(nrm, h + (size_t)t * E, w->mb.norm, E, c->rms_eps);
+            k3_mmw_tp(w->lg_rows + (size_t)k++ * c->vocab, nrm, w->mb.lm_head, w->mb.wdt, E, c->vocab);
+        }
+        k3_prof_add(K3P_HEAD, tp);
+        return 0;
+    }
     if (arg_all) {
         for (int t = 0; t < T; t++) {
             k3_rmsnorm(nrm, h + (size_t)t * E, w->mb.norm, E, c->rms_eps);
@@ -877,6 +895,149 @@ static int chat_run(Tok *tok, const K3ChatTemplate *tmpl, K3ChatHistory *history
     }
 }
 
+/* ----------------------------------------------------------------------- serve ----
+ * Compute backend for an external front end (llama.cpp built with the remote backend,
+ * LLAMA_REMOTE_BACKEND=<socket>): the front end keeps tokenizer, templates, sampling
+ * and HTTP; every decode comes here. Rank 0 serves one client at a time on a UNIX
+ * socket and broadcasts each request, so all ranks run the same forward.
+ * Protocol (little endian): request u32 op, u32 n, i32 pos0, u32 n_out, then
+ *   INFO      -> i32 vocab, i32 n_ctx, i32 hidden, i32 cached
+ *   DECODE    i32 ids[n], u8 want[n] -> i32 status, then n_out * vocab floats
+ *   TRUNCATE  pos0 -> i32 status (0 ok), i32 cached
+ *   RESET     -> i32 status
+ * One sequence, appended in order: a decode must start at the cached length (or at 0,
+ * which resets). Truncation succeeds at the cached length or 0; anything else needs
+ * a state checkpoint, which the front end handles by clearing and re-processing. */
+enum { SRV_INFO = 1, SRV_DECODE = 2, SRV_TRUNCATE = 3, SRV_RESET = 4, SRV_QUIT = 99 };
+
+static int srv_io(int fd, void *p, size_t n, int wr)
+{
+    char *c = (char *)p;
+    while (n > 0) {
+        const ssize_t k = wr ? write(fd, c, n) : read(fd, c, n);
+        if (k <= 0) {
+            if (k < 0 && errno == EINTR) continue;
+            return -1;
+        }
+        c += k; n -= (size_t)k;
+    }
+    return 0;
+}
+
+static int serve_run(const char *path, int ctx_cap, Weights *w, const K3Cfg *c,
+                     K3Cache *cache, int nl, int *tmax, float **h, float **br, float *ks,
+                     float **sc, float *lg, int **seq, int maxb, size_t kper)
+{
+    if (chat_resize(ctx_cap, tmax, nl, maxb, kper, w, c, h, br, sc, seq) != 0) return 1;
+    memset(ks, 0, kper * (size_t)nl * sizeof(float));
+    w->cached = 0;
+    int lfd = -1;
+    if (k3_tp.rank == 0) {
+        lfd = socket(AF_UNIX, SOCK_STREAM, 0);
+        struct sockaddr_un a;
+        memset(&a, 0, sizeof a);
+        a.sun_family = AF_UNIX;
+        snprintf(a.sun_path, sizeof a.sun_path, "%s", path);
+        unlink(path);
+        if (lfd < 0 || bind(lfd, (struct sockaddr *)&a, sizeof a) != 0 || listen(lfd, 1) != 0) {
+            fprintf(stderr, "serve: cannot listen on %s: %s\n", path, strerror(errno));
+            k3_mpi_abort(1);
+            return 1;
+        }
+        printf("serving on %s: %d positions, vocab %d, %d ranks\n", path, *tmax, c->vocab,
+               k3_tp.size);
+        fflush(stdout);
+    }
+    int *ids = (int *)malloc((size_t)*tmax * sizeof(int));
+    uint8_t *want = (uint8_t *)malloc((size_t)*tmax);
+    float *rows = NULL;
+    size_t rows_cap = 0;
+    if (!ids || !want) return 1;
+    int cfd = -1, rc = 0;
+    long n_req = 0, n_tok = 0;
+    double t_busy = 0.0;
+    for (;;) {
+        uint32_t hdr[4] = { 0, 0, 0, 0 };
+        if (k3_tp.rank == 0) {
+            while (cfd < 0) {
+                cfd = accept(lfd, NULL, NULL);
+                if (cfd >= 0) printf("serve: client connected\n"), fflush(stdout);
+            }
+            if (srv_io(cfd, hdr, sizeof hdr, 0) != 0) {
+                close(cfd); cfd = -1;
+                printf("serve: client gone after %ld requests, %ld tokens, %.1f s busy\n",
+                       n_req, n_tok, t_busy);
+                fflush(stdout);
+                if (getenv("K3_SERVE_ONCE")) hdr[0] = SRV_QUIT;
+                else continue;
+            }
+        }
+        k3_mpi_bcast(hdr, sizeof hdr);
+        const uint32_t op = hdr[0], n = hdr[1], n_out = hdr[3];
+        const int32_t pos0 = (int32_t)hdr[2];
+        if (op == SRV_QUIT) break;
+        const double t0 = now_s();
+        if (op == SRV_INFO) {
+            const int32_t r[4] = { c->vocab, *tmax, c->hidden, w->cached };
+            if (k3_tp.rank == 0) srv_io(cfd, (void *)r, sizeof r, 1);
+        } else if (op == SRV_RESET || (op == SRV_TRUNCATE && pos0 <= 0)) {
+            memset(ks, 0, kper * (size_t)nl * sizeof(float));
+            w->cached = 0;
+            const int32_t r[2] = { 0, 0 };
+            if (k3_tp.rank == 0) srv_io(cfd, (void *)r, op == SRV_RESET ? 4 : 8, 1);
+        } else if (op == SRV_TRUNCATE) {
+            const int32_t r[2] = { pos0 >= w->cached ? 0 : 1, w->cached };
+            if (k3_tp.rank == 0) srv_io(cfd, (void *)r, sizeof r, 1);
+        } else if (op == SRV_DECODE) {
+            if (n == 0 || n > (uint32_t)*tmax) { rc = 1; break; }
+            if (k3_tp.rank == 0) {
+                if (srv_io(cfd, ids, (size_t)n * sizeof(int), 0) || srv_io(cfd, want, n, 0)) {
+                    close(cfd); cfd = -1;
+                    hdr[0] = 0;
+                }
+            }
+            k3_mpi_bcast(hdr, sizeof hdr);
+            if (hdr[0] == 0) continue;           /* the client vanished mid-request */
+            k3_mpi_bcast(ids, (size_t)n * sizeof(int));
+            k3_mpi_bcast(want, n);
+            int32_t status = 0;
+            if (pos0 == 0 && w->cached > 0) {   /* a fresh prompt */
+                memset(ks, 0, kper * (size_t)nl * sizeof(float));
+                w->cached = 0;
+            }
+            if (pos0 != w->cached) status = -2;
+            else if (pos0 + (int)n > *tmax) status = -3;
+            for (uint32_t i = 0; status == 0 && i < n; i++)
+                if (ids[i] < 0 || ids[i] >= c->vocab) status = -4;
+            if (status == 0) {
+                if ((size_t)n_out * c->vocab > rows_cap) {
+                    free(rows);
+                    rows_cap = (size_t)(n_out ? n_out : 1) * c->vocab;
+                    rows = (float *)malloc(rows_cap * sizeof(float));
+                    if (!rows) { rc = 1; break; }
+                }
+                w->lg_rows = rows;
+                w->lg_want = want;
+                const int frc = forward(w, c, cache, ids, (int)n, lg, *sc, *h, *br, ks, NULL);
+                w->lg_rows = NULL;
+                w->lg_want = NULL;
+                if (frc != 0) status = -5;
+                else w->cached += (int)n;
+                n_tok += n;
+            }
+            if (k3_tp.rank == 0) {
+                srv_io(cfd, &status, sizeof status, 1);
+                if (status == 0 && n_out) srv_io(cfd, rows, (size_t)n_out * c->vocab * sizeof(float), 1);
+            }
+        }
+        t_busy += now_s() - t0;
+        n_req++;
+    }
+    if (k3_tp.rank == 0) { if (cfd >= 0) close(cfd); close(lfd); unlink(path); }
+    free(ids); free(want); free(rows);
+    return rc;
+}
+
 static int k3_main(int argc, char **argv);
 
 /* Under MPI every rank runs the same program on the same input; all ranks compute the
@@ -934,6 +1095,8 @@ static int k3_main(int argc, char **argv)
     int tf_check = 0;
     const char *draft_dir = NULL;
     double draft_gb = 6.0;
+    const char *serve_path = NULL;
+    int serve_ctx = 8192;
     const char *load_state = NULL, *save_state = NULL;
     const char *preset_name = NULL;
     int incremental = 0, ultra = 0, chat = 0, greedy = 0;
@@ -999,6 +1162,8 @@ static int k3_main(int argc, char **argv)
         }
         else if (!strcmp(argv[i], "--trunk-ring") && i + 1 < argc) trunk_ring = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--incremental")) incremental = 1;
+        else if (!strcmp(argv[i], "--serve") && i + 1 < argc) serve_path = argv[++i];
+        else if (!strcmp(argv[i], "--serve-ctx") && i + 1 < argc) serve_ctx = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--ultra-low-memory")) ultra = 1;
         else if (!strcmp(argv[i], "--chat")) chat = 1;
         else if (!strcmp(argv[i], "--system") && i + 1 < argc) system_text = argv[++i];
@@ -1046,6 +1211,17 @@ static int k3_main(int argc, char **argv)
         }
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(stdout); return 0; }
         else { fprintf(stderr, "unknown option %s\n\n", argv[i]); usage(stderr); return 2; }
+    }
+
+    if (serve_path) {
+        if (ultra || chat || spec_n > 0 || draft_dir || load_state || save_state || tf_check) {
+            fprintf(stderr, "--serve takes no --ultra-low-memory, --chat, --spec, --draft-trunk, "
+                            "state files or --tf-check\n");
+            return 2;
+        }
+        if (serve_ctx < 16) { fprintf(stderr, "--serve-ctx must be at least 16\n"); return 2; }
+        incremental = 1;
+        if (!ids_s && !prompt_text && !prompt_file) ids_s = "0";   /* nothing runs before a client */
     }
 
     if (ultra && !trunk_dir) {
@@ -1728,6 +1904,20 @@ static int k3_main(int argc, char **argv)
             printf("restored %d positions in %.2f s: decode continues without "
                    "re-reading the prior context\n\n", w.cached, now_s() - tl);
         }
+    }
+
+    if (serve_path) {
+        const int rc = serve_run(serve_path, serve_ctx, &w, &c, &cache, NL, &Tmax, &h, &br,
+                                 ks, &sc, lg, &seq, maxb, kper);
+        free(w.kvc); free(w.ropec); free(w.mla_slot);
+        k3_cache_free(&cache);
+        if (experts_res) k3_resident_free(&res);
+        free(w.layer_s);
+        for (int L = 0; L < w.n_bound; L++) k3_bind_free(&w.lay[L]);
+        free(w.lay); k3_bind_model_free(&w.mb); k3_st_close(&st);
+        if (gguf) { k3_gguf_experts_free(&gx); k3_gguf_close(&gg); }
+        free(h); free(br); free(ks); free(sc); free(lg); free(seq); free(outtok); free(prompt);
+        return rc;
     }
 
     if (chat) {

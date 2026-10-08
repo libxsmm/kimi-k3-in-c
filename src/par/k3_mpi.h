@@ -14,11 +14,14 @@ void k3_mpi_finalize(void);
 int  k3_mpi_max_int(int v);
 /* Tear every rank down: a rank that fails alone would leave the others in a collective. */
 void k3_mpi_abort(int rc);
+/* Rank 0's n bytes at buf, on every rank. */
+void k3_mpi_bcast(void *buf, size_t n);
 #else
 static inline int  k3_mpi_init(int *argc, char ***argv) { (void)argc; (void)argv; return 0; }
 static inline void k3_mpi_finalize(void) {}
 static inline int  k3_mpi_max_int(int v) { return v; }
 static inline void k3_mpi_abort(int rc) { (void)rc; }
+static inline void k3_mpi_bcast(void *buf, size_t n) { (void)buf; (void)n; }
 #endif
 
 #endif /* K3_MPI_H */
