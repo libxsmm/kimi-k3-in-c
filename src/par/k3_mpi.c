@@ -579,3 +579,8 @@ void k3_mpi_abort(int rc)
 {
     MPI_Abort(MPI_COMM_WORLD, rc);
 }
+
+void k3_mpi_bcast(void *buf, size_t n)
+{
+    if (k3_tp.size > 1) MPI_Bcast(buf, (int)n, MPI_BYTE, 0, MPI_COMM_WORLD);
+}
