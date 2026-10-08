@@ -327,6 +327,14 @@ static void run_experts(int xi, int P, int q8)
            100 * dnb / dns / 1e9 / roof_gbs, dns * 1e3 * cd, gu[0]);
     phase_add(q8 ? "experts" : "experts fp32", gus * 1e3 * cg + dns * 1e3 * cd,
               (gub * cg + dnb * cd) / 1e9);
+    FILE *sm = fopen("/proc/self/smaps_rollup", "r");
+    if (sm) {
+        char line[256];
+        while (fgets(line, sizeof line, sm))
+            if (!strncmp(line, "AnonHugePages:", 14) || !strncmp(line, "Anonymous:", 10))
+                printf("    %s", line);
+        fclose(sm);
+    }
     munmap(pool, ne * rec);
     free(z); free(act); free(gu); free(dn); free(zq); free(aq); free(zdx); free(adx);
 }
