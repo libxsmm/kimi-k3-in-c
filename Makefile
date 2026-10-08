@@ -260,6 +260,10 @@ $(BIN)/test_trunk: tests/unit/test_trunk.c $(BUILD)/src/io/k3_trunk.o \
 $(BIN)/bench_kernels: benchmarks/bench_kernels.c $(BUILD)/src/core/k3_ops.o $(BUILD)/src/core/k3_gq.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
+# Per-rank decode GEMVs of the GGUF model at TP shapes, streamed from DRAM.
+$(BIN)/bench_gemv_tp: benchmarks/bench_gemv_tp.c $(BUILD)/src/core/k3_ops.o $(BUILD)/src/core/k3_gq.o | $(BIN)
+	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
+
 # MPI builds only: latency of the collective shapes tensor parallelism uses.
 $(BIN)/bench_allgather: benchmarks/bench_allgather.c $(BUILD)/src/par/k3_mpi.o \
                         $(BUILD)/src/core/k3_ops.o $(BUILD)/src/core/k3_gq.o | $(BIN)

@@ -3,6 +3,7 @@
 #include "k3_gq.h"
 
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "ggml_iq_grids.h"
@@ -249,26 +250,65 @@ static inline __mmask64 iq3xxs_neg(uint32_t a0, uint32_t a1)
 #endif
 
 /* --------------------------------------------------------------- fp32 kernels */
+#if defined(K3_GQ_AVX512)
+#ifndef K3_GQ_PFH
+#define K3_GQ_PFH _MM_HINT_T0
+#endif
+/* R consecutive rows at once: each x chunk is loaded once for all R. Every row keeps its
+ * own four accumulators in the single-row order, so the bits do not depend on R. */
+static inline __attribute__((always_inline)) void q80_rows_r(float *y, const float *x,
+    const unsigned char *W, size_t rb, int in, int o, const int R)
+{
+    __m512 a[4][4];
+    for (int r = 0; r < R; r++)
+        for (int k = 0; k < 4; k++) a[r][k] = _mm512_setzero_ps();
+    const unsigned char *w0 = W + (size_t)o * rb;
+    for (int i = 0, j = 0; i < in; i += 64, j += 2) {
+        __m512 xv[4];
+        for (int k = 0; k < 4; k++) xv[k] = _mm512_loadu_ps(x + i + 16 * k);
+        for (int r = 0; r < R; r++) {
+            const BQ80 *b = (const BQ80 *)(w0 + (size_t)r * rb) + j;
+            _mm_prefetch((const char *)b + K3_GQ_PF, K3_GQ_PFH);
+            for (int k = 0; k < 4; k++) {
+                const BQ80 *bk = b + (k >> 1);
+                const __m512 w = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(
+                    _mm_loadu_si128((const __m128i *)(bk->qs + 16 * (k & 1)))));
+                a[r][k] = _mm512_fmadd_ps(_mm512_mul_ps(w, _mm512_set1_ps(h2f(bk->d))), xv[k], a[r][k]);
+            }
+        }
+    }
+    for (int r = 0; r < R; r++) y[o + r] = v512_sum(a[r]);
+}
+#endif
+
+/* Rows per pass of the Q8_0 kernel (1, 2 or 4); env K3_Q80_ROWS overrides. */
+#ifndef K3_GQ_Q80R
+#define K3_GQ_Q80R 4
+#endif
+static int q80_nr(void)
+{
+    static int nr = 0;
+    if (!nr) {
+        const char *e = getenv("K3_Q80_ROWS");
+        const int v = e ? atoi(e) : K3_GQ_Q80R;
+        nr = v >= 4 ? 4 : v >= 2 ? 2 : 1;
+    }
+    return nr;
+}
+
 void k3_q80_rows(float *y, const float *x, const void *W, int in, int o0, int o1)
 {
 #if defined(K3_GQ_AVX512)
     if (in % 64 == 0) {
         const size_t rb = k3_gq_row_bytes(K3_GG_Q8_0, in);
-        for (int o = o0; o < o1; o++) {
-            const BQ80 *b = (const BQ80 *)((const unsigned char *)W + (size_t)o * rb);
-            __m512 a[4] = { _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps() };
-            for (int i = 0; i < in; i += 64, b += 2) {
-                _mm_prefetch((const char *)b + K3_GQ_PF, _MM_HINT_T0);
-                for (int k = 0; k < 4; k++) {
-                    const BQ80 *bk = b + (k >> 1);
-                    const __m512 w = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(
-                        _mm_loadu_si128((const __m128i *)(bk->qs + 16 * (k & 1)))));
-                    a[k] = _mm512_fmadd_ps(_mm512_mul_ps(w, _mm512_set1_ps(h2f(bk->d))),
-                                           _mm512_loadu_ps(x + i + 16 * k), a[k]);
-                }
-            }
-            y[o] = v512_sum(a);
-        }
+        const unsigned char *Wb = (const unsigned char *)W;
+        const int nr = q80_nr();
+        int o = o0;
+        if (nr == 4)
+            for (; o + 4 <= o1; o += 4) q80_rows_r(y, x, Wb, rb, in, o, 4);
+        if (nr >= 2)
+            for (; o + 2 <= o1; o += 2) q80_rows_r(y, x, Wb, rb, in, o, 2);
+        for (; o < o1; o++) q80_rows_r(y, x, Wb, rb, in, o, 1);
         return;
     }
 #endif
