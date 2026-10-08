@@ -74,9 +74,10 @@ static __thread size_t tl_panel_n;
 static __thread float *tl_c;
 static __thread size_t tl_c_n;
 
+/* tl_cfg: 0 none, 1 the bf16 GEMM tiles, otherwise 2 + the int8 kernel's (T, tail) */
 static void tiles_on(void)
 {
-    if (tl_cfg) return;
+    if (tl_cfg == 1) return;
     TileCfg cfg;
     memset(&cfg, 0, sizeof cfg);
     cfg.palette = 1;
@@ -374,4 +375,160 @@ void k3_amx_pack_cols(uint16_t *Xv, const float *X, int ldx, const int *map, int
         }
     }
 }
+#endif
+
+/* ------------------------------------------------- Q8_0 x int8 activations */
+#if defined(K3_AMX) && defined(__AMX_INT8__)
+int k3_amx_q8_ok(void)
+{
+    static int ok = -1;
+    if (ok < 0) {
+        unsigned a, b, c, d;
+        __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(7), "c"(0));
+        ok = (d >> 25 & 1) && k3_amx_ok();
+    }
+    return ok;
+}
+
+static __thread int8_t *tl_xq;
+static __thread size_t tl_xq_n;
+static __thread float *tl_dq;
+static __thread size_t tl_dq_n;
+
+/* tiles: 0 C [16][T], 1 C tail [nt][T], 2 A [16 rows][one block], 3 A tail, 4 B [8][T x 4] */
+static void tiles_q8(int T, int nt)
+{
+    const int key = 2 + T * 16 + nt;
+    if (tl_cfg == key) return;
+    TileCfg cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.palette = 1;
+    cfg.rows[0] = 16;      cfg.colsb[0] = (uint16_t)(4 * T);
+    cfg.rows[2] = 16;      cfg.colsb[2] = 32;
+    cfg.rows[4] = 8;       cfg.colsb[4] = (uint16_t)(4 * T);
+    if (nt) {
+        cfg.rows[1] = (uint8_t)nt; cfg.colsb[1] = (uint16_t)(4 * T);
+        cfg.rows[3] = (uint8_t)nt; cfg.colsb[3] = 32;
+    }
+    _tile_loadconfig(&cfg);
+    tl_cfg = key;
+}
+
+/* T <= 16 tokens to int8 per 32 (d = amax / 127, round to nearest even), as B tiles:
+ * block b, k quad j, token t at xq[b * 32T + j * 4T + 4t]; scales at dq[b * 16 + t] */
+void k3_q8x_quant(int8_t *xq, float *dq, const float *X, int ldx, int T, int in, int i0, int i1)
+{
+    const int nb = in / 32;
+    const __m512 sgn = _mm512_set1_ps(-0.0f);
+    for (int it = i0; it < i1; it++) {
+        const int t = it / nb, b = it % nb;
+        const float *x = X + (size_t)t * ldx;
+        {
+            const __m512 v0 = _mm512_loadu_ps(x + b * 32), v1 = _mm512_loadu_ps(x + b * 32 + 16);
+            const float amax = _mm512_reduce_max_ps(_mm512_max_ps(_mm512_andnot_ps(sgn, v0),
+                                                                  _mm512_andnot_ps(sgn, v1)));
+            const float d = amax / 127.0f, id = d > 0.0f ? 1.0f / d : 0.0f;
+            dq[b * 16 + t] = d;
+            const __m512 s = _mm512_set1_ps(id);
+            const __m128i q0 = _mm512_cvtsepi32_epi8(_mm512_cvtps_epi32(_mm512_mul_ps(v0, s)));
+            const __m128i q1 = _mm512_cvtsepi32_epi8(_mm512_cvtps_epi32(_mm512_mul_ps(v1, s)));
+            int8_t *o = xq + (size_t)b * 32 * T + 4 * t;
+            if (T == 1) {
+                _mm_storeu_si128((__m128i *)o, q0);
+                _mm_storeu_si128((__m128i *)(o + 16), q1);
+            } else {
+                int32_t g[8];
+                _mm_storeu_si128((__m128i *)g, q0);
+                _mm_storeu_si128((__m128i *)(g + 4), q1);
+                for (int j = 0; j < 8; j++) memcpy(o + (size_t)j * 4 * T, &g[j], 4);
+            }
+        }
+    }
+}
+
+/* Per (row, token), over blocks in order: acc = fma((float)isum_b, dx_b * dw_b, acc).
+ * isum is exact in int32, so the bits are the same for every T and tile shape. */
+static inline void q8_epi(__m512 *acc, int n, const int32_t *cb, const unsigned char *w0,
+                          size_t rb, int b, __m512 dxv, __mmask16 mt)
+{
+    for (int m = 0; m < n; m++) {
+        const float dw = _cvtsh_ss(*(const uint16_t *)(w0 + (size_t)m * rb + (size_t)b * 34));
+        acc[m] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_maskz_loadu_epi32(mt, cb + m * 16)),
+                                 _mm512_mul_ps(dxv, _mm512_set1_ps(dw)), acc[m]);
+    }
+}
+
+static void q8_tile(float *Y, int ldy, const int8_t *xq, const float *dq, int T, int nb,
+                    const unsigned char *W, size_t rb, int o, int n)
+{
+    int32_t cb[256] __attribute__((aligned(64)));
+    __m512 acc[16];
+    const __mmask16 mt = (__mmask16)((1u << T) - 1);
+    for (int m = 0; m < n; m++) acc[m] = _mm512_setzero_ps();
+    const unsigned char *w0 = W + (size_t)o * rb;
+    for (int b = 0; b < nb; b++) {
+        if (!(b & 1))
+            for (int m = 0; m < n; m++)
+                _mm_prefetch((const char *)w0 + (size_t)m * rb + (size_t)(b + 8) * 34, _MM_HINT_T0);
+        _tile_loadd(4, xq + (size_t)b * 32 * T, 4 * T);
+        if (n == 16) {
+            _tile_zero(0);
+            _tile_loadd(2, w0 + (size_t)b * 34 + 2, rb);
+            _tile_dpbssd(0, 2, 4);
+            _tile_stored(0, cb, 64);
+        } else {
+            _tile_zero(1);
+            _tile_loadd(3, w0 + (size_t)b * 34 + 2, rb);
+            _tile_dpbssd(1, 3, 4);
+            _tile_stored(1, cb, 64);
+        }
+        q8_epi(acc, n, cb, w0, rb, b, _mm512_maskz_loadu_ps(mt, dq + b * 16), mt);
+    }
+    float out[16] __attribute__((aligned(64)));
+    for (int m = 0; m < n; m++) {
+        _mm512_store_ps(out, acc[m]);
+        for (int t = 0; t < T; t++) Y[(size_t)t * ldy + o + m] = out[t];
+    }
+}
+
+int k3_amx_q80_rows_q(float *Y, int ldy, const int8_t *xq, const float *dq, int T, const void *W,
+                      int in, int o0, int o1)
+{
+    if (in % 32 || T > 16 || !k3_amx_q8_ok()) return -1;
+    if (o1 <= o0 || T <= 0) return 0;
+    const int nb = in / 32, nt = (o1 - o0) % 16;
+    const size_t rb = (size_t)nb * 34;
+    tiles_q8(T, nt);
+    int o = o0;
+    for (; o + 16 <= o1; o += 16)
+        q8_tile(Y, ldy, xq, dq, T, nb, (const unsigned char *)W, rb, o, 16);
+    if (nt) q8_tile(Y, ldy, xq, dq, T, nb, (const unsigned char *)W, rb, o, nt);
+    return 0;
+}
+
+int k3_amx_q80_rows(float *Y, int ldy, const float *X, int ldx, int T, const void *W, int in,
+                    int o0, int o1)
+{
+    if (in % 32 || !k3_amx_q8_ok()) return -1;
+    if (o1 <= o0 || T <= 0) return 0;
+    const int nb = in / 32;
+    tl_xq = (int8_t *)grow(tl_xq, &tl_xq_n, (size_t)in * 16);
+    tl_dq = (float *)grow(tl_dq, &tl_dq_n, (size_t)nb * 16 * sizeof(float));
+    for (int t0 = 0; t0 < T; t0 += 16) {
+        const int Tc = T - t0 < 16 ? T - t0 : 16;
+        k3_q8x_quant(tl_xq, tl_dq, X + (size_t)t0 * ldx, ldx, Tc, in, 0, Tc * nb);
+        k3_amx_q80_rows_q(Y + (size_t)t0 * ldy, ldy, tl_xq, tl_dq, Tc, W, in, o0, o1);
+    }
+    return 0;
+}
+#else
+int k3_amx_q8_ok(void) { return 0; }
+void k3_q8x_quant(int8_t *xq, float *dq, const float *X, int ldx, int T, int in, int i0, int i1)
+{ (void)xq; (void)dq; (void)X; (void)ldx; (void)T; (void)in; (void)i0; (void)i1; }
+int k3_amx_q80_rows_q(float *Y, int ldy, const int8_t *xq, const float *dq, int T, const void *W,
+                      int in, int o0, int o1)
+{ (void)Y; (void)ldy; (void)xq; (void)dq; (void)T; (void)W; (void)in; (void)o0; (void)o1; return -1; }
+int k3_amx_q80_rows(float *Y, int ldy, const float *X, int ldx, int T, const void *W, int in,
+                    int o0, int o1)
+{ (void)Y; (void)ldy; (void)X; (void)ldx; (void)T; (void)W; (void)in; (void)o0; (void)o1; return -1; }
 #endif

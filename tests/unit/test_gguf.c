@@ -17,6 +17,7 @@
 #include "k3.h"
 #include "k3_gguf.h"
 #include "k3_gq.h"
+#include "k3_amx.h"
 
 static int fails = 0;
 #define CHECK(cond, ...) do { if (!(cond)) { fails++; printf("  FAIL: " __VA_ARGS__); printf("\n"); } } while (0)
@@ -40,6 +41,7 @@ static void test_kernels(void)
     static const int types[3] = { K3_GG_Q8_0, K3_GG_IQ2_XS, K3_GG_IQ3_XXS };
     static const char *names[3] = { "q8_0", "iq2_xs", "iq3_xxs" };
     static const int ins[3] = { 3584, 3072, 7168 };
+    k3_act_q8 = 0;
     for (int ti = 0; ti < 3; ti++)
         for (int s = 0; s < 3; s++) {
             const int t = types[ti], in = ins[s], rows = 96;
@@ -58,18 +60,74 @@ static void test_kernels(void)
             else { k3_iq3xxs_rows(y1, x, W, in, 0, rows); memcpy(y2, y1, 4 * rows); }
             CHECK(!memcmp(y0, y1, 4 * (size_t)rows), "%s in=%d: fused rows differ from dequantise + k3_matmul", names[ti], in);
             CHECK(!memcmp(y0, y2, 4 * (size_t)rows), "%s in=%d: team matmul differs", names[ti], in);
+            if (t == K3_GG_Q8_0)
+                for (int T = 1; T <= 8; T++) {
+                    float *X = (float *)malloc(sizeof(float) * (size_t)T * in);
+                    float *Y = (float *)malloc(sizeof(float) * (size_t)T * rows);
+                    for (int i = 0; i < T * in; i++) X[i] = (float)((int)(rnd() % 2001) - 1000) / 991.0f;
+                    k3_q80_rows_T(Y, rows, X, in, T, W, in, 0, rows);
+                    for (int u = 0; u < T; u++) {
+                        k3_q80_rows(y1, X + (size_t)u * in, W, in, 0, rows);
+                        CHECK(!memcmp(y1, Y + (size_t)u * rows, 4 * (size_t)rows),
+                              "q8_0 in=%d T=%d token %d: multi-token rows differ", in, T, u);
+                    }
+                    free(X); free(Y);
+                }
+            if (t == K3_GG_Q8_0 && k3_amx_q8_ok()) {
+                k3_act_q8 = 1;
+                for (int T = 1; T <= 17; T += 2) {
+                    float *X = (float *)malloc(sizeof(float) * (size_t)T * in);
+                    float *Y = (float *)malloc(sizeof(float) * (size_t)T * rows);
+                    for (int i = 0; i < T * in; i++) X[i] = (float)((int)(rnd() % 2001) - 1000) / 991.0f;
+                    memcpy(X, x, sizeof(float) * in);
+                    k3_q80_rows_T(Y, rows, X, in, T, W, in, 0, rows);
+                    double md = 0, ny = 0;
+                    for (int r = 0; r < rows; r++) { md = fmax(md, fabs((double)Y[r] - y0[r])); ny = fmax(ny, fabs(y0[r])); }
+                    CHECK(md <= 2e-2 * ny, "q8_0 in=%d act-int8: max error %.3g of max |y| %.3g", in, md, ny);
+                    for (int u = 0; u < T; u++) {
+                        k3_q80_rows(y1, X + (size_t)u * in, W, in, 0, 37);
+                        k3_q80_rows(y1, X + (size_t)u * in, W, in, 37, rows);
+                        CHECK(!memcmp(y1, Y + (size_t)u * rows, 4 * (size_t)rows),
+                              "q8_0 in=%d act-int8 T=%d token %d: batch differs from one token", in, T, u);
+                    }
+                    free(X); free(Y);
+                }
+                k3_act_q8 = 0;
+            }
             if (t != K3_GG_Q8_0 && k3_gq_have_q8()) {
                 k3_gq_quant_x(xq, dx, x, in);
                 if (t == K3_GG_IQ2_XS) k3_iq2xs_rows_q8(y1, xq, dx, W, in, 0, rows);
                 else k3_iq3xxs_rows_q8(y1, xq, dx, W, in, 0, rows);
+                if (t == K3_GG_IQ2_XS)
+                    for (int T = 1; T <= 6; T++) {
+                        const int nb = in / 256;
+                        int8_t *XQ = (int8_t *)malloc((size_t)T * in);
+                        float *DX = (float *)malloc(sizeof(float) * (size_t)T * nb);
+                        float *Y = (float *)malloc(sizeof(float) * (size_t)T * rows), *X = (float *)malloc(sizeof(float) * in);
+                        for (int u = 0; u < T; u++) {
+                            for (int i = 0; i < in; i++) X[i] = (float)((int)(rnd() % 2001) - 1000) / 993.0f;
+                            k3_gq_quant_x(XQ + (size_t)u * in, DX + (size_t)u * nb, X, in);
+                        }
+                        float *yp[8]; const int8_t *xp[8]; const float *dp[8];
+                        for (int u = 0; u < T; u++) { yp[u] = Y + (size_t)u * rows; xp[u] = XQ + (size_t)u * in; dp[u] = DX + (size_t)u * nb; }
+                        k3_iq2xs_rows_q8_P(yp, xp, dp, T, W, in, 0, rows);
+                        float *y3 = (float *)malloc(sizeof(float) * rows);
+                        for (int u = 0; u < T; u++) {
+                            k3_iq2xs_rows_q8(y3, XQ + (size_t)u * in, DX + (size_t)u * nb, W, in, 0, rows);
+                            CHECK(!memcmp(y3, Y + (size_t)u * rows, 4 * (size_t)rows),
+                                  "iq2_xs in=%d int8 T=%d token %d: multi-token rows differ", in, T, u);
+                        }
+                        free(XQ); free(DX); free(Y); free(X); free(y3);
+                    }
                 double md = 0, ny = 0;
                 for (int r = 0; r < rows; r++) { md = fmax(md, fabs((double)y1[r] - y0[r])); ny = fmax(ny, fabs(y0[r])); }
                 CHECK(md <= 2e-2 * ny, "%s in=%d int8: max error %.3g of max |y| %.3g", names[ti], in, md, ny);
             }
             free(W); free(Wd); free(x); free(y0); free(y1); free(y2); free(xq); free(dx);
         }
-    printf("  kernels: q8_0, iq2_xs, iq3_xxs fused == dequantise + k3_matmul%s\n",
-           k3_gq_have_q8() ? "; int8 paths within tolerance" : " (no int8 kernels in this build)");
+    printf("  kernels: q8_0, iq2_xs, iq3_xxs fused == dequantise + k3_matmul%s%s\n",
+           k3_gq_have_q8() ? "; int8 paths within tolerance" : " (no int8 kernels in this build)",
+           k3_amx_q8_ok() ? "; AMX-INT8 q8_0 batch == one token" : "");
 }
 
 /* ggml MXFP4 blocks repacked to the engine layout dequantise to the same values */

@@ -18,6 +18,7 @@
 #endif
 
 #include "k3.h"
+#include "k3_gq.h"
 #include "k3_st.h"
 
 static double k3d_now(void)
@@ -216,16 +217,27 @@ static void gemm_q80_rows(float *Y, int ldy, const float *X, int ldx, int T,
 }
 
 /* Y[T][out] = X[T][in] W^T, T any: passes of up to K3_DSPARK_MAXT tokens, rows split
- * over the threads. */
+ * over the threads and, under TP, over the ranks (then gathered, so every rank holds Y). */
 static void gemm_bf16(float *Y, const float *X, int T, const uint16_t *W, int in, int out)
 {
+    int r0 = 0, r1 = out;
+    if (k3_tp.size > 1 && out >= 64 * k3_tp.size && !getenv("K3_DSPARK_REDUNDANT"))
+        k3_tp_part(out, &r0, &r1);
     for (int t0 = 0; t0 < T; t0 += K3_DSPARK_MAXT) {
         const int nt = T - t0 < K3_DSPARK_MAXT ? T - t0 : K3_DSPARK_MAXT;
         #pragma omp parallel
         {
             int lo, hi;
-            k3_split(out, &lo, &hi);
-            gemm_bf16_rows(Y + (size_t)t0 * out, out, X + (size_t)t0 * in, in, nt, W, in, lo, hi);
+            k3_split(r1 - r0, &lo, &hi);
+            gemm_bf16_rows(Y + (size_t)t0 * out, out, X + (size_t)t0 * in, in, nt, W, in,
+                           r0 + lo, r0 + hi);
+        }
+        if (r1 - r0 < out) {
+            K3Seg s[K3_DSPARK_MAXT];
+            for (int t = 0; t < nt; t++) {
+                s[t].p = Y + (size_t)(t0 + t) * out; s[t].n = out; s[t].unit = 1; s[t].exact = 1;
+            }
+            k3_tp_gather(s, nt);
         }
     }
 }
@@ -582,11 +594,16 @@ int k3_dspark_propose(K3DSpark *d, int anchor, int pos, int nq, const void *lm_h
     if (k3_tp.size > 1) k3_tp_part(V, &v0, &v1);
     const int obase = k3_tp.local ? v0 : 0;
     if (lm_wdt == K3_WQ8_0 && H % 32 == 0) {
+        const size_t rb = k3_row_bytes(K3_WQ8_0, H);
         #pragma omp parallel
         {
             int lo, hi;
             k3_split(v1 - v0, &lo, &hi);
-            gemm_q80_rows(lg, V, hs, H, nq, (const unsigned char *)lm_head, H, v0 + lo, v0 + hi, obase);
+            if (k3_act_q8_on())
+                k3_q80_rows_T(lg + v0 + lo, V, hs, H, nq,
+                              (const unsigned char *)lm_head + (size_t)(v0 + lo - obase) * rb, H, 0, hi - lo);
+            else
+                gemm_q80_rows(lg, V, hs, H, nq, (const unsigned char *)lm_head, H, v0 + lo, v0 + hi, obase);
         }
     } else if (lm_wdt == K3_WBF16) {
         #pragma omp parallel

@@ -41,6 +41,14 @@ static inline size_t k3_gq_row_bytes(int t, int64_t in)
 
 /* y[o] = W[o] . x for o in [o0, o1); W points at row 0. in must be a block multiple. */
 void k3_q80_rows(float *y, const float *x, const void *W, int in, int o0, int o1);
+/* The same rows for T tokens, each row read once: Y[t * ldy + o] = W[o] . X[t * ldx],
+ * per token bit-identical to k3_q80_rows. */
+void k3_q80_rows_T(float *Y, int ldy, const float *X, int ldx, int T, const void *W, int in,
+                   int o0, int o1);
+/* K3_ACT_Q8=1 (and AMX-INT8 present): both of the above quantize activations to int8 per
+ * 32 and run k3_amx_q80_rows. k3_act_q8 < 0 until first use; set it to force a mode. */
+extern int k3_act_q8;
+int  k3_act_q8_on(void);
 void k3_iq2xs_rows(float *y, const float *x, const void *W, int in, int o0, int o1);
 void k3_iq3xxs_rows(float *y, const float *x, const void *W, int in, int o0, int o1);
 
@@ -61,6 +69,10 @@ void k3_gq_quant_x(int8_t *xq, float *dx, const float *x, int n);
 int  k3_gq_have_q8(void);
 void k3_iq2xs_rows_q8(float *y, const int8_t *xq, const float *dx, const void *W, int in,
                       int o0, int o1);
+/* T tokens, token g's xq/scales at XQ[g]/DX[g] and output at Y[g][o], each row decoded
+ * once; per token bit-identical to k3_iq2xs_rows_q8. */
+void k3_iq2xs_rows_q8_P(float *const *Y, const int8_t *const *XQ, const float *const *DX, int T,
+                        const void *W, int in, int o0, int o1);
 void k3_iq3xxs_rows_q8(float *y, const int8_t *xq, const float *dx, const void *W, int in,
                        int o0, int o1);
 

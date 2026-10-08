@@ -79,6 +79,16 @@ static double now_s(void)
     return t.tv_sec + t.tv_nsec * 1e-9;
 }
 
+static void par_copy(float *dst, const float *src, size_t n)
+{
+    const long chunk = 1 << 16, nc = (long)((n + chunk - 1) / chunk);
+    #pragma omp parallel for schedule(static)
+    for (long c = 0; c < nc; c++) {
+        const size_t o = (size_t)c * chunk, m = n - o < (size_t)chunk ? n - o : (size_t)chunk;
+        memcpy(dst + o, src + o, m * sizeof(float));
+    }
+}
+
 static void human(double b, char *o, size_t n)
 {
     const char *u[] = {"B", "KB", "MB", "GB", "TB"};
@@ -687,6 +697,27 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
     }
 
     float *nrm = scratch;
+    if (arg_all && T > 1 && T <= 8 && !w->ultra &&
+        !(getenv("K3_BATCH_DECODE") && !strcmp(getenv("K3_BATCH_DECODE"), "0"))) {
+        /* a verify sweep: the lm_head is read once for all T positions */
+        static float *lgT;
+        static size_t lgT_cap;
+        const size_t need = (size_t)T * ((size_t)c->vocab + E);
+        if (need > lgT_cap) {
+            free(lgT);
+            lgT = (float *)malloc(need * sizeof(float));
+            if (!lgT) { lgT_cap = 0; return -1; }
+            lgT_cap = need;
+        }
+        float *NR = lgT + (size_t)T * c->vocab;
+        for (int t = 0; t < T; t++)
+            k3_rmsnorm(NR + (size_t)t * E, h + (size_t)t * E, w->mb.norm, E, c->rms_eps);
+        k3_mmw_tp_T(lgT, c->vocab, NR, E, T, w->mb.lm_head, w->mb.wdt, E, c->vocab);
+        for (int t = 0; t < T; t++) arg_all[t] = argmax_(lgT + (size_t)t * c->vocab, c->vocab);
+        memcpy(logits_last, lgT + (size_t)(T - 1) * c->vocab, (size_t)c->vocab * sizeof(float));
+        k3_prof_add(K3P_HEAD, tp);
+        return 0;
+    }
     if (arg_all) {
         for (int t = 0; t < T; t++) {
             k3_rmsnorm(nrm, h + (size_t)t * E, w->mb.norm, E, c->rms_eps);
@@ -1082,6 +1113,9 @@ static int k3_main(int argc, char **argv)
         return 2;
     }
     if (getenv("K3_EXPERT_Q8") && atoi(getenv("K3_EXPERT_Q8")) > 0) k3_expert_q8 = 1;
+    if (getenv("K3_ACT_Q8") && atoi(getenv("K3_ACT_Q8")) > 0)
+        printf("Q8_0 matmuls: %s\n", k3_act_q8_on() ? "int8 activations per 32 on AMX-INT8"
+                                                    : "K3_ACT_Q8 ignored, no AMX-INT8 here");
     if (ultra && budget_auto) {
         fprintf(stderr, "--ultra-low-memory uses explicit bounded budgets; use "
                         "--preset ultra or pass --trunk-gb/--cache-gb\n");
@@ -1861,6 +1895,7 @@ static int k3_main(int argc, char **argv)
     static K3DSpark dsp;
     int dsp_on = 0;
     long dsp_rounds = 0, dsp_drafted = 0, dsp_accepted = 0;
+    double dsp_t_verify = 0, dsp_t_fix = 0;
     if (dspark_dir) {
         if (k3_dspark_open(&dsp, dspark_dir, c.vocab, c.hidden, w.kv_cap + K3_SPEC_MAX + 1) != 0)
             return 1;
@@ -2011,9 +2046,13 @@ static int k3_main(int argc, char **argv)
                  * exactly what serial decode would have emitted, and arg[m] after it is
                  * clean because its context contains only accepted tokens. */
                 int arg[K3_SPEC_MAX + 1];
-                memcpy(spec_snap, ks, kper_f * (size_t)w.n_bound * sizeof(float));
+                par_copy(spec_snap, ks, kper_f * (size_t)w.n_bound);
                 for (int i = 0; i < nd; i++) seq[T + i] = d[i];
+                if (!w.ultra && !getenv("K3_SPEC_REPLAY")) k3_kda_record_arm(nd + 1);
+                const double tv = now_s();
                 frc = forward(&w, &c, &cache, seq + base, nd + 1, lg, sc, h, br, ks, arg);
+                const double tf = now_s();
+                dsp_t_verify += tf - tv;
                 if (frc == 0) {
                     int m = 0;
                     while (m < nd && arg[m] == d[m]) m++;
@@ -2026,7 +2065,14 @@ static int k3_main(int argc, char **argv)
                         /* the recurrent state absorbed rejected tokens: restore, then
                          * replay only the accepted prefix. The replay also rewrites the
                          * KV rows those positions touched, so nothing stale survives. */
-                        memcpy(ks, spec_snap, kper_f * (size_t)w.n_bound * sizeof(float));
+                        par_copy(ks, spec_snap, kper_f * (size_t)w.n_bound);
+                        if (k3_kda_rollback(&c, m + 1) == 0) {
+                            /* the recorded recurrence inputs of the kept tokens replayed
+                             * from the snapshot; their taps from the sweep stand */
+                            w.cached = base + m + 1;
+                            if (dsp_on && k3_dspark_context(&dsp, w.taps, m + 1, base) != 0)
+                                frc = -1;
+                        } else {
                         w.cached = base;
                         frc = forward(&w, &c, &cache, seq + base, m + 1, lg, sc, h, br,
                                       ks, NULL);
@@ -2034,7 +2080,10 @@ static int k3_main(int argc, char **argv)
                         if (dsp_on && frc == 0 &&
                             k3_dspark_context(&dsp, w.taps, m + 1, base) != 0)
                             frc = -1;
+                        }
                     }
+                    k3_kda_record_arm(0);
+                    dsp_t_fix += now_s() - tf;
                     if (dsp_on) dsp_accepted += m;
                     /* Resync the draft model to the ACCEPTED sequence. On full
                      * acceptance its state already contains every fed token except
@@ -2159,10 +2208,14 @@ static int k3_main(int argc, char **argv)
     if (dsp_on) {
         if (dsp_rounds > 0)
             printf("DSpark: %ld blocks, %ld drafted, %ld accepted (%.2f per block, %.2f tokens "
-                   "per verify incl. the bonus); draft %.1f ms/block, context %.1f ms total\n",
+                   "per verify incl. the bonus); draft %.1f ms/block, context %.1f ms total, "
+                   "verify %.1f ms/block, accept/rollback %.1f ms/block\n",
                    dsp_rounds, dsp_drafted, dsp_accepted, (double)dsp_accepted / dsp_rounds,
                    1.0 + (double)dsp_accepted / dsp_rounds, 1e3 * dsp.t_draft / dsp.steps,
-                   1e3 * dsp.t_ctx);
+                   1e3 * dsp.t_ctx, 1e3 * dsp_t_verify / dsp_rounds, 1e3 * dsp_t_fix / dsp_rounds);
+        if (k3_mt_pairs > 0)
+            printf("grouped experts: %ld distinct for %ld (token, expert) pairs (%.2f tokens per expert read)\n",
+                   k3_mt_experts, k3_mt_pairs, (double)k3_mt_pairs / k3_mt_experts);
         k3_dspark_close(&dsp);
         free(w.taps);
         w.taps = NULL;

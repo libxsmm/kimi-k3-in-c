@@ -50,4 +50,19 @@ void k3_amx_gemm_groups(const K3AmxGroup *g, int ng, const uint16_t *Xv, int in,
 void k3_amx_pack_rows(uint16_t *Xv, const float *X, int ldx, const int *map, int N, int in);
 void k3_amx_pack_cols(uint16_t *Xv, const float *X, int ldx, const int *map, int N, int in);
 
+/* INT8 ACTIVATIONS (K3_ACT_Q8=1): Q8_0 rows [o0, o1) of W (row o at W + o * row_bytes,
+ * read in place) against T tokens of X, each quantized to int8 per 32 like ggml's q8_0,
+ * on AMX-INT8. Per (row, token) the arithmetic does not depend on T or on the row split,
+ * so a batch of tokens gives exactly the bits of one token at a time. Calling thread
+ * only; -1 when unavailable (no AMX-INT8, or in % 32). */
+int k3_amx_q8_ok(void);
+int k3_amx_q80_rows(float *Y, int ldy, const float *X, int ldx, int T, const void *W, int in,
+                    int o0, int o1);
+/* The same in two parts, so a team can quantize once and share: items [i0, i1) of the
+ * T * in/32 (token, block) pairs of X into xq (in * T bytes) and dq (in/32 * 16 floats),
+ * then rows [o0, o1) for T <= 16 tokens from them. */
+void k3_q8x_quant(int8_t *xq, float *dq, const float *X, int ldx, int T, int in, int i0, int i1);
+int k3_amx_q80_rows_q(float *Y, int ldy, const int8_t *xq, const float *dq, int T, const void *W,
+                      int in, int o0, int o1);
+
 #endif /* K3_AMX_H */

@@ -80,6 +80,7 @@ extern "C" {
  * code is also the serial reference. Work split by rows changes no arithmetic. */
 #ifdef _OPENMP
 void k3_team_barrier(void);
+extern unsigned long k3_team_gen;          /* bumped at every K3_TEAM_IF fork */
 static inline int  k3_tid(void)     { return omp_get_thread_num(); }
 static inline int  k3_nth(void)     { return omp_get_num_threads(); }
 static inline int  k3_in_team(void) { return omp_in_parallel(); }
@@ -105,7 +106,7 @@ static inline void k3_split(int n, int *lo, int *hi)
 #ifdef _OPENMP
 #define K3_TEAM_IF(cond, ...) do {                                            \
         if (k3_in_team() || !(cond)) { __VA_ARGS__; }                         \
-        else { _Pragma("omp parallel") { __VA_ARGS__; } }                     \
+        else { k3_team_gen++; _Pragma("omp parallel") { __VA_ARGS__; } }     \
     } while (0)
 #else
 #define K3_TEAM_IF(cond, ...) do { __VA_ARGS__; } while (0)
@@ -270,6 +271,10 @@ void k3_tp_gather_end(const K3Seg *seg, int nseg);   /* the same segments as beg
 /* y = W x with the output rows split across ranks and gathered: bit-identical to k3_mmw.
  * W holds every row on every rank. */
 void k3_mmw_tp(float *y, const float *x, const void *W, int wdt, int in, int out);
+/* The same for T <= 8 tokens, each weight row read once: Y[t * ldy + o], per token
+ * bit-identical to k3_mmw_tp. */
+void k3_mmw_tp_T(float *Y, int ldy, const float *X, int ldx, int T, const void *W, int wdt,
+                 int in, int out);
 
 /* ------------------------------------------------------------------ ops ---- */
 
@@ -490,6 +495,8 @@ enum { K3_EQ_MXFP4 = 0, K3_EQ_IQ2XS = 1, K3_EQ_IQ3XXS = 2 };
 /* 1: GGUF experts take int8 activations (VNNI dot products; deterministic but not
  * bit-identical to fp32). Set before the forward pass (CLI: K3_EXPERT_Q8=1). */
 extern int k3_expert_q8;
+/* Batched decode with grouped experts: (token, expert) pairs and distinct experts run. */
+extern long k3_mt_pairs, k3_mt_experts;
 
 /* A source of experts. get() must leave the returned pointers valid until the caller
  * finishes the token; a cache satisfies that by pinning what the current token needs
@@ -633,6 +640,12 @@ typedef struct {
 } K3KdaW;
 
 size_t k3_kda_scratch(const K3Cfg *c, int T);
+/* Speculative verify: arm with the sweep's T to have every KDA layer record its per-token
+ * recurrence and ShortConv inputs (0 disarms). After restoring the pre-sweep state,
+ * k3_kda_rollback replays the first `keep` tokens' state updates; -1 if no complete
+ * record exists (the caller then re-runs the kept tokens). */
+void   k3_kda_record_arm(int T);
+int    k3_kda_rollback(const K3Cfg *c, int keep);
 /* state may be NULL (fresh sequence). If non-NULL it must hold
  * H*D*D recurrent floats followed by 3*H*D*(conv_k-1) convolution floats, and it is
  * UPDATED IN PLACE so a decode loop can carry it. */

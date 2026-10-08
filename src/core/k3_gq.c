@@ -7,6 +7,18 @@
 #include <string.h>
 
 #include "ggml_iq_grids.h"
+#include "k3_amx.h"
+
+int k3_act_q8 = -1;
+
+int k3_act_q8_on(void)
+{
+    if (k3_act_q8 < 0) {
+        const char *e = getenv("K3_ACT_Q8");
+        k3_act_q8 = e && atoi(e) > 0 && k3_amx_q8_ok();
+    }
+    return k3_act_q8;
+}
 
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
 #define K3_GQ_AVX512 1
@@ -284,7 +296,56 @@ static inline __attribute__((always_inline)) void q80_rows_r(float *y, const flo
     }
     for (int r = 0; r < R; r++) y[o + r] = v512_sum(a[r]);
 }
+
+/* One row against G tokens: the weights are decoded once per 16 and fed to every token's
+ * own four accumulators, each in the single-token order. */
+static inline __attribute__((always_inline)) void q80_row_g(float *Y, int ldy, const float *X,
+    int ldx, const unsigned char *w0, int in, int o, const int G)
+{
+    __m512 a[4][4];
+    for (int g = 0; g < G; g++)
+        for (int k = 0; k < 4; k++) a[g][k] = _mm512_setzero_ps();
+    for (int i = 0, j = 0; i < in; i += 64, j += 2) {
+        const BQ80 *b = (const BQ80 *)w0 + j;
+        _mm_prefetch((const char *)b + K3_GQ_PF, K3_GQ_PFH);
+        for (int k = 0; k < 4; k++) {
+            const BQ80 *bk = b + (k >> 1);
+            const __m512 w = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(
+                _mm_loadu_si128((const __m128i *)(bk->qs + 16 * (k & 1))))),
+                _mm512_set1_ps(h2f(bk->d)));
+            for (int g = 0; g < G; g++)
+                a[g][k] = _mm512_fmadd_ps(w, _mm512_loadu_ps(X + (size_t)g * ldx + i + 16 * k), a[g][k]);
+        }
+    }
+    for (int g = 0; g < G; g++) Y[(size_t)g * ldy + o] = v512_sum(a[g]);
+}
 #endif
+
+void k3_q80_rows_T(float *Y, int ldy, const float *X, int ldx, int T, const void *W, int in,
+                   int o0, int o1)
+{
+    if (k3_act_q8_on() && k3_amx_q80_rows(Y, ldy, X, ldx, T, W, in, o0, o1) == 0) return;
+#if defined(K3_GQ_AVX512)
+    if (in % 64 == 0) {
+        const size_t rb = k3_gq_row_bytes(K3_GG_Q8_0, in);
+        for (int o = o0; o < o1; o++) {
+            const unsigned char *w0 = (const unsigned char *)W + (size_t)o * rb;
+            for (int t = 0; t < T; t += 4) {
+                const int G = T - t < 4 ? T - t : 4;
+                float *Yt = Y + (size_t)t * ldy;
+                const float *Xt = X + (size_t)t * ldx;
+                if (G == 4)      q80_row_g(Yt, ldy, Xt, ldx, w0, in, o, 4);
+                else if (G == 3) q80_row_g(Yt, ldy, Xt, ldx, w0, in, o, 3);
+                else if (G == 2) q80_row_g(Yt, ldy, Xt, ldx, w0, in, o, 2);
+                else             q80_row_g(Yt, ldy, Xt, ldx, w0, in, o, 1);
+            }
+        }
+        return;
+    }
+#endif
+    for (int t = 0; t < T; t++)
+        k3_q80_rows(Y + (size_t)t * ldy, X + (size_t)t * ldx, W, in, o0, o1);
+}
 
 /* Rows per pass of the Q8_0 kernel (1, 2 or 4); env K3_Q80_ROWS overrides. */
 #ifndef K3_GQ_Q80R
@@ -303,6 +364,7 @@ static int q80_nr(void)
 
 void k3_q80_rows(float *y, const float *x, const void *W, int in, int o0, int o1)
 {
+    if (k3_act_q8_on() && k3_amx_q80_rows(y, 0, x, 0, 1, W, in, o0, o1) == 0) return;
 #if defined(K3_GQ_AVX512)
     if (in % 64 == 0) {
         const size_t rb = k3_gq_row_bytes(K3_GG_Q8_0, in);
@@ -525,6 +587,60 @@ void k3_iq2xs_rows_q8(float *y, const int8_t *xq, const float *dx, const void *W
     }
 }
 
+/* G tokens against one row, the block decoded once; per token the single-token order */
+static inline __attribute__((always_inline)) void iq2xs_row_q8_g(float *const *Y,
+    const int8_t *const *XQ, const float *const *DX, const BIQ2XS *b, int in, int o,
+    const int G, const __m512i *idx4)
+{
+    const __m128i m4 = _mm_set1_epi8(0xf);
+    __m512 facc[4];
+    for (int g = 0; g < G; g++) facc[g] = _mm512_setzero_ps();
+    for (int i = 0; i < in; i += K3_GQ_QK, b++) {
+        _mm_prefetch((const char *)b + K3_GQ_PF_IQ, _MM_HINT_T0);
+        _mm_prefetch((const char *)b + K3_GQ_PF_IQ + 64, _MM_HINT_T0);
+        const __m128i s = _mm_loadl_epi64((const __m128i *)b->sc);
+        const __m128i nib = _mm_unpacklo_epi8(_mm_and_si128(s, m4), _mm_and_si128(_mm_srli_epi16(s, 4), m4));
+        const __m512i sc = _mm512_cvtepu8_epi32(_mm_add_epi8(_mm_add_epi8(nib, nib), _mm_set1_epi8(1)));
+        __m512i iacc[4];
+        for (int g = 0; g < G; g++) iacc[g] = _mm512_setzero_si512();
+        for (int j = 0; j < 4; j++) {
+            const uint16_t *q = b->qs + 8 * j;
+            const __mmask64 neg = iq2xs_neg(q);
+            const __m512i mag = iq2xs_mag(q), scj = _mm512_permutexvar_epi32(idx4[j], sc);
+            for (int g = 0; g < G; g++) {
+                const __m512i xv = _mm512_loadu_si512((const void *)(XQ[g] + i + 64 * j));
+                const __m512i xs = _mm512_mask_sub_epi8(xv, neg, _mm512_setzero_si512(), xv);
+                iacc[g] = _mm512_dpwssd_epi32(iacc[g], _mm512_dpbusd_epi32(_mm512_setzero_si512(), mag, xs), scj);
+            }
+        }
+        const float d = h2f(b->d);
+        for (int g = 0; g < G; g++)
+            facc[g] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(iacc[g]),
+                                      _mm512_set1_ps(d * DX[g][i / K3_GQ_QK] * 0.125f), facc[g]);
+    }
+    for (int g = 0; g < G; g++) Y[g][o] = _mm512_reduce_add_ps(facc[g]);
+}
+
+void k3_iq2xs_rows_q8_P(float *const *Y, const int8_t *const *XQ, const float *const *DX, int T,
+                        const void *W, int in, int o0, int o1)
+{
+    const size_t rb = k3_gq_row_bytes(K3_GG_IQ2_XS, in);
+    __m512i idx4[4];
+    for (int j = 0; j < 4; j++)
+        idx4[j] = _mm512_setr_epi32(4*j, 4*j, 4*j, 4*j, 4*j+1, 4*j+1, 4*j+1, 4*j+1,
+                                    4*j+2, 4*j+2, 4*j+2, 4*j+2, 4*j+3, 4*j+3, 4*j+3, 4*j+3);
+    for (int o = o0; o < o1; o++) {
+        const BIQ2XS *b = (const BIQ2XS *)((const unsigned char *)W + (size_t)o * rb);
+        for (int t = 0; t < T; t += 4) {
+            const int G = T - t < 4 ? T - t : 4;
+            if (G == 4)      iq2xs_row_q8_g(Y + t, XQ + t, DX + t, b, in, o, 4, idx4);
+            else if (G == 3) iq2xs_row_q8_g(Y + t, XQ + t, DX + t, b, in, o, 3, idx4);
+            else if (G == 2) iq2xs_row_q8_g(Y + t, XQ + t, DX + t, b, in, o, 2, idx4);
+            else             iq2xs_row_q8_g(Y + t, XQ + t, DX + t, b, in, o, 1, idx4);
+        }
+    }
+}
+
 void k3_iq3xxs_rows_q8(float *y, const int8_t *xq, const float *dx, const void *W, int in,
                        int o0, int o1)
 {
@@ -555,6 +671,11 @@ void k3_iq3xxs_rows_q8(float *y, const int8_t *xq, const float *dx, const void *
     }
 }
 #else
+void k3_iq2xs_rows_q8_P(float *const *Y, const int8_t *const *XQ, const float *const *DX, int T,
+                        const void *W, int in, int o0, int o1)
+{
+    (void)Y; (void)XQ; (void)DX; (void)T; (void)W; (void)in; (void)o0; (void)o1;
+}
 void k3_iq2xs_rows_q8(float *y, const int8_t *xq, const float *dx, const void *W, int in,
                       int o0, int o1)
 {
