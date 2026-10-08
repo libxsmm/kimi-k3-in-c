@@ -28,6 +28,11 @@ _Static_assert(sizeof(BIQ3XXS) == 98, "iq3_xxs block");
 #ifndef K3_GQ_PF
 #define K3_GQ_PF 512
 #endif
+/* The expert kernels read a few hundred KB per (expert, thread) at random places, so they
+ * need the prefetch much further ahead: measured on GNR 140 -> 201 GB/s (512 -> 4096). */
+#ifndef K3_GQ_PF_IQ
+#define K3_GQ_PF_IQ 4096
+#endif
 
 static inline float h2f(uint16_t h)
 {
@@ -323,8 +328,8 @@ void k3_iq2xs_rows(float *y, const float *x, const void *W, int in, int o0, int 
         const BIQ2XS *b = (const BIQ2XS *)((const unsigned char *)W + (size_t)o * rb);
         __m512 a[4] = { _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps() };
         for (int i = 0; i < in; i += K3_GQ_QK, b++) {
-            _mm_prefetch((const char *)b + K3_GQ_PF, _MM_HINT_T0);
-            _mm_prefetch((const char *)b + K3_GQ_PF + 64, _MM_HINT_T0);
+            _mm_prefetch((const char *)b + K3_GQ_PF_IQ, _MM_HINT_T0);
+            _mm_prefetch((const char *)b + K3_GQ_PF_IQ + 64, _MM_HINT_T0);
             const float d = h2f(b->d);
             for (int j = 0; j < 4; j++) {
                 const __m512i mag = iq2xs_mag(b->qs + 8 * j);
@@ -354,8 +359,8 @@ void k3_iq3xxs_rows(float *y, const float *x, const void *W, int in, int o0, int
         const BIQ3XXS *b = (const BIQ3XXS *)((const unsigned char *)W + (size_t)o * rb);
         __m512 a[4] = { _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps() };
         for (int i = 0; i < in; i += K3_GQ_QK, b++) {
-            _mm_prefetch((const char *)b + K3_GQ_PF, _MM_HINT_T0);
-            _mm_prefetch((const char *)b + K3_GQ_PF + 64, _MM_HINT_T0);
+            _mm_prefetch((const char *)b + K3_GQ_PF_IQ, _MM_HINT_T0);
+            _mm_prefetch((const char *)b + K3_GQ_PF_IQ + 64, _MM_HINT_T0);
             const float d = h2f(b->d);
             const uint8_t *sas = b->qs + K3_GQ_QK / 4;
             for (int j = 0; j < 4; j++) {
@@ -415,8 +420,8 @@ void k3_iq2xs_rows_q8(float *y, const int8_t *xq, const float *dx, const void *W
         const BIQ2XS *b = (const BIQ2XS *)((const unsigned char *)W + (size_t)o * rb);
         __m512 facc = _mm512_setzero_ps();
         for (int i = 0; i < in; i += K3_GQ_QK, b++) {
-            _mm_prefetch((const char *)b + K3_GQ_PF, _MM_HINT_T0);
-            _mm_prefetch((const char *)b + K3_GQ_PF + 64, _MM_HINT_T0);
+            _mm_prefetch((const char *)b + K3_GQ_PF_IQ, _MM_HINT_T0);
+            _mm_prefetch((const char *)b + K3_GQ_PF_IQ + 64, _MM_HINT_T0);
             /* lane c: 2*s+1 of 16-weight chunk c */
             const __m128i s = _mm_loadl_epi64((const __m128i *)b->sc);
             const __m128i nib = _mm_unpacklo_epi8(_mm_and_si128(s, m4), _mm_and_si128(_mm_srli_epi16(s, 4), m4));
@@ -445,8 +450,8 @@ void k3_iq3xxs_rows_q8(float *y, const int8_t *xq, const float *dx, const void *
         const BIQ3XXS *b = (const BIQ3XXS *)((const unsigned char *)W + (size_t)o * rb);
         __m512 facc = _mm512_setzero_ps();
         for (int i = 0; i < in; i += K3_GQ_QK, b++) {
-            _mm_prefetch((const char *)b + K3_GQ_PF, _MM_HINT_T0);
-            _mm_prefetch((const char *)b + K3_GQ_PF + 64, _MM_HINT_T0);
+            _mm_prefetch((const char *)b + K3_GQ_PF_IQ, _MM_HINT_T0);
+            _mm_prefetch((const char *)b + K3_GQ_PF_IQ + 64, _MM_HINT_T0);
             const uint8_t *sas = b->qs + K3_GQ_QK / 4;
             __m512i iacc = _mm512_setzero_si512();
             for (int j = 0; j < 4; j++) {
