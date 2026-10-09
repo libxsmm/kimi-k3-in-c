@@ -1,0 +1,434 @@
+From 352b041bb4aead223a55e0f194b8b46b036a47d7 Mon Sep 17 00:00:00 2001
+From: egeorgan <evangelos.georganas@intel.com>
+Date: Thu, 8 Oct 2026 10:39:20 -0700
+Subject: [PATCH 1/2] Remote compute backend (LLAMA_REMOTE_BACKEND=socket):
+ vocab-only model load, decodes forwarded to an external engine (kimi-k3-in-c
+ --serve), recurrent-style single-sequence memory
+
+---
+ src/CMakeLists.txt    |   1 +
+ src/llama-context.cpp |  81 ++++++++++++++++++++++++
+ src/llama-context.h   |   5 ++
+ src/llama-model.cpp   |   5 ++
+ src/llama-remote.cpp  | 141 ++++++++++++++++++++++++++++++++++++++++++
+ src/llama-remote.h    |  79 +++++++++++++++++++++++
+ src/llama.cpp         |   5 ++
+ 7 files changed, 317 insertions(+)
+ create mode 100644 src/llama-remote.cpp
+ create mode 100644 src/llama-remote.h
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index afdaddc..523f6ba 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -32,6 +32,7 @@ set(LLAMA_CORE_SOURCES
+     llama-memory-hybrid-iswa.cpp
+     llama-memory-hybrid-idx.cpp
+     llama-memory-recurrent.cpp
++    llama-remote.cpp
+     llama-mmap.cpp
+     llama-model-loader.cpp
+     llama-model-saver.cpp
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 4f04db0..1570fa4 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -385,6 +385,21 @@ llama_context::llama_context(
+     }
+ 
+     // init the memory module
++    if (hparams.vocab_only && getenv("LLAMA_REMOTE_BACKEND")) {
++        remote = std::make_unique<llama_remote_client>(getenv("LLAMA_REMOTE_BACKEND"));
++        if (remote->n_vocab != model.vocab.n_tokens()) {
++            throw std::runtime_error(format("remote backend vocab %d != model vocab %d",
++                    remote->n_vocab, model.vocab.n_tokens()));
++        }
++        if (cparams.n_ctx > (uint32_t) remote->n_ctx) {
++            LLAMA_LOG_WARN("%s: n_ctx %u exceeds the remote engine's %d positions\n",
++                    __func__, cparams.n_ctx, remote->n_ctx);
++        }
++        if (output_reserve(params.n_seq_max) < params.n_seq_max) {
++            throw std::runtime_error("failed to reserve initial output buffer");
++        }
++        memory = std::make_unique<llama_memory_remote>(*remote);
++    }
+     if (!hparams.vocab_only) {
+         llama_memory_params params_mem = {
+             /*.type_k    =*/ params.type_k,
+@@ -1710,6 +1725,10 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
+ }
+ 
+ int llama_context::decode(const llama_batch_ext & batch_inp) {
++    if (remote) {
++        return decode_remote(batch_inp);
++    }
++
+     if (!memory) {
+         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
+         return encode(batch_inp);
+@@ -2113,6 +2132,68 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+ // output
+ //
+ 
++// One sequence, consecutive positions, token ids only: the engine owns every other
++// detail of the forward, and returns the logits rows the batch asked for.
++int llama_context::decode_remote(const llama_batch_ext & batch_inp) {
++    const size_t n = batch_inp.tokens.size();
++    if (n == 0) {
++        LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
++        return -1;
++    }
++    const int32_t pos0 = batch_inp.tokens[0].pos[0];
++    std::vector<int32_t> ids(n);
++    std::vector<uint8_t> want(n);
++    int32_t n_out = 0;
++    for (size_t i = 0; i < n; ++i) {
++        const auto & tok = batch_inp.tokens[i];
++        if (tok.has_embd || tok.pos[0] != pos0 + (int32_t) i) {
++            LLAMA_LOG_ERROR("%s: the remote backend takes consecutive token ids only\n", __func__);
++            return -1;
++        }
++        for (auto s : tok.seq_ids) {
++            if (s != 0) {
++                LLAMA_LOG_ERROR("%s: the remote backend serves sequence 0 only\n", __func__);
++                return -1;
++            }
++        }
++        ids[i]  = tok.id;
++        want[i] = (cparams.embeddings || tok.output) ? 1 : 0;
++        n_out  += want[i];
++    }
++    if (t_compute_start_us == 0) {
++        t_compute_start_us = ggml_time_us();
++    }
++    if (output_reserve(n_out) < (uint32_t) n_out) {
++        LLAMA_LOG_ERROR("%s: could not reserve space for %d outputs\n", __func__, n_out);
++        return -2;
++    }
++    output_swaps.clear();
++    try {
++        if (remote->decode(ids, pos0, want, logits.data) != 0) {
++            return -3;
++        }
++    } catch (const std::exception & e) {
++        LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
++        return -3;
++    }
++    n_outputs = n_out;
++    std::fill(output_ids.begin(), output_ids.end(), -1);
++    for (size_t i = 0, k = 0; i < n; ++i) {
++        if (want[i]) {
++            output_ids[i] = (int32_t) k++;
++        }
++    }
++    if (n == 1) {
++        n_eval++;
++        t_eval_us += ggml_time_us() - t_compute_start_us;
++    } else {
++        n_p_eval += n;
++        t_p_eval_us += ggml_time_us() - t_compute_start_us;
++    }
++    t_compute_start_us = 0;
++    return 0;
++}
++
+ uint32_t llama_context::output_reserve(int32_t n_outputs) {
+     const auto & hparams = model.hparams;
+     const auto & vocab   = model.vocab;
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 95b7226..8f05290 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -7,6 +7,7 @@
+ #include "llama-adapter.h"
+ #include "llama-impl.h"
+ #include "llama-memory.h"
++#include "llama-remote.h"
+ 
+ #include "ggml-cpp.h"
+ #include "ggml-opt.h"
+@@ -145,6 +146,7 @@ struct llama_context {
+ 
+     int encode(const llama_batch_ext & batch_inp);
+     int decode(const llama_batch_ext & batch_inp);
++    int decode_remote(const llama_batch_ext & batch_inp);
+ 
+     // compat version
+     int encode(const llama_batch & batch_inp);
+@@ -297,6 +299,9 @@ private:
+ 
+     llama_memory_ptr memory;
+ 
++    // set when decodes go to an external engine (LLAMA_REMOTE_BACKEND)
++    std::unique_ptr<llama_remote_client> remote;
++
+     // decode output (2-dimensional array: [n_outputs][n_vocab])
+     buffer_view<float> logits = {nullptr, 0};
+ 
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 742bcd5..41dd2aa 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1315,6 +1315,11 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
+     // everything past this point is not vocab-related
+     // for CLIP models, we only need to load tensors, no hparams
+     if (hparams.vocab_only || ml.get_arch() == LLM_ARCH_CLIP) {
++        // a remote backend serves this model: front ends still size contexts from these
++        if (hparams.vocab_only && getenv("LLAMA_REMOTE_BACKEND")) {
++            ml.get_key(LLM_KV_CONTEXT_LENGTH,   hparams.n_ctx_train, false);
++            ml.get_key(LLM_KV_EMBEDDING_LENGTH, hparams.n_embd,      false);
++        }
+         return;
+     }
+ 
+diff --git a/src/llama-remote.cpp b/src/llama-remote.cpp
+new file mode 100644
+index 0000000..9976f2e
+--- /dev/null
++++ b/src/llama-remote.cpp
+@@ -0,0 +1,141 @@
++#include "llama-remote.h"
++
++#include "llama-impl.h"
++
++#include <cerrno>
++#include <cstring>
++#include <stdexcept>
++
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <unistd.h>
++
++llama_remote_client::llama_remote_client(const std::string & path) {
++    fd = socket(AF_UNIX, SOCK_STREAM, 0);
++    if (fd < 0) {
++        throw std::runtime_error("remote backend: socket() failed");
++    }
++    sockaddr_un addr = {};
++    addr.sun_family = AF_UNIX;
++    if (path.size() >= sizeof(addr.sun_path)) {
++        throw std::runtime_error("remote backend: socket path too long");
++    }
++    std::memcpy(addr.sun_path, path.c_str(), path.size() + 1);
++    if (connect(fd, (const sockaddr *) &addr, sizeof(addr)) != 0) {
++        const int e = errno;
++        close(fd);
++        fd = -1;
++        throw std::runtime_error("remote backend: cannot connect to " + path + ": " + std::strerror(e));
++    }
++    request(LLAMA_REMOTE_INFO, 0, 0, 0);
++    int32_t info[4];
++    recv_all(info, sizeof(info));
++    n_vocab  = info[0];
++    n_ctx    = info[1];
++    n_embd   = info[2];
++    n_cached = info[3];
++    LLAMA_LOG_INFO("%s: connected to %s: n_vocab = %d, n_ctx = %d, n_embd = %d, n_cached = %d\n",
++            __func__, path.c_str(), n_vocab, n_ctx, n_embd, n_cached);
++}
++
++llama_remote_client::~llama_remote_client() {
++    if (fd >= 0) {
++        close(fd);
++    }
++}
++
++void llama_remote_client::send_all(const void * p, size_t n) {
++    const char * c = (const char *) p;
++    while (n > 0) {
++        const ssize_t k = write(fd, c, n);
++        if (k <= 0) {
++            if (k < 0 && errno == EINTR) {
++                continue;
++            }
++            throw std::runtime_error("remote backend: connection lost (write)");
++        }
++        c += k;
++        n -= (size_t) k;
++    }
++}
++
++void llama_remote_client::recv_all(void * p, size_t n) {
++    char * c = (char *) p;
++    while (n > 0) {
++        const ssize_t k = read(fd, c, n);
++        if (k <= 0) {
++            if (k < 0 && errno == EINTR) {
++                continue;
++            }
++            throw std::runtime_error("remote backend: connection lost (read)");
++        }
++        c += k;
++        n -= (size_t) k;
++    }
++}
++
++void llama_remote_client::request(uint32_t op, uint32_t n, int32_t pos0, uint32_t n_out) {
++    const uint32_t hdr[4] = { op, n, (uint32_t) pos0, n_out };
++    send_all(hdr, sizeof(hdr));
++}
++
++int llama_remote_client::decode(const std::vector<int32_t> & tokens, int32_t pos0,
++                                const std::vector<uint8_t> & want, float * logits) {
++    uint32_t n_out = 0;
++    for (uint8_t w : want) {
++        n_out += w != 0;
++    }
++    request(LLAMA_REMOTE_DECODE, (uint32_t) tokens.size(), pos0, n_out);
++    send_all(tokens.data(), tokens.size() * sizeof(int32_t));
++    send_all(want.data(), want.size());
++    int32_t status = 0;
++    recv_all(&status, sizeof(status));
++    if (status != 0) {
++        LLAMA_LOG_ERROR("%s: engine refused a batch of %zu tokens at position %d (status %d, engine holds %d)\n",
++                __func__, tokens.size(), pos0, status, n_cached);
++        return status;
++    }
++    recv_all(logits, (size_t) n_out * n_vocab * sizeof(float));
++    n_cached = pos0 + (int32_t) tokens.size();
++    return 0;
++}
++
++bool llama_remote_client::truncate(int32_t pos) {
++    request(LLAMA_REMOTE_TRUNCATE, 0, pos, 0);
++    int32_t r[2];
++    recv_all(r, sizeof(r));
++    n_cached = r[1];
++    return r[0] == 0;
++}
++
++void llama_remote_client::reset() {
++    request(LLAMA_REMOTE_RESET, 0, 0, 0);
++    int32_t status;
++    recv_all(&status, sizeof(status));
++    n_cached = 0;
++}
++
++void llama_memory_remote::clear(bool /*data*/) {
++    cl.reset();
++}
++
++bool llama_memory_remote::seq_rm(llama_seq_id /*seq_id*/, llama_pos p0, llama_pos p1) {
++    if (p0 < 0) {
++        p0 = 0;
++    }
++    if (p1 >= 0 && p1 < cl.n_cached) {
++        return false;   // removing a range in the middle needs positional memory
++    }
++    if (p0 >= cl.n_cached) {
++        return true;
++    }
++    return cl.truncate(p0);
++}
++
++void llama_memory_remote::state_write(llama_io_write_i &, llama_seq_id, llama_state_seq_flags) const {
++    throw std::runtime_error("remote backend: state save is not supported (run llama-server with --cache-ram 0 --ctx-checkpoints 0)");
++}
++
++void llama_memory_remote::state_read(llama_io_read_i &, llama_seq_id, llama_state_seq_flags) {
++    throw std::runtime_error("remote backend: state load is not supported");
++}
+diff --git a/src/llama-remote.h b/src/llama-remote.h
+new file mode 100644
+index 0000000..ea4ff00
+--- /dev/null
++++ b/src/llama-remote.h
+@@ -0,0 +1,79 @@
++#pragma once
++
++// Remote compute backend: llama.cpp keeps tokenization, chat templates, sampling and the
++// server, and sends every decode to an engine process over a UNIX socket
++// (LLAMA_REMOTE_BACKEND=/path/to/socket). The model is then loaded vocab-only.
++// Protocol (little endian), shared with the kimi-k3-in-c engine (k3 --serve):
++//   request:  u32 op, u32 n, i32 pos0, u32 n_out, then the op's payload
++//   INFO      -> i32 vocab, i32 n_ctx, i32 n_embd, i32 n_cached
++//   DECODE    payload i32 tokens[n], u8 want[n] -> i32 status, then n_out*vocab floats
++//   TRUNCATE  pos0 = first position to drop -> i32 status (0 ok), i32 n_cached
++//   RESET     -> i32 status
++
++#include "llama-memory.h"
++
++#include <cstdint>
++#include <string>
++#include <vector>
++
++enum llama_remote_op : uint32_t {
++    LLAMA_REMOTE_INFO     = 1,
++    LLAMA_REMOTE_DECODE   = 2,
++    LLAMA_REMOTE_TRUNCATE = 3,
++    LLAMA_REMOTE_RESET    = 4,
++};
++
++struct llama_remote_client {
++    explicit llama_remote_client(const std::string & path);
++    ~llama_remote_client();
++
++    int32_t n_vocab  = 0;
++    int32_t n_ctx    = 0;
++    int32_t n_embd   = 0;
++    int32_t n_cached = 0;   // positions the engine holds for the (single) sequence
++
++    // logits receives one row of n_vocab floats per want[i] != 0, in batch order
++    int  decode(const std::vector<int32_t> & tokens, int32_t pos0,
++                const std::vector<uint8_t> & want, float * logits);
++    bool truncate(int32_t pos);
++    void reset();
++
++private:
++    int fd = -1;
++    void request(uint32_t op, uint32_t n, int32_t pos0, uint32_t n_out);
++    void send_all(const void * p, size_t n);
++    void recv_all(void * p, size_t n);
++};
++
++// Memory module for a remote backend: one sequence, appended in order. Truncation is
++// whatever the engine supports (its current end, 0, or a checkpoint it holds); when it
++// fails, callers clear and re-process, as they do for recurrent models.
++struct llama_memory_remote : public llama_memory_i {
++    explicit llama_memory_remote(llama_remote_client & client) : cl(client) {}
++
++    llama_memory_context_ptr init_batch(llama_batch_allocr &, uint32_t, bool) override { return nullptr; }
++    llama_memory_context_ptr init_full() override { return nullptr; }
++    llama_memory_context_ptr init_update(llama_context *, bool) override { return nullptr; }
++
++    bool get_can_shift() const override { return false; }
++
++    void clear(bool data) override;
++
++    bool seq_rm  (llama_seq_id seq_id, llama_pos p0, llama_pos p1) override;
++    void seq_cp  (llama_seq_id, llama_seq_id, llama_pos, llama_pos) override {}
++    void seq_keep(llama_seq_id) override {}
++    void seq_add (llama_seq_id, llama_pos, llama_pos, llama_pos) override {}
++    void seq_div (llama_seq_id, llama_pos, llama_pos, int) override {}
++
++    // reported like recurrent memory: only the latest state is held, so callers re-process
++    // from 0 rather than truncate into the middle
++    llama_pos seq_pos_min(llama_seq_id) const override { return cl.n_cached - 1; }
++    llama_pos seq_pos_max(llama_seq_id) const override { return cl.n_cached - 1; }
++
++    std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override { return {}; }
++
++    void state_write(llama_io_write_i &, llama_seq_id, llama_state_seq_flags) const override;
++    void state_read (llama_io_read_i  &, llama_seq_id, llama_state_seq_flags) override;
++
++    llama_remote_client & cl;
++};
+diff --git a/src/llama.cpp b/src/llama.cpp
+index 9beb148..201ceb9 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -404,6 +404,11 @@ static struct llama_model * llama_model_load_from_file_impl(
+     // TODO: remove
+     ggml_time_init();
+ 
++    // a remote engine computes the forward: only the vocabulary and metadata are needed
++    if (getenv("LLAMA_REMOTE_BACKEND")) {
++        params.vocab_only = true;
++    }
++
+     if (!params.vocab_only && ggml_backend_reg_count() == 0) {
+         LLAMA_LOG_ERROR("%s: no backends are loaded. hint: use ggml_backend_load() or ggml_backend_load_all() to load a backend before calling this function\n", __func__);
+         return nullptr;
+-- 
+2.52.0
+

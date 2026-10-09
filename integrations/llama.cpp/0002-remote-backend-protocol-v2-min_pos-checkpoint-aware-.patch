@@ -1,0 +1,145 @@
+From 0e3926b22bc9c0b1683f6052123eb7ece754af8f Mon Sep 17 00:00:00 2001
+From: egeorgan <evangelos.georganas@intel.com>
+Date: Thu, 8 Oct 2026 10:55:23 -0700
+Subject: [PATCH 2/2] remote backend: protocol v2 (min_pos), checkpoint-aware
+ seq_pos_min, split prompt tail so the engine checkpoints before the assistant
+ header
+
+---
+ src/llama-context.cpp | 15 ++++++++++++++-
+ src/llama-remote.cpp  | 13 +++++++++----
+ src/llama-remote.h    | 17 +++++++++++------
+ 3 files changed, 34 insertions(+), 11 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 1570fa4..1bdeef4 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2169,7 +2169,20 @@ int llama_context::decode_remote(const llama_batch_ext & batch_inp) {
+     }
+     output_swaps.clear();
+     try {
+-        if (remote->decode(ids, pos0, want, logits.data) != 0) {
++        // the engine checkpoints its state after each multi-token batch; send a prompt's
++        // last few tokens separately so the checkpoint lands before the chat template's
++        // assistant header, where the next turn's re-rendered prompt diverges
++        static const size_t tail = getenv("LLAMA_REMOTE_TAIL") ? (size_t) atoi(getenv("LLAMA_REMOTE_TAIL")) : 8;
++        const size_t split = (tail > 0 && n > 2 * tail) ? n - tail : 0;
++        if (split > 0) {
++            const std::vector<llama_token> ids_a(ids.begin(), ids.begin() + split), ids_b(ids.begin() + split, ids.end());
++            const std::vector<uint8_t> want_a(want.begin(), want.begin() + split), want_b(want.begin() + split, want.end());
++            const size_t out_a = std::count(want_a.begin(), want_a.end(), (uint8_t) 1);
++            if (remote->decode(ids_a, pos0, want_a, logits.data) != 0 ||
++                remote->decode(ids_b, pos0 + (llama_pos) split, want_b, logits.data + out_a * remote->n_vocab) != 0) {
++                return -3;
++            }
++        } else if (remote->decode(ids, pos0, want, logits.data) != 0) {
+             return -3;
+         }
+     } catch (const std::exception & e) {
+diff --git a/src/llama-remote.cpp b/src/llama-remote.cpp
+index 9976f2e..80dbf6d 100644
+--- a/src/llama-remote.cpp
++++ b/src/llama-remote.cpp
+@@ -28,12 +28,13 @@ llama_remote_client::llama_remote_client(const std::string & path) {
+         throw std::runtime_error("remote backend: cannot connect to " + path + ": " + std::strerror(e));
+     }
+     request(LLAMA_REMOTE_INFO, 0, 0, 0);
+-    int32_t info[4];
++    int32_t info[5];
+     recv_all(info, sizeof(info));
+     n_vocab  = info[0];
+     n_ctx    = info[1];
+     n_embd   = info[2];
+     n_cached = info[3];
++    min_pos  = info[4];
+     LLAMA_LOG_INFO("%s: connected to %s: n_vocab = %d, n_ctx = %d, n_embd = %d, n_cached = %d\n",
+             __func__, path.c_str(), n_vocab, n_ctx, n_embd, n_cached);
+ }
+@@ -88,13 +89,15 @@ int llama_remote_client::decode(const std::vector<int32_t> & tokens, int32_t pos
+     request(LLAMA_REMOTE_DECODE, (uint32_t) tokens.size(), pos0, n_out);
+     send_all(tokens.data(), tokens.size() * sizeof(int32_t));
+     send_all(want.data(), want.size());
+-    int32_t status = 0;
+-    recv_all(&status, sizeof(status));
++    int32_t r[2] = { 0, 0 };
++    recv_all(r, sizeof(r));
++    const int32_t status = r[0];
+     if (status != 0) {
+         LLAMA_LOG_ERROR("%s: engine refused a batch of %zu tokens at position %d (status %d, engine holds %d)\n",
+                 __func__, tokens.size(), pos0, status, n_cached);
+         return status;
+     }
++    min_pos = r[1];
+     recv_all(logits, (size_t) n_out * n_vocab * sizeof(float));
+     n_cached = pos0 + (int32_t) tokens.size();
+     return 0;
+@@ -102,9 +105,10 @@ int llama_remote_client::decode(const std::vector<int32_t> & tokens, int32_t pos
+ 
+ bool llama_remote_client::truncate(int32_t pos) {
+     request(LLAMA_REMOTE_TRUNCATE, 0, pos, 0);
+-    int32_t r[2];
++    int32_t r[3];
+     recv_all(r, sizeof(r));
+     n_cached = r[1];
++    min_pos  = r[2];
+     return r[0] == 0;
+ }
+ 
+@@ -113,6 +117,7 @@ void llama_remote_client::reset() {
+     int32_t status;
+     recv_all(&status, sizeof(status));
+     n_cached = 0;
++    min_pos  = 0;
+ }
+ 
+ void llama_memory_remote::clear(bool /*data*/) {
+diff --git a/src/llama-remote.h b/src/llama-remote.h
+index ea4ff00..9b06747 100644
+--- a/src/llama-remote.h
++++ b/src/llama-remote.h
+@@ -5,13 +5,15 @@
+ // (LLAMA_REMOTE_BACKEND=/path/to/socket). The model is then loaded vocab-only.
+ // Protocol (little endian), shared with the kimi-k3-in-c engine (k3 --serve):
+ //   request:  u32 op, u32 n, i32 pos0, u32 n_out, then the op's payload
+-//   INFO      -> i32 vocab, i32 n_ctx, i32 n_embd, i32 n_cached
+-//   DECODE    payload i32 tokens[n], u8 want[n] -> i32 status, then n_out*vocab floats
+-//   TRUNCATE  pos0 = first position to drop -> i32 status (0 ok), i32 n_cached
++//   INFO      -> i32 vocab, i32 n_ctx, i32 n_embd, i32 n_cached, i32 min_pos
++//   DECODE    payload i32 tokens[n], u8 want[n] -> i32 status, i32 min_pos, then n_out*vocab floats
++//   TRUNCATE  pos0 = first position to drop -> i32 status (0 ok), i32 n_cached, i32 min_pos
+ //   RESET     -> i32 status
++// min_pos is the oldest position the engine can truncate to (it keeps state checkpoints)
+ 
+ #include "llama-memory.h"
+ 
++#include <algorithm>
+ #include <cstdint>
+ #include <string>
+ #include <vector>
+@@ -31,6 +33,7 @@ struct llama_remote_client {
+     int32_t n_ctx    = 0;
+     int32_t n_embd   = 0;
+     int32_t n_cached = 0;   // positions the engine holds for the (single) sequence
++    int32_t min_pos  = 0;   // oldest position a truncation can reach
+ 
+     // logits receives one row of n_vocab floats per want[i] != 0, in batch order
+     int  decode(const std::vector<int32_t> & tokens, int32_t pos0,
+@@ -65,9 +68,11 @@ struct llama_memory_remote : public llama_memory_i {
+     void seq_add (llama_seq_id, llama_pos, llama_pos, llama_pos) override {}
+     void seq_div (llama_seq_id, llama_pos, llama_pos, int) override {}
+ 
+-    // reported like recurrent memory: only the latest state is held, so callers re-process
+-    // from 0 rather than truncate into the middle
+-    llama_pos seq_pos_min(llama_seq_id) const override { return cl.n_cached - 1; }
++    // the state is not positional: report the oldest position the engine can truncate to,
++    // so callers re-process from 0 rather than ask for a cut it cannot make
++    llama_pos seq_pos_min(llama_seq_id) const override {
++        return cl.n_cached > 0 ? std::min(cl.min_pos, cl.n_cached - 1) : -1;
++    }
+     llama_pos seq_pos_max(llama_seq_id) const override { return cl.n_cached - 1; }
+ 
+     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override { return {}; }
+-- 
+2.52.0
+
