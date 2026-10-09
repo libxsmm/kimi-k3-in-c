@@ -1508,8 +1508,7 @@ static int k3_main(int argc, char **argv)
     }
     if (getenv("K3_EXPERT_Q8") && atoi(getenv("K3_EXPERT_Q8")) > 0) k3_expert_q8 = 1;
     if (getenv("K3_ACT_Q8") && atoi(getenv("K3_ACT_Q8")) > 0)
-        printf("Q8_0 matmuls: %s\n", k3_act_q8_on() == 2 ? "int8 activations per 32 on AMX-INT8, multi-token batches only"
-                                    : k3_act_q8_on() ? "int8 activations per 32 on AMX-INT8"
+        printf("Q8_0 matmuls: %s\n", k3_act_q8_on() ? "int8 activations per 32 on AMX-INT8"
                                                     : "K3_ACT_Q8 ignored, no AMX-INT8 here");
     if (ultra && budget_auto) {
         fprintf(stderr, "--ultra-low-memory uses explicit bounded budgets; use "

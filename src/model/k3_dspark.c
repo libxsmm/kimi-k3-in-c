@@ -599,7 +599,7 @@ int k3_dspark_propose(K3DSpark *d, int anchor, int pos, int nq, const void *lm_h
         {
             int lo, hi;
             k3_split(v1 - v0, &lo, &hi);
-            if (k3_act_q8_T(nq))
+            if (k3_act_q8_on())
                 k3_q80_rows_T(lg + v0 + lo, V, hs, H, nq,
                               (const unsigned char *)lm_head + (size_t)(v0 + lo - obase) * rb, H, 0, hi - lo);
             else
