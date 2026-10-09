@@ -17,6 +17,7 @@
 | [TESTING.md](TESTING.md) | what each gate proves |
 | [BENCHMARKING.md](BENCHMARKING.md) | how to measure without fooling yourself |
 | [REPRODUCE-TP.md](REPRODUCE-TP.md) | full model on a Xeon cluster, tensor parallel over MPI: 55.1 ms/token at TP=16, 42.5 ms/token at TP=32, step by step |
+| [LLAMACPP-SERVE.md](LLAMACPP-SERVE.md) | llama.cpp (`llama-server`) as the front end on one 2-socket Xeon 6980P node: kernel roofs, decode profile, 50-57 ms/token with DSpark, reproduction from an empty directory |
 | [ROADMAP.md](ROADMAP.md) | what is missing, in priority order |
 | [data/](data/) | the raw measurement output every table is transcribed from |
 

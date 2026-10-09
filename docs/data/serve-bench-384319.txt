@@ -1,0 +1,73 @@
+pcl-gnrap01.sc.intel.com
+Thu Oct  8 09:30:34 PM PDT 2026
+9567736 serve: SIGSEGV/SIGBUS handler prints rank, fault address and a backtrace
+a09dbbd TP large gathers: rank-wide buffer parity (a per-thread turn drifted after serial gathers, so threads used different halves and could read a stale or in-flight half)
+  after cleanup: 0 engine processes, 1501 GB available
+
+=== serve base:  
+  turn1  prompt  100 tok (cached    0)   23.7 tok/s | gen  64 tok  12.22 tok/s ( 81.8 ms/tok) | 'The capital of France is Paris.'
+  turn2  prompt   45 tok (cached  100)   23.6 tok/s | gen  66 tok  12.29 tok/s ( 81.4 ms/tok) | 'The capital of Germany is Berlin.'
+  code   prompt  123 tok (cached    0)   23.7 tok/s | gen 512 tok  11.75 tok/s ( 85.1 ms/tok) | ''
+  long   prompt 1296 tok (cached    0)   21.7 tok/s | gen 256 tok  10.00 tok/s (100.0 ms/tok) | ''
+  code2  prompt  123 tok (cached    0)   23.3 tok/s | gen 512 tok  11.99 tok/s ( 83.4 ms/tok) | ''
+serve: client gone after 1 requests, 0 tokens (0 replayed), 0.0 s busy; batches 0.0 s
+serve: client gone after 1425 requests, 3094 tokens (0 replayed), 197.6 s busy; batches 76.4 s
+  after cleanup: 0 engine processes, 1501 GB available
+
+=== serve amx: K3_PREFILL_AMX=1 K3_ACT_Q8=1 
+  turn1  prompt  100 tok (cached    0)   36.8 tok/s | gen  64 tok  11.60 tok/s ( 86.2 ms/tok) | 'The capital of France is Paris.'
+  turn2  prompt   45 tok (cached  100)   28.0 tok/s | gen  72 tok  11.73 tok/s ( 85.3 ms/tok) | 'The capital of Germany is Berlin.'
+  code   prompt  123 tok (cached    0)   41.2 tok/s | gen 512 tok  11.17 tok/s ( 89.5 ms/tok) | ''
+  long   prompt 1296 tok (cached    0)   78.3 tok/s | gen 256 tok   9.07 tok/s (110.3 ms/tok) | ''
+  code2  prompt  123 tok (cached    0)   41.1 tok/s | gen 512 tok  11.46 tok/s ( 87.2 ms/tok) | ''
+serve: client gone after 1 requests, 0 tokens (0 replayed), 0.0 s busy; batches 0.0 s
+serve: client gone after 1431 requests, 3100 tokens (0 replayed), 156.0 s busy; batches 26.8 s
+  after cleanup: 0 engine processes, 1501 GB available
+
+=== serve amx_ds3: K3_PREFILL_AMX=1 K3_ACT_Q8=1 --dspark /scratch/egeorgan/models/Kimi-K3-DSpark --dspark-n 3
+  turn1  prompt  100 tok (cached    0)   36.3 tok/s | gen  64 tok  19.85 tok/s ( 50.4 ms/tok) | 'The capital of France is Paris.'
+  turn2  prompt   45 tok (cached  100)   28.0 tok/s | gen  72 tok  16.93 tok/s ( 59.1 ms/tok) | 'The capital of Germany is Berlin.'
+  code   prompt  123 tok (cached    0)   40.8 tok/s | gen 512 tok  17.42 tok/s ( 57.4 ms/tok) | ''
+  long   prompt 1296 tok (cached    0)   77.5 tok/s | gen 256 tok  13.05 tok/s ( 76.6 ms/tok) | ''
+  code2  prompt  123 tok (cached    0)   40.7 tok/s | gen 512 tok  17.72 tok/s ( 56.4 ms/tok) | ''
+serve: client gone after 1 requests, 0 tokens (0 replayed), 0.0 s busy; batches 0.0 s (draft context 0.00 s)
+serve: client gone after 1431 requests, 3100 tokens (0 replayed), 115.8 s busy; DSpark 430 blocks, 2.28 accepted/block, 981 answered from drafts, draft 17.1 ms/block, verify+fix 171.8 ms/block; batches 31.4 s (draft context 0.61 s)
+  after cleanup: 0 engine processes, 1501 GB available
+
+=== serve amx_ds4: K3_PREFILL_AMX=1 K3_ACT_Q8=1 --dspark /scratch/egeorgan/models/Kimi-K3-DSpark --dspark-n 4
+  turn1  prompt  100 tok (cached    0)   36.4 tok/s | gen  64 tok  20.59 tok/s ( 48.6 ms/tok) | 'The capital of France is Paris.'
+  turn2  prompt   45 tok (cached  100)   27.9 tok/s | gen  72 tok  17.87 tok/s ( 56.0 ms/tok) | 'The capital of Germany is Berlin.'
+  code   prompt  123 tok (cached    0)   40.9 tok/s | gen 512 tok  17.97 tok/s ( 55.6 ms/tok) | ''
+  long   prompt 1296 tok (cached    0)   77.3 tok/s | gen 256 tok  12.30 tok/s ( 81.3 ms/tok) | ''
+  code2  prompt  123 tok (cached    0)   40.6 tok/s | gen 512 tok  18.25 tok/s ( 54.8 ms/tok) | ''
+serve: client gone after 1 requests, 0 tokens (0 replayed), 0.0 s busy; batches 0.0 s (draft context 0.00 s)
+serve: client gone after 1431 requests, 3100 tokens (0 replayed), 110.7 s busy; DSpark 370 blocks, 2.83 accepted/block, 1041 answered from drafts, draft 21.4 ms/block, verify+fix 197.0 ms/block; batches 27.1 s (draft context 0.58 s)
+  after cleanup: 0 engine processes, 1501 GB available
+
+=== serve q8: K3_ACT_Q8=1 
+  turn1  prompt  100 tok (cached    0)   19.3 tok/s | gen  64 tok  11.58 tok/s ( 86.3 ms/tok) | 'The capital of France is Paris.'
+  turn2  prompt   45 tok (cached  100)   19.6 tok/s | gen  66 tok  11.75 tok/s ( 85.1 ms/tok) | 'The capital of Germany is Berlin.'
+  code   prompt  123 tok (cached    0)   19.9 tok/s | gen 512 tok  11.21 tok/s ( 89.2 ms/tok) | ''
+  long   prompt 1296 tok (cached    0)   17.7 tok/s | gen 256 tok   9.06 tok/s (110.4 ms/tok) | ''
+  code2  prompt  123 tok (cached    0)   19.8 tok/s | gen 512 tok  11.48 tok/s ( 87.1 ms/tok) | ''
+serve: client gone after 1 requests, 0 tokens (0 replayed), 0.0 s busy; batches 0.0 s
+serve: client gone after 1425 requests, 3094 tokens (0 replayed), 221.5 s busy; batches 93.1 s
+  after cleanup: 0 engine processes, 1501 GB available
+
+=== CLI (main checkout, MTP branch): AMX prefill + int8, 1k prompt, 256 tokens
+  aq: rc=0 256 tokens in 38.7 s, 0.15 s/token average 
+  dq3: rc=0 DSpark: 116 blocks, 348 drafted, 138 accepted (1.19 per block, 2.19 tokens per verify incl. the bonus); draft 24.1 ms/block, context 243.0 ms total, verify 192.0 ms/block, accept/rollback 6.9 ms/block 256 tokens in 38.6 s, 0.15 s/token average 
+
+=== exactness / determinism
+  base     code repeat: identical
+  amx      code repeat: identical
+  amx_ds3  code repeat: identical
+  amx_ds4  code repeat: identical
+  q8       code repeat: identical
+  t1: amx vs amx_ds3: identical    amx vs amx_ds4: identical    amx vs q8: identical
+  t2: amx vs amx_ds3: identical    amx vs amx_ds4: identical    amx vs q8: differ at char 17 (len 309/255)
+  c1: amx vs amx_ds3: identical    amx vs amx_ds4: identical    amx vs q8: differ at char 478 (len 2253/2288)
+  l1: amx vs amx_ds3: identical    amx vs amx_ds4: identical    amx vs q8: identical
+  c2: amx vs amx_ds3: identical    amx vs amx_ds4: identical    amx vs q8: differ at char 478 (len 2253/2288)
+  CLI dq3 vs aq: identical (256 tokens)
+Thu Oct  8 10:08:00 PM PDT 2026
