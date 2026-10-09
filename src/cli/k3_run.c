@@ -60,6 +60,8 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
+#include <execinfo.h>
+#include <signal.h>
 #endif
 
 #include "k3_portable_io.h"   /* getline() shim for MinGW; see the header for why */
@@ -1067,12 +1069,32 @@ static int srv_minpos(const Srv *s, int vis)
     return m;
 }
 
+static void srv_segv(int sig, siginfo_t *si, void *uc)
+{
+    (void)uc;
+    char msg[128];
+    const int n = snprintf(msg, sizeof msg, "serve: rank %d signal %d at address %p, backtrace (addr2line -f -e k3 +offset):\n",
+                           k3_tp.rank, sig, si->si_addr);
+    if (write(2, msg, (size_t)n) < 0) _exit(128 + sig);
+    void *bt[48];
+    backtrace_symbols_fd(bt, backtrace(bt, 48), 2);
+    _exit(128 + sig);
+}
+
 static int serve_run(const char *path, Weights *w, const K3Cfg *c, K3Cache *cache, int tmax,
                      float *h, float *br, float *ks, float *sc, float *lg, int *seq, size_t kst,
                      K3DSpark *dsp, int spec_n, float *spec_snap)
 {
     Srv s;
     memset(&s, 0, sizeof s);
+    {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_sigaction = srv_segv;
+        sa.sa_flags = SA_SIGINFO;
+        sigaction(SIGSEGV, &sa, NULL);
+        sigaction(SIGBUS, &sa, NULL);
+    }
     s.w = w; s.c = c; s.cache = cache;
     s.h = h; s.br = br; s.ks = ks; s.sc = sc; s.lg = lg;
     s.hist = seq; s.kst = kst; s.dsp = dsp; s.spec_snap = spec_snap;
