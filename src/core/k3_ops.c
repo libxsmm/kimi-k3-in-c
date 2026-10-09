@@ -201,12 +201,14 @@ static int tp_big(int total, int ll)
     return !off && !ll && k3_tp.big && 2L * total <= k3_tp.big_cap;
 }
 
-static __thread unsigned tp_big_turn;
+/* rank-wide: a per-thread turn drifts when serial callers gather, and a serial gather
+ * then overwrites the half other ranks are still copying out of */
+static unsigned tp_big_turn;
 static void tp_big_gather(const K3Seg *seg, int nseg, int total)
 {
     const int P = k3_tp.size, me = k3_tp.rank;
-    const long base = (long)(tp_big_turn++ & 1) * (k3_tp.big_cap / 2);
     k3_sync();                                   /* every thread's rows are written */
+    const long base = (long)(tp_big_turn & 1) * (k3_tp.big_cap / 2);
     const double t0 = k3_prof_on && k3_tid() == 0 ? k3_prof_now() : 0.0;
     {
         float *dst = k3_tp.big[me] + base;
@@ -239,6 +241,7 @@ static void tp_big_gather(const K3Seg *seg, int nseg, int total)
     }
     k3_sync();
     if (k3_tid() == 0) {
+        tp_big_turn++;                           /* read only after the next gather's first sync */
         k3_tp.calls++;
         k3_tp.floats += (double)total;
         if (k3_prof_on) k3_prof_s[K3P_COMM] += k3_prof_now() - t0;
