@@ -132,7 +132,7 @@ mkdir k3ws && cd k3ws
 git clone --branch feauture_run_2bit_llamacpp_frontend_mtp https://github.com/libxsmm/kimi-k3-in-c
 git clone --branch iq1-narrow https://github.com/unslothai/llama.cpp
 git -C llama.cpp checkout ef45f21
-git -C llama.cpp -c user.name=k3 -c user.email=k3@localhost am ../kimi-k3-in-c/integrations/llama.cpp/*.patch
+git -C llama.cpp -c user.name=k3 -c user.email=k3@localhost am "$PWD"/kimi-k3-in-c/integrations/llama.cpp/*.patch
 ```
 
 ### 2. Models
