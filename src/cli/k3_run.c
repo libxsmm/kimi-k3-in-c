@@ -2745,6 +2745,16 @@ static int k3_main(int argc, char **argv)
         }
         printf("  weights read per step %.2f GB%s -> %.1f GB/s effective\n",
                wb / 1e9, k3_tp.local ? " per rank" : "", wb / 1e9 / (prof_wall / prof_steps));
+        /* stdout is /dev/null off rank 0 */
+        if (k3_tp.size > 1 && getenv("K3_PROF_RANKS")) {
+            char line[1024];
+            int n = snprintf(line, sizeof line, "rank %d ms/step:", k3_tp.rank);
+            for (int i = 0; i < K3P_N && n < (int)sizeof line - 32; i++)
+                if (k3_prof_s[i] > 0.0)
+                    n += snprintf(line + n, sizeof line - n, " %s=%.3f", k3_prof_name[i],
+                                  k3_prof_s[i] * ms);
+            fprintf(stderr, "%s\n", line);
+        }
     }
 
     FILE *f = k3_tp.rank == 0 ? fopen(outp, "w") : NULL;

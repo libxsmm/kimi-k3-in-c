@@ -268,6 +268,10 @@ $(BIN)/bench_gemv_tp: benchmarks/bench_gemv_tp.c $(BUILD)/src/core/k3_ops.o $(BU
 $(BIN)/bench_amx: benchmarks/bench_amx.c $(BUILD)/src/core/k3_amx.o $(BUILD)/src/core/k3_ops.o $(BUILD)/src/core/k3_gq.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
+# One rank's routed-expert decode pattern (random top-k, team split, barriers) from DRAM.
+$(BIN)/bench_expert_stream: benchmarks/bench_expert_stream.c $(BUILD)/src/core/k3_gq.o $(BUILD)/src/core/k3_amx.o $(BUILD)/src/core/k3_ops.o | $(BIN)
+	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
+
 # MPI builds only: latency of the collective shapes tensor parallelism uses.
 $(BIN)/bench_allgather: benchmarks/bench_allgather.c $(BUILD)/src/par/k3_mpi.o \
                         $(BUILD)/src/core/k3_ops.o $(BUILD)/src/core/k3_gq.o $(BUILD)/src/core/k3_amx.o | $(BIN)
