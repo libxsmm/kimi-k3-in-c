@@ -620,7 +620,8 @@ static void k3_fatal_bound(const char *what, long value, long limit)
  * a team, so a slot must not be live across a call that uses the same slot. */
 enum { K3S_MLA_SC, K3S_MOE_AN, K3S_ROUTER_CHOICE, K3S_ROUTER_SCORE, K3S_MOE_SCORE,
        K3S_MXFP4_XD, K3S_PREFILL, K3S_SEGS, K3S_KDA_STATE, K3S_XBF, K3S_QKV, K3S_XQ8,
-       K3S_AMX0, K3S_AMX1, K3S_AMXB, K3S_AMXE, K3S_AR, K3S_MT, K3S_MTAN, K3S_MTE, K3S_N };
+       K3S_AMX0, K3S_AMX1, K3S_AMXB, K3S_AMXE, K3S_AR, K3S_MT, K3S_MTAN, K3S_MTE, K3S_XQT,
+       K3S_N };
 #define K3S_MAXT 1024
 static void  *k3s_buf[K3S_MAXT][K3S_N];
 static size_t k3s_cap[K3S_MAXT][K3S_N];
@@ -2014,6 +2015,17 @@ static int expert_spans(int nq, int n, int *sj, int *s0, int *s1)
 
 static int mt_grp;                         /* int8 GGUF experts seen: grouping applies */
 
+/* K3_MOE_FUSE=0 off: each thread quantizes z and the acts it reads itself, instead of a
+ * team split and a barrier for each; the quantized values are the same. */
+static int moe_fuse(void)
+{
+    static int on = -1;
+    if (on < 0) on = !(getenv("K3_MOE_FUSE") && !strcmp(getenv("K3_MOE_FUSE"), "0"));
+    return on;
+}
+static int8_t *moe_zq_sh, *moe_aq_sh;      /* the shared buffers of the unfused path */
+static float  *moe_zdx_sh, *moe_adx_sh;
+
 static void moe_routed(float *accL, const float *z, const K3MoeW *w, const K3ExpertQ *q,
                        const int *eidx, const float *wq, int nq, const K3Cfg *c,
                        float *buf, K3Seg extra)
@@ -2048,21 +2060,31 @@ static void moe_routed(float *accL, const float *z, const K3MoeW *w, const K3Exp
     }
 
     /* int8 activations for GGUF experts (K3_EXPERT_Q8): z once here, act after its gather */
-    static int8_t *zq, *aq;
-    static float  *zdx, *adx;
+    int8_t *zq = NULL, *aq = NULL;
+    float  *zdx = NULL, *adx = NULL;
     const int nzb = L / K3_GQ_QK, nab = I / K3_GQ_QK;
     const int q8 = q && nq > 0 && k3_expert_q8 && q[0].qt1 != K3_EQ_MXFP4 &&
                    k3_gq_have_q8() && L % K3_GQ_QK == 0 && I % K3_GQ_QK == 0;
-    if (q8) {
+    const int fuse = q8 && moe_fuse();
+    if (fuse) {
+        mt_grp = 1;
+        unsigned char *own = (unsigned char *)k3_scratch(K3S_XQT,
+            (size_t)L + I + 64 + sizeof(float) * ((size_t)nzb + nab), "int8 activations");
+        zq = (int8_t *)own; aq = zq + L;
+        zdx = (float *)(own + (((size_t)L + I + 63) & ~(size_t)63)); adx = zdx + nzb;
+        k3_gq_quant_x(zq, zdx, z, L);
+    } else if (q8) {
         mt_grp = 1;
         if (k3_tid() == 0) {
             const size_t nb8 = (size_t)L + (size_t)nq * I;
             unsigned char *pool = (unsigned char *)k3_scratch(K3S_XQ8,
                 nb8 + 64 + sizeof(float) * ((size_t)nzb + (size_t)nq * nab), "int8 activations");
-            zq = (int8_t *)pool; aq = zq + L;
-            zdx = (float *)(pool + ((nb8 + 63) & ~(size_t)63)); adx = zdx + nzb;
+            moe_zq_sh = (int8_t *)pool; moe_aq_sh = moe_zq_sh + L;
+            moe_zdx_sh = (float *)(pool + ((nb8 + 63) & ~(size_t)63));
+            moe_adx_sh = moe_zdx_sh + nzb;
         }
         k3_sync();
+        zq = moe_zq_sh; aq = moe_aq_sh; zdx = moe_zdx_sh; adx = moe_adx_sh;
         int lo, hi;
         k3_split(nzb, &lo, &hi);
         for (int b = lo; b < hi; b++)
@@ -2103,7 +2125,7 @@ static void moe_routed(float *accL, const float *z, const K3MoeW *w, const K3Exp
         if (extra.p) sg[ng++] = extra;
         k3_tp_gather(sg, ng);
     }
-    if (q8) {
+    if (q8 && !fuse) {
         int lo, hi;
         k3_split(nq * nab, &lo, &hi);
         for (int b = lo; b < hi; b++) {
@@ -2131,9 +2153,11 @@ static void moe_routed(float *accL, const float *z, const K3MoeW *w, const K3Exp
         for (int t = 0; t < ns; t++) {
             const int j = sj[t], r0 = l0 + s0[t], r1 = l0 + s1[t];
             if (r1 <= r0) continue;
+            if (fuse) k3_gq_quant_x(aq, adx, act + (size_t)j * I, I);
             if (q)
                 eq_rows(edn + (size_t)j * L, act + (size_t)j * I, ad ? ad + (size_t)j * I : NULL,
-                        q8 ? aq + (size_t)j * I : NULL, q8 ? adx + (size_t)j * nab : NULL,
+                        !q8 ? NULL : fuse ? aq : aq + (size_t)j * I,
+                        !q8 ? NULL : fuse ? adx : adx + (size_t)j * nab,
                         q[j].p2, q[j].s2, q[j].qt2, I, r0, r1, sliced ? l0 : 0, G, q[j].ilv);
             else
                 matmul_f32_rows(edn + (size_t)j * L, act + (size_t)j * I,
@@ -2290,13 +2314,25 @@ static void moe_routed_mt(float *AC, const float *Z, float *SA, int T, const K3M
     float  *ADX = ZDX + (size_t)T * nzb;            /* [NP][nab] */
     int8_t *ZQ  = (int8_t *)(((uintptr_t)(ADX + (size_t)NP * nab) + 63) & ~(uintptr_t)63);
     int8_t *AQ  = ZQ + (size_t)T * L;               /* [NP][I]  */
-    {
+    const int fuse = moe_fuse();
+    int8_t *AQo = NULL;                     /* fused: [G][I] of the group at hand */
+    float  *ADXo = NULL;
+    if (fuse) {
+        const size_t nb8 = (size_t)T * L + (size_t)K3_MT_MAX * I;
+        const size_t nsc = (size_t)T * nzb + (size_t)K3_MT_MAX * nab;
+        unsigned char *own = (unsigned char *)k3_scratch(
+            K3S_XQT, nb8 + 64 + sizeof(float) * nsc, "int8 activations");
+        ZQ = (int8_t *)own; AQo = ZQ + (size_t)T * L;
+        ZDX = (float *)(own + ((nb8 + 63) & ~(size_t)63));
+        ADXo = ZDX + (size_t)T * nzb;
+        k3_gq_quant_x(ZQ, ZDX, Z, T * L);
+    } else {
         int lo, hi;
         k3_split(T * nzb, &lo, &hi);
         for (int b = lo; b < hi; b++)
             k3_gq_quant_x(ZQ + (size_t)b * K3_GQ_QK, ZDX + b, Z + (size_t)b * K3_GQ_QK, K3_GQ_QK);
+        k3_sync();
     }
-    k3_sync();
 
     /* gate|up and SiTU over (distinct expert, row) items, weighted by the expert's token
      * count so threads get equal work; boundaries are the same ceil at every thread */
@@ -2347,7 +2383,7 @@ static void moe_routed_mt(float *AC, const float *Z, float *SA, int T, const K3M
         if (ng) k3_tp_gather(sg, ng);
         else k3_sync();
     }
-    {
+    if (!fuse) {
         int lo, hi;
         k3_split(NP * nab, &lo, &hi);
         for (int b = lo; b < hi; b++) {
@@ -2356,8 +2392,8 @@ static void moe_routed_mt(float *AC, const float *Z, float *SA, int T, const K3M
             const size_t off = (size_t)pr * I + (size_t)(b % nab) * K3_GQ_QK;
             k3_gq_quant_x(AQ + off, ADX + b, ACT + off, K3_GQ_QK);
         }
+        k3_sync();
     }
-    k3_sync();
 
     {
         long tot = 0;
@@ -2380,7 +2416,13 @@ static void moe_routed_mt(float *AC, const float *Z, float *SA, int T, const K3M
             for (int g = 0; g < G; g++) {
                 const int pr = mtu_pair[u][g];
                 yd[g] = EDN + (size_t)pr * L;
-                xq[g] = AQ + (size_t)pr * I; dx[g] = ADX + (size_t)pr * nab;
+                if (fuse) {
+                    xq[g] = AQo + (size_t)g * I; dx[g] = ADXo + (size_t)g * nab;
+                    k3_gq_quant_x(AQo + (size_t)g * I, ADXo + (size_t)g * nab,
+                                  ACT + (size_t)pr * I, I);
+                } else {
+                    xq[g] = AQ + (size_t)pr * I; dx[g] = ADX + (size_t)pr * nab;
+                }
             }
             grp_rows(yd, xq, dx, G, q->p2, q->qt2, I, r0, r1, sliced ? l0 : 0);
         }

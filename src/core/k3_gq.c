@@ -534,11 +534,28 @@ void k3_gq_quant_x(int8_t *xq, float *dx, const float *x, int n)
 {
     for (int b = 0; b < n / K3_GQ_QK; b++) {
         const float *xb = x + (size_t)b * K3_GQ_QK;
+#if defined(K3_GQ_AVX512)
+        /* max is order-free, and vcvtps2dq rounds to nearest even as lrintf does */
+        __m512 m = _mm512_setzero_ps();
+        for (int j = 0; j < K3_GQ_QK; j += 16)
+            m = _mm512_max_ps(m, _mm512_abs_ps(_mm512_loadu_ps(xb + j)));
+        const float amax = _mm512_reduce_max_ps(m);
+#else
         float amax = 0.0f;
         for (int j = 0; j < K3_GQ_QK; j++) amax = fmaxf(amax, fabsf(xb[j]));
+#endif
         const float d = amax / 127.0f, id = d > 0.0f ? 1.0f / d : 0.0f;
         dx[b] = d;
+#if defined(K3_GQ_AVX512)
+        const __m512 vi = _mm512_set1_ps(id);
+        for (int j = 0; j < K3_GQ_QK; j += 16) {
+            const __m512 v = _mm512_mul_ps(_mm512_loadu_ps(xb + j), vi);
+            _mm_storeu_si128((__m128i *)(xq + (size_t)b * K3_GQ_QK + j),
+                             _mm512_cvtepi32_epi8(_mm512_cvtps_epi32(v)));
+        }
+#else
         for (int j = 0; j < K3_GQ_QK; j++) xq[(size_t)b * K3_GQ_QK + j] = (int8_t)lrintf(xb[j] * id);
+#endif
     }
 }
 

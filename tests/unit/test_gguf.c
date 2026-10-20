@@ -130,6 +130,35 @@ static void test_kernels(void)
            k3_amx_q8_ok() ? "; AMX-INT8 q8_0 batch == one token" : "");
 }
 
+/* k3_gq_quant_x equals the scalar definition to the bit: exact ties (amax 127 makes the
+ * scale 1, so x * id lands on k + 0.5 and must round to even), all-zero and signed-zero
+ * blocks, one huge outlier, tiny values and a negative maximum */
+static void test_quant_x(void)
+{
+    const int n = 9 * 256, nb = n / 256;
+    float *x = (float *)malloc(sizeof(float) * n);
+    int8_t *q = (int8_t *)malloc(n), *r = (int8_t *)malloc(n);
+    float *d = (float *)malloc(sizeof(float) * nb), *e = (float *)malloc(sizeof(float) * nb);
+    for (int i = 0; i < n; i++) x[i] = (float)((int)(rnd() % 20001) - 10000) / 997.0f;
+    for (int i = 0; i < 255; i++) x[i] = (float)(i % 254 - 127) + 0.5f;
+    x[255] = 127.0f;
+    for (int i = 256; i < 512; i++) x[i] = (i & 1) ? -0.0f : 0.0f;
+    x[512 + 7] = 3.0e30f;
+    for (int i = 768; i < 1024; i++) x[i] = (float)(i - 900) * 1e-30f;
+    for (int i = 1024; i < 1280; i++) x[i] = -(float)(i - 1024) * 0.5f;     /* amax at a negative */
+    for (int b = 0; b < nb; b++) {
+        float amax = 0.0f;
+        for (int j = 0; j < 256; j++) amax = fmaxf(amax, fabsf(x[b * 256 + j]));
+        const float dd = amax / 127.0f, id = dd > 0.0f ? 1.0f / dd : 0.0f;
+        e[b] = dd;
+        for (int j = 0; j < 256; j++) r[b * 256 + j] = (int8_t)lrintf(x[b * 256 + j] * id);
+    }
+    k3_gq_quant_x(q, d, x, n);
+    CHECK(!memcmp(q, r, (size_t)n), "quant_x: int8 values differ from the scalar definition");
+    CHECK(!memcmp(d, e, sizeof(float) * nb), "quant_x: scales differ from the scalar definition");
+    free(x); free(q); free(r); free(d); free(e);
+}
+
 /* ggml MXFP4 blocks repacked to the engine layout dequantise to the same values */
 static void test_mxfp4(void)
 {
@@ -227,6 +256,7 @@ static void test_reader(const char *dir)
 int main(int argc, char **argv)
 {
     test_kernels();
+    test_quant_x();
     test_mxfp4();
     test_reader(argc > 1 ? argv[1] : ".");
     if (fails) { printf("test_gguf: %d FAILURE(S)\n", fails); return 1; }
