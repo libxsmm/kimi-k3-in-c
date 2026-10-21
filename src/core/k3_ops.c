@@ -3148,6 +3148,19 @@ static int moe_experts_amx(float *AC, const float *Z, const float *SC, int T,
     k3_amx_pack_rows(amx_xv[0], Z, L, mx.mapz, mx.npad, L);
     k3_amx_gemm_groups(mx.gu, 2 * mx.ng, amx_xv[0], L, i0, i1);
     k3_sync();
+    /* act parts: rank r's rows [bnd[r], bnd[r+1]) of act form one contiguous region of
+     * actT, which the gather copies as is; inside it the layout is pair-major when every
+     * boundary is a multiple of 32, so writes and the down packing both run contiguous */
+    int bnd[65], parts = 0;
+#if defined(K3_AVX512) && defined(__AVX512BF16__)
+    if (ni % 16 == 0 && k3_tp.size <= 64) {
+        parts = k3_tp.size;
+        for (int r = 0; r <= k3_tp.size; r++) {
+            bnd[r] = (int)((long)I * r / k3_tp.size);
+            if (bnd[r] % 32) parts = 0;
+        }
+    }
+#endif
 #if defined(K3_AVX512) && defined(__AVX512BF16__)
     if (ni % 16 == 0) {
         /* a 16-position tile is one expert's, its valid pairs consecutive columns: 16 pairs
@@ -3174,6 +3187,12 @@ static int moe_experts_amx(float *AC, const float *Z, const float *SC, int T,
                     const __m512 a = _mm512_mul_ps(_mm512_mul_ps(b1, tanh512(_mm512_mul_ps(g, ib1))), sg);
                     v[j] = _mm512_mul_ps(a, _mm512_mul_ps(b2, tanh512(_mm512_mul_ps(u, ib2))));
                 } else v[j] = _mm512_setzero_ps();
+            }
+            if (parts) {
+                uint16_t *R = mx.actT + (size_t)i0 * npe + r;
+                for (int j = 0; j < nv; j++)
+                    _mm256_storeu_epi16(R + (size_t)(col0 + j) * ni, (__m256i)_mm512_cvtneps_pbh(v[j]));
+                continue;
             }
             v512_tr16(v);
             const __mmask16 m = v512_tail(nv);
@@ -3205,7 +3224,8 @@ static int moe_experts_amx(float *AC, const float *Z, const float *SC, int T,
     }
 
     /* down: every expert's act through its rows [l0, l1) */
-    k3_amx_pack_cols_bf16(amx_xv[1], mx.actT, npe, mx.mapa, mx.npad, I);
+    if (parts) k3_amx_pack_parts_bf16(amx_xv[1], mx.actT, npe, bnd, parts, mx.mapa, mx.npad, I);
+    else       k3_amx_pack_cols_bf16(amx_xv[1], mx.actT, npe, mx.mapa, mx.npad, I);
     k3_amx_gemm_groups(mx.dn, mx.ng, amx_xv[1], I, l0, l1);
     k3_sync();
     {

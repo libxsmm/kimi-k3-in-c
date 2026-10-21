@@ -46,6 +46,9 @@ void k3_amx_pack_cols(uint16_t *Xv, const float *X, int ldx, const int *map, int
 { (void)Xv; (void)X; (void)ldx; (void)map; (void)N; (void)in; }
 void k3_amx_pack_cols_bf16(uint16_t *Xv, const uint16_t *X, int ldx, const int *map, int N, int in)
 { (void)Xv; (void)X; (void)ldx; (void)map; (void)N; (void)in; }
+void k3_amx_pack_parts_bf16(uint16_t *Xv, const uint16_t *X, int np, const int *bnd, int nb,
+                            const int *map, int N, int in)
+{ (void)Xv; (void)X; (void)np; (void)bnd; (void)nb; (void)map; (void)N; (void)in; }
 #else
 
 #define ARCH_REQ_XCOMP_PERM 0x1023
@@ -427,6 +430,29 @@ void k3_amx_pack_cols_bf16(uint16_t *Xv, const uint16_t *X, int ldx, const int *
             _mm512_storeu_si512((void *)(tile + j * 32),
                                 _mm512_permutexvar_epi16(ilv, _mm512_inserti64x4(_mm512_castsi256_si512(a), b, 1)));
         }
+    }
+}
+
+void k3_amx_pack_parts_bf16(uint16_t *Xv, const uint16_t *X, int np, const int *bnd, int nb,
+                            const int *map, int N, int in)
+{
+    const int KT = in / 32, MT = N / 16;
+    int lo, hi;
+    k3_split(MT * KT, &lo, &hi);
+    for (int i = lo; i < hi; i++) {
+        const int mt = i / KT, k0 = i % KT * 32;
+        int r = 0;
+        while (r + 1 < nb && bnd[r + 1] <= k0) r++;
+        const int w = bnd[r + 1] - bnd[r];
+        const uint16_t *part = X + (size_t)bnd[r] * np + (k0 - bnd[r]);
+        __m512 v[16];
+        for (int c = 0; c < 16; c++) {
+            const int col = map[mt * 16 + c];
+            v[c] = col >= 0 ? _mm512_loadu_ps((const float *)(part + (size_t)col * w)) : _mm512_setzero_ps();
+        }
+        v512_tr16(v);                         /* bf16 pair j of token c to [j][c] */
+        uint16_t *tile = Xv + (size_t)i * 512;
+        for (int j = 0; j < 16; j++) _mm512_storeu_ps((float *)(tile + j * 32), v[j]);
     }
 }
 #endif

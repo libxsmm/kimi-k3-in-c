@@ -53,6 +53,12 @@ void k3_amx_pack_cols(uint16_t *Xv, const float *X, int ldx, const int *map, int
 /* As k3_amx_pack_cols from bf16 X: the same tiles as packing the fp32 values they round. */
 void k3_amx_pack_cols_bf16(uint16_t *Xv, const uint16_t *X, int ldx, const int *map, int N, int in);
 
+/* The same tiles from bf16 X split at k boundaries bnd[0] = 0 < ... < bnd[nb] = in (all
+ * multiples of 32): part r starts at X + bnd[r] * np and holds column col's k values
+ * contiguously at col * (bnd[r + 1] - bnd[r]). map[p] is p's column or -1 (zero). */
+void k3_amx_pack_parts_bf16(uint16_t *Xv, const uint16_t *X, int np, const int *bnd, int nb,
+                            const int *map, int N, int in);
+
 /* INT8 ACTIVATIONS (K3_ACT_Q8=1): Q8_0 rows [o0, o1) of W (row o at W + o * row_bytes,
  * read in place) against T tokens of X, each quantized to int8 per 32 like ggml's q8_0,
  * on AMX-INT8. Per (row, token) the arithmetic does not depend on T or on the row split,
