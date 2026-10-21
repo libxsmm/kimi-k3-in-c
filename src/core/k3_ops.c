@@ -1088,6 +1088,38 @@ static void shortconv_part(float *y, const float *x, const float *w, float *stat
                            int c0, int c1, int stride, int k, int T)
 {
     const int hist = k - 1;
+    if (hist <= K3_CONV_HIST_MAX) {
+        /* blocks of channels walk the tokens together, so each step reads one contiguous
+         * run of a row rather than one float per row; per channel the same arithmetic */
+        enum { CH = 64 };
+        float buf[K3_CONV_HIST_MAX][CH];
+        int lo, hi;
+        k3_split(c1 - c0, &lo, &hi);
+        for (int cb = c0 + lo; cb < c0 + hi; cb += CH) {
+            const int n = c0 + hi - cb < CH ? c0 + hi - cb : CH;
+            for (int j = 0; j < hist; j++)
+                for (int i = 0; i < n; i++) buf[j][i] = state ? state[(size_t)(cb + i) * hist + j] : 0.0f;
+            for (int t = 0; t < T; t++) {
+                const float *xt = x + (size_t)t * stride + cb;
+                float *yt = y + (size_t)t * stride + cb;
+                for (int i = 0; i < n; i++) {
+                    const float *wc = w + (size_t)(cb + i) * k;
+                    const float cur = xt[i];
+                    /* taps are ordered oldest..newest, matching conv1d over a left-padded
+                     * sequence: w[k-1] multiplies the CURRENT input. */
+                    float acc = wc[hist] * cur;
+                    for (int j = 0; j < hist; j++) acc += wc[j] * buf[j][i];
+                    for (int j = 0; j + 1 < hist; j++) buf[j][i] = buf[j + 1][i];
+                    if (hist > 0) buf[hist - 1][i] = cur;
+                    yt[i] = acc * sigmoidf_(acc);     /* SiLU, fused */
+                }
+            }
+            if (state)
+                for (int j = 0; j < hist; j++)
+                    for (int i = 0; i < n; i++) state[(size_t)(cb + i) * hist + j] = buf[j][i];
+        }
+        return;
+    }
     {
         /* hist can be 0 when k == 1; every use of buf below is guarded on hist. */
         float lbuf[K3_CONV_HIST_MAX];
@@ -1930,6 +1962,31 @@ static void router_scores_part(float *score, const float *x, const float *W, int
         score[e] = 1.0f / (1.0f + expf(-(float)acc));
     }
 }
+
+#if defined(K3_AVX512)
+/* router_scores_part for T tokens, as (row block, token range) tasks: a block's rows stay
+ * in L2 and are read once per 4 tokens. The per-row arithmetic is matmul_f32_rows', so
+ * the scores, and the experts they pick, are those of the per-token path. */
+static void router_scores_T(float *SC, int NE, const float *x, int E, int T, const float *W,
+                            int x0, int x1)
+{
+    const int RB = 32, nrb = (x1 - x0 + RB - 1) / RB;
+    int ntb = k3_nth() / nrb;
+    if (ntb < 1) ntb = 1;
+    if (ntb > T) ntb = T;
+    int lo, hi;
+    k3_split(nrb * ntb, &lo, &hi);
+    for (int task = lo; task < hi; task++) {
+        const int r0 = x0 + task % nrb * RB, r1 = r0 + RB < x1 ? r0 + RB : x1, tb = task / nrb;
+        const int t0 = (int)((long)T * tb / ntb), t1 = (int)((long)T * (tb + 1) / ntb);
+        matmul_f32_rows_T(SC + (size_t)t0 * NE + r0, NE, x + (size_t)t0 * E, E, t1 - t0,
+                          W + (size_t)(r0 - (k3_tp.local ? x0 : 0)) * E, E, 0, r1 - r0);
+        for (int t = t0; t < t1; t++)
+            for (int e = r0; e < r1; e++)
+                SC[(size_t)t * NE + e] = 1.0f / (1.0f + expf(-SC[(size_t)t * NE + e]));
+    }
+}
+#endif
 
 static void router_select(int *idx, float *w, const float *score, const float *bias,
                           int n_experts, int topk, int renorm, float routed_scale)
@@ -3196,6 +3253,10 @@ static void moe_team_amx(float *out, const float *x, const K3MoeW *w, const K3Cf
     if ((size_t)(xbuf - scratch) & 1) xbuf++;
 
     double tp = k3_prof_t0();
+#if defined(K3_AVX512)
+    if (E % 64 == 0) router_scores_T(SC, NE, x, E, T, w->gate, x0, x1);
+    else
+#endif
     {
         int lo, hi;
         k3_split(x1 - x0, &lo, &hi);
@@ -3706,11 +3767,15 @@ static void kda_layer_team(float *out, const float *x, const K3KdaW *w, const K3
      * bit-identical to the serial form at any thread count. 96 heads alone left a
      * 64-thread socket with two uneven waves. */
     /* Column blocks of 32 (K3_KDA_CB overrides; 64 measured slower at TP=6 although it
-     * halves the task count). */
+     * halves the task count). Blocks of one head go to different threads, so they must not
+     * share a cache line: with S not 64-byte aligned every token's writes would bounce
+     * lines between cores, and whole heads are taken instead. */
     static int cb_env = -1;
     if (cb_env < 0) cb_env = getenv("K3_KDA_CB") ? atoi(getenv("K3_KDA_CB")) : 0;
     int CB = cb_env > 0 ? (cb_env < D ? cb_env : D) : (D >= 64 ? 32 : D);
     if (CB > K3_KDA_STEP_DV) CB = K3_KDA_STEP_DV;
+    if (((uintptr_t)S | (size_t)D * sizeof(float) | (size_t)CB * sizeof(float)) % 64)
+        CB = D <= K3_KDA_STEP_DV ? D : CB;
     const int nbc = (D + CB - 1) / CB;
     K3_TEAM_IF(1, int lo, hi; k3_split(nh * nbc, &lo, &hi);
     for (int task = lo; task < hi; task++) {
@@ -4002,6 +4067,34 @@ static void layer_team(float *h, float *block_residual, int *n_blocks,
              * the whole chunk; decode (T == 1) and the resident path fall straight
              * through to k3_moe inside, byte-identical. */
             k3_moe_prefill(tmp, hin, w->moe, c, T, idx, wt, sub);
+        } else if (amx_prefill(T) && amx_wt(w->wdt) >= 0 && E % 32 == 0 && c->dense_inter % 32 == 0) {
+            double tp = k3_prof_t0();
+            const int DI = c->dense_inter, TC = T < 512 ? T : 512;   /* bounds [TC][3 DI] */
+            int d0, d1, e0, e1;
+            k3_tp_part(DI, &d0, &d1);
+            k3_tp_part(E, &e0, &e1);
+            if (k3_tid() == 0)
+                moe_amx_buf = (float *)k3_scratch(K3S_AMXB, (size_t)TC * 3 * DI * sizeof(float), "AMX dense MLP");
+            k3_sync();
+            float *G = moe_amx_buf, *U = G + (size_t)TC * DI, *A = U + (size_t)TC * DI;
+            for (int t0 = 0; t0 < T; t0 += TC) {
+                const int tc = T - t0 < TC ? T - t0 : TC;
+                const uint16_t *xv = amx_pack(0, hin + (size_t)t0 * E, E, tc, E);
+                amx_rows(G, DI, xv, tc, w->dense_gate, w->wdt, E, d0, d1);
+                amx_rows(U, DI, xv, tc, w->dense_up, w->wdt, E, d0, d1);
+                k3_sync();
+                int tl, th;
+                k3_split(tc, &tl, &th);
+                for (int t = tl; t < th; t++)
+                    situ_range(A + (size_t)t * DI + d0, G + (size_t)t * DI + d0, U + (size_t)t * DI + d0,
+                               d1 - d0, c->situ_b1, c->situ_b2);
+                tp_gather_rows(A, tc, DI, 1);
+                const uint16_t *av = amx_pack(1, A, DI, tc, DI);
+                amx_rows(tmp + (size_t)t0 * E, E, av, tc, w->dense_down, w->wdt, DI, e0, e1);
+                k3_sync();                      /* G, U, A are rewritten by the next chunk */
+            }
+            tp_gather_rows(tmp, T, E, 1);
+            k3_prof_add(K3P_DENSE, tp);
         } else {
             double tp = k3_prof_t0();
             const int DI = c->dense_inter;

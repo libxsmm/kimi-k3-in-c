@@ -817,6 +817,16 @@ static int chat_render_ids(Tok *tok, const K3ChatHistory *history, const K3ChatO
 }
 
 /* KV-cache bytes per position on this rank: every MLA layer's keys/values and rope slot */
+/* KDA recurrent state, zeroed and cache-line aligned: the recurrence splits each head's
+ * matrix into column blocks across threads, which must not share a line. */
+static float *state_alloc(size_t floats)
+{
+    void *p = NULL;
+    if (posix_memalign(&p, 64, floats * sizeof(float) + 64) != 0) return NULL;
+    memset(p, 0, floats * sizeof(float));
+    return (float *)p;
+}
+
 static double kv_bytes_per_pos(const K3Cfg *c)
 {
     int n_mla = 0;
@@ -2143,7 +2153,7 @@ static int k3_main(int argc, char **argv)
     float *h  = (float *)malloc((size_t)Tmax * E * sizeof(float));
     float *br = (float *)malloc((size_t)Tmax * maxb * E * sizeof(float));
     const int state_layers = (ultra && !incremental) ? 1 : NL;
-    float *ks = (float *)malloc(kper * (size_t)state_layers * sizeof(float));
+    float *ks = state_alloc(kper * (size_t)state_layers);
     size_t sc_need = k3_layer_scratch(&c, Tmax);
     {   /* the cached MLA path sizes its score buffer by cache capacity, not by T */
         const size_t ic = k3_mla_scratch_cached(&c, Tmax, Tmax, 1);
@@ -2221,7 +2231,7 @@ static int k3_main(int argc, char **argv)
         for (int L = 0; L < w.n_bound; L++) k3_bind_free(&w.lay[L]);
         free(w.lay); k3_bind_model_free(&w.mb); k3_st_close(&st);
         if (gguf) { k3_gguf_experts_free(&gx); k3_gguf_close(&gg); }
-        free(h); free(br); free(ks); free(sc); free(lg); free(seq); free(outtok);
+        free(h); free(br); k3_aligned_free(ks); free(sc); free(lg); free(seq); free(outtok);
         free(prompt); k3_chat_history_free(&chat_history);
         if (k3_expert_drops) {
             fprintf(stderr, "chat invalid: %ld routed expert load(s) failed; the transcript was preserved\n", k3_expert_drops);
@@ -2256,7 +2266,7 @@ static int k3_main(int argc, char **argv)
             spec_n = 0;
         } else {
             if (spec_n > K3_SPEC_MAX) spec_n = K3_SPEC_MAX;
-            spec_snap = (float *)malloc(kper_f * (size_t)w.n_bound * sizeof(float));
+            spec_snap = state_alloc(kper_f * (size_t)w.n_bound);
             if (!spec_snap) { fprintf(stderr, "OOM for the --spec snapshot\n"); return 1; }
             printf("speculative decode: up to %d drafted tokens per sweep, n-gram lookup, "
                    "verified batched\n\n", spec_n);
@@ -2285,15 +2295,15 @@ static int k3_main(int argc, char **argv)
             if (spec_n <= 0) spec_n = 4;
             if (spec_n > K3_SPEC_MAX) spec_n = K3_SPEC_MAX;
             if (!spec_snap) {
-                spec_snap = (float *)malloc(kper_f * (size_t)w.n_bound * sizeof(float));
+                spec_snap = state_alloc(kper_f * (size_t)w.n_bound);
                 if (!spec_snap) { fprintf(stderr, "OOM for the --spec snapshot\n"); return 1; }
             }
             if (k3_trunk_open(&trunk_d, draft_dir, &c, (int64_t)(draft_gb * 1e9),
                               trunk_ring) != 0)
                 return 1;
             dw.lay = (K3LayerBind *)calloc((size_t)NL, sizeof(K3LayerBind));
-            dks   = (float *)calloc(kper_f * (size_t)w.n_bound, sizeof(float));
-            dsnap = (float *)malloc(kper_f * (size_t)w.n_bound * sizeof(float));
+            dks   = state_alloc(kper_f * (size_t)w.n_bound);
+            dsnap = state_alloc(kper_f * (size_t)w.n_bound);
             const size_t kvperd = k3_kv_layer_floats(&c, w.kv_cap);
             const size_t rpperd = (size_t)w.kv_cap * c.qk_rope;
             dw.kvc   = (float *)calloc(kvperd * (size_t)w.n_mla, sizeof(float));
@@ -2346,7 +2356,7 @@ static int k3_main(int argc, char **argv)
                                  kper_f * (size_t)w.n_bound, dsp_on ? &dsp : NULL, spec_n,
                                  spec_snap);
         if (dsp_on) k3_dspark_close(&dsp);
-        free(w.taps); free(spec_snap);
+        free(w.taps); k3_aligned_free(spec_snap);
         free(w.kvc); free(w.ropec); free(w.mla_slot);
         k3_cache_free(&cache);
         if (experts_res) k3_resident_free(&res);
@@ -2354,7 +2364,7 @@ static int k3_main(int argc, char **argv)
         for (int L = 0; L < w.n_bound; L++) k3_bind_free(&w.lay[L]);
         free(w.lay); k3_bind_model_free(&w.mb); k3_st_close(&st);
         if (gguf) { k3_gguf_experts_free(&gx); k3_gguf_close(&gg); }
-        free(h); free(br); free(ks); free(sc); free(lg); free(seq); free(outtok); free(prompt);
+        free(h); free(br); k3_aligned_free(ks); free(sc); free(lg); free(seq); free(outtok); free(prompt);
         return rc;
     }
 
@@ -2677,9 +2687,9 @@ static int k3_main(int argc, char **argv)
                hyb_drafted ? 100.0 * hyb_accepted / hyb_drafted : 0.0,
                (double)hyb_accepted / hyb_rounds);
         k3_trunk_close(&trunk_d);
-        free(dw.lay); free(dks); free(dsnap); free(dw.kvc); free(dw.ropec);
+        free(dw.lay); k3_aligned_free(dks); k3_aligned_free(dsnap); free(dw.kvc); free(dw.ropec);
     }
-    free(spec_snap);
+    k3_aligned_free(spec_snap);
     printf("--------------------------------------------------------------------\n");
     if (nout > 0)
         printf("%d tokens in %.1f s, %.2f s/token average\n",
@@ -2861,7 +2871,7 @@ static int k3_main(int argc, char **argv)
     k3_bind_model_free(&w.mb);
     k3_st_close(&st);
     if (gguf) { k3_gguf_experts_free(&gx); k3_gguf_close(&gg); }
-    free(h); free(br); free(ks); free(sc); free(lg); free(generated_text);
+    free(h); free(br); k3_aligned_free(ks); free(sc); free(lg); free(generated_text);
 
     /* A dropped expert means some token was computed with part of its routed sum
      * missing. The run still produced token ids and they still look plausible, which is
