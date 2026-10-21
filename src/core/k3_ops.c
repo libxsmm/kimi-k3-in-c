@@ -2462,6 +2462,9 @@ static void moe_team_mt(float *out, const float *x, const K3MoeW *w, const K3Cfg
 {
     const int E = c->hidden, L = c->latent, I = c->moe_inter;
     const int SI = I * c->n_shared, NE = c->n_experts;
+    /* before the first barrier: mt_grp is set during this call, and a thread reading it
+     * later could take the other path and desynchronise the team and the ranks */
+    const int grouped = moe_grouped_ok(w, c, T);
     int x0, x1, l0, l1, s0, s1, o0, o1;
     k3_tp_part(NE, &x0, &x1);
     k3_tp_part(L, &l0, &l1);
@@ -2522,7 +2525,7 @@ static void moe_team_mt(float *out, const float *x, const K3MoeW *w, const K3Cfg
     k3_prof_add(K3P_SHARED, tp);
     k3_tp_gather_end(sg, 2 * T);
 
-    if (moe_grouped_ok(w, c, T)) {
+    if (grouped) {
         tp = k3_prof_t0();
         moe_routed_mt(AC, Z, SA, T, w, c, SC, idx, wt);
         k3_prof_add(K3P_EXPERTS, tp);
