@@ -1,12 +1,12 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* k3_amx.c - see k3_amx.h.
  *
- * Work is split over (row block, token block) tasks so every thread gets one; within a
- * task the K dimension is walked in chunks so that the decoded weight panel (row block x
- * K chunk) and the token block's activations (token block x K chunk) both stay in L2.
- * Per task: for each K chunk, decode the panel once, then every token tile pair streams
- * through every weight tile pair (2x2 tiles of fp32 accumulators, kept in a per-thread
- * buffer between chunks). */
+ * Work is split over (row block, token block) tasks; within a task the K dimension is
+ * walked in chunks so that the decoded weight panel (row block x K chunk) and the token
+ * block's activations (token block x K chunk) both stay in L2. Per task: for each K chunk,
+ * decode the panel once, then every token tile pair streams through every weight tile
+ * pair (2x2 tiles of fp32 accumulators, kept in a per-thread buffer between chunks). A
+ * panel is decoded once per token block, which is why blk_pick prefers few, large ones. */
 #define _GNU_SOURCE
 #include "k3_amx.h"
 
@@ -22,6 +22,7 @@
 #include <immintrin.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#include "k3_simd.h"
 #endif
 
 size_t k3_amx_xv_elems(int T, int in)
@@ -94,27 +95,32 @@ static void *grow(void *p, size_t *have, size_t need)
     return aligned_alloc(64, (need + 63) & ~(size_t)63);
 }
 
+/* One A tile from 16 token rows (NULL: zero): row c's 32 values as 16 bf16 pairs, then a
+ * 16x16 dword transpose puts pair j of token c at [j][c]. */
+static inline void pack_tile(uint16_t *tile, const float **x)
+{
+    __m512 r[16];
+    for (int c = 0; c < 16; c++)
+        r[c] = x[c] ? (__m512)_mm512_cvtne2ps_pbh(_mm512_loadu_ps(x[c] + 16), _mm512_loadu_ps(x[c]))
+                    : _mm512_setzero_ps();
+    v512_tr16(r);
+    for (int j = 0; j < 16; j++) _mm512_storeu_ps((float *)(tile + j * 32), r[j]);
+}
+
 /* Tile (mt, kt) holds tokens mt*16 + c and k = kt*32 + 2j + e at [j][c][e]. */
 void k3_amx_pack_x(uint16_t *Xv, const float *X, int ldx, int T, int in)
 {
     const int KT = in / 32, MT = (T + 31) / 32 * 2;
     int lo, hi;
     k3_split(MT * KT, &lo, &hi);
-    const __m512i pos = _mm512_mullo_epi32(_mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15),
-                                           _mm512_set1_epi32(16));   /* dword j*16: row j of the tile */
     for (int i = lo; i < hi; i++) {
         const int mt = i / KT, kt = i % KT;
-        uint16_t *tile = Xv + (size_t)i * 512;
+        const float *x[16];
         for (int c = 0; c < 16; c++) {
             const int t = mt * 16 + c;
-            __m512i v = _mm512_setzero_si512();
-            if (t < T) {
-                const float *x = X + (size_t)t * ldx + (size_t)kt * 32;
-                v = (__m512i)_mm512_cvtne2ps_pbh(_mm512_loadu_ps(x + 16), _mm512_loadu_ps(x));
-            }
-            /* dword j (k = 2j, 2j + 1) of token c goes to row j, column c */
-            _mm512_i32scatter_epi32((void *)(tile + c * 2), pos, v, 4);
+            x[c] = t < T ? X + (size_t)t * ldx + (size_t)kt * 32 : NULL;
         }
+        pack_tile(Xv + (size_t)i * 512, x);
     }
 }
 
@@ -141,16 +147,40 @@ static int env_int(const char *name, int def)
     return e && atoi(e) > 0 ? atoi(e) : def;
 }
 
-static int kc_max, rb_max, tb_max;
+static int kc_max, rb_max, tb_max, blk_auto;
+static size_t l2_budget;
 static pthread_once_t blk_once = PTHREAD_ONCE_INIT;
 static void blk_init(void)
 {
+    blk_auto = !getenv("K3_AMX_KC") && !getenv("K3_AMX_RB") && !getenv("K3_AMX_TB");
+    l2_budget = (size_t)env_int("K3_AMX_L2_KB", 1792) * 1024;
     kc_max = env_int("K3_AMX_KC", 1024) / 256 * 8;
     rb_max = env_int("K3_AMX_RB", 256) / 32 * 32;
     tb_max = env_int("K3_AMX_TB", 128) / 32 * 32;
     if (kc_max < 8) kc_max = 8;
     if (rb_max < 32) rb_max = 32;
     if (tb_max < 32) tb_max = 32;
+}
+
+/* Blocks giving near-whole rounds of tasks (>= 90% of the team busy in each): the largest
+ * token block first, as each weight panel is decoded once per token block, then the
+ * fewest row blocks whose panel, C block and activation block fit in L2. 0: none. */
+static int blk_pick(int rows, int Tp, int KT, int nth, int *RB, int *TB, int *KC)
+{
+    const int kc = KT < 16 ? KT : 16, r32 = (rows + 31) / 32;
+    for (int tb = 512; tb >= 32; tb /= 2) {
+        if (tb > Tp) continue;
+        const int ntb = (Tp + tb - 1) / tb;
+        for (int nrb = 1; nrb <= r32; nrb++) {
+            const int rb = (r32 + nrb - 1) / nrb * 32, tasks = (rows + rb - 1) / rb * ntb;
+            const int rounds = (tasks + nth - 1) / nth;
+            if (tasks < nth || (long)tasks * 10 < (long)rounds * nth * 9) continue;
+            if ((size_t)rb * kc * 64 + (size_t)rb * tb * 4 + (size_t)tb * kc * 64 > l2_budget) continue;
+            *RB = rb; *TB = tb; *KC = kc;
+            return 1;
+        }
+    }
+    return 0;
 }
 
 void k3_amx_gemm(float *Y, int ldy, const uint16_t *Xv, int T, const void *W, int wt,
@@ -161,19 +191,22 @@ void k3_amx_gemm(float *Y, int ldy, const uint16_t *Xv, int T, const void *W, in
     const size_t rb = k3_gq_row_bytes(wt, in);
 
     /* blocks: K chunk of KC k-tiles (a multiple of 8, i.e. of 256 weights), row blocks
-     * of RB and token blocks of TB (multiples of 32), halved until every thread has a task */
+     * of RB and token blocks of TB (multiples of 32), by blk_pick; with K3_AMX_KC/RB/TB
+     * set, or when it finds none, those sizes halved until every thread has a task */
     pthread_once(&blk_once, blk_init);
-    const int KC = KT < kc_max ? KT : kc_max;
+    int KC = KT < kc_max ? KT : kc_max;
     int RB = rb_max, TB = tb_max;
     const int Tp = MT * 16, nth = k3_nth();
-    if (TB > Tp) TB = Tp;
-    for (;;) {
-        const long tasks = (long)((rows + RB - 1) / RB) * ((Tp + TB - 1) / TB);
-        if (tasks >= nth || (RB == 32 && TB == 32)) break;
-        if (TB >= RB && TB > 32) TB /= 2;
-        else if (RB > 32) RB /= 2;
-        else TB /= 2;
-        TB = TB < 32 ? 32 : TB / 32 * 32;
+    if (!blk_auto || !blk_pick(rows, Tp, KT, nth, &RB, &TB, &KC)) {
+        if (TB > Tp) TB = Tp;
+        for (;;) {
+            const long tasks = (long)((rows + RB - 1) / RB) * ((Tp + TB - 1) / TB);
+            if (tasks >= nth || (RB == 32 && TB == 32)) break;
+            if (TB >= RB && TB > 32) TB /= 2;
+            else if (RB > 32) RB /= 2;
+            else TB /= 2;
+            TB = TB < 32 ? 32 : TB / 32 * 32;
+        }
     }
     const int nrb = (rows + RB - 1) / RB, ntb = (Tp + TB - 1) / TB;
     int lo, hi;
@@ -331,22 +364,16 @@ void k3_amx_gemm_groups(const K3AmxGroup *g, int ng, const uint16_t *Xv, int in,
 void k3_amx_pack_rows(uint16_t *Xv, const float *X, int ldx, const int *map, int N, int in)
 {
     const int KT = in / 32, MT = N / 16;
-    const __m512i pos = _mm512_mullo_epi32(_mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15),
-                                           _mm512_set1_epi32(16));
     int lo, hi;
     k3_split(MT * KT, &lo, &hi);
     for (int i = lo; i < hi; i++) {
         const int mt = i / KT, kt = i % KT;
-        uint16_t *tile = Xv + (size_t)i * 512;
+        const float *x[16];
         for (int c = 0; c < 16; c++) {
             const int r = map[mt * 16 + c];
-            __m512i v = _mm512_setzero_si512();
-            if (r >= 0) {
-                const float *x = X + (size_t)r * ldx + (size_t)kt * 32;
-                v = (__m512i)_mm512_cvtne2ps_pbh(_mm512_loadu_ps(x + 16), _mm512_loadu_ps(x));
-            }
-            _mm512_i32scatter_epi32((void *)(tile + c * 2), pos, v, 4);
+            x[c] = r >= 0 ? X + (size_t)r * ldx + (size_t)kt * 32 : NULL;
         }
+        pack_tile(Xv + (size_t)i * 512, x);
     }
 }
 

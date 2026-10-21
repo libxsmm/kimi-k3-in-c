@@ -3525,10 +3525,12 @@ static void kda_layer_team(float *out, const float *x, const K3KdaW *w, const K3
 
     /* 1. projections */
     double tp = k3_prof_t0();
+    const uint16_t *xv0 = NULL;
     const int amx = amx_prefill(T) && !w->qkv && amx_wt(w->wdt) >= 0 && amx_wt(w->b_wdt) >= 0 &&
                     E % 32 == 0 && D % 32 == 0 && P % 32 == 0;
     if (amx) {
-        const uint16_t *xv = amx_pack(0, x, E, T, E);
+        xv0 = amx_pack(0, x, E, T, E);
+        const uint16_t *xv = xv0;
         amx_rows(q, P, xv, T, w->q, w->wdt, E, c0, c1);
         amx_rows(k, P, xv, T, w->k, w->wdt, E, c0, c1);
         amx_rows(v, P, xv, T, w->v, w->wdt, E, c0, c1);
@@ -3671,9 +3673,9 @@ static void kda_layer_team(float *out, const float *x, const K3KdaW *w, const K3
 
     /* 7/8/9. head-wise RMSNorm, THEN the gate, THEN the output projection */
     if (amx) {
-        /* z held the decay pre-activation, dead after step 2: the gate goes there */
-        const uint16_t *xv = amx_pack(0, x, E, T, E);
-        amx_rows(z, P, xv, T, w->g, w->wdt, E, c0, c1);
+        /* z held the decay pre-activation, dead after step 2: the gate goes there; slot 0
+         * still holds x's tiles (only slot 1 was repacked since) */
+        amx_rows(z, P, xv0, T, w->g, w->wdt, E, c0, c1);
         k3_sync();
         int lo, hi;
         k3_split(T * nh, &lo, &hi);

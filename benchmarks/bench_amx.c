@@ -1,5 +1,5 @@
 /* bench_amx.c - prefill GEMM (k3_amx_gemm, AMX-BF16 with weight panels decoded once per
- * call) against the per-token GEMV path the prefill uses today, at per-rank shapes.
+ * task) against the per-token GEMV path the prefill uses today, at per-rank shapes.
  *
  *   OMP_NUM_THREADS=42 OMP_PLACES=cores OMP_PROC_BIND=close numactl -N 0 -m 0 \
  *       bin/bench_amx [-P ranks] [-T 16,64,256,1024] [-s rows,in[,iq2]]
