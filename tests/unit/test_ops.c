@@ -11,9 +11,13 @@
  * Fixtures are parsed with the vendored json.h (Apache 2.0, see NOTICE).
  */
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include "json.h"
 #include "k3.h"
@@ -1054,6 +1058,107 @@ static void t_bf16_act(void)
     free(Wb); free(Wf); free(x); free(xr); free(ya); free(yb);
 }
 
+/* The team-split fp32 decode attention (k3_mla_split=1) against the per-head fp64 loop on
+ * 600 cached positions, three position chunks: within 1e-4 of max |y|; and bit-identical
+ * between the full team and one thread (team size 1 leaves the dissemination barrier's
+ * epochs alone) and between one token per call and four or seven (the speculative path; seven
+ * straddles a chunk boundary). */
+static void t_mla_split(void)
+{
+    K3Cfg c; memset(&c, 0, sizeof c);
+    c.hidden = 128; c.n_heads = 4; c.qk_nope = 32; c.qk_rope = 16; c.v_head = 32;
+    c.kv_lora = 64; c.q_lora = 64; c.rms_eps = 1e-5f;
+    const int E = c.hidden, H = c.n_heads, qh = c.qk_nope + c.qk_rope, kvd = c.qk_nope + c.v_head;
+    const int N = 600;
+    uint32_t s = 12345u;
+    float *buf[8];
+    const size_t sz[8] = { (size_t)c.q_lora * E, (size_t)H * qh * c.q_lora,
+                           (size_t)(c.kv_lora + c.qk_rope) * E, (size_t)H * kvd * c.kv_lora,
+                           (size_t)E * H * c.v_head, (size_t)H * c.v_head * E,
+                           (size_t)c.q_lora + c.kv_lora, (size_t)N * E };
+    for (int i = 0; i < 8; i++) {
+        buf[i] = (float *)malloc(sz[i] * sizeof(float));
+        for (size_t j = 0; buf[i] && j < sz[i]; j++) {
+            s = s * 1664525u + 1013904223u;
+            buf[i][j] = ((float)(s >> 8) / 16777216.0f - 0.5f) * (i == 6 ? 0.2f : i == 7 ? 2.0f : 0.25f);
+            if (i == 6) buf[i][j] += 1.0f;                     /* norm weights near 1 */
+        }
+    }
+    K3MlaW w; memset(&w, 0, sizeof w);
+    w.q_a = buf[0]; w.q_b = buf[1]; w.kv_a = buf[2]; w.kv_b = buf[3]; w.o = buf[4]; w.g = buf[5];
+    w.q_a_norm = buf[6]; w.kv_a_norm = buf[6] + c.q_lora;
+    const float *x = buf[7];
+    float *y[10], *kvc = NULL, *ropec = NULL, *scr = NULL;
+    for (int v = 0; v < 10; v++) y[v] = (float *)malloc((size_t)N * E * sizeof(float));
+    kvc = (float *)malloc((size_t)N * H * kvd * sizeof(float));
+    ropec = (float *)malloc((size_t)N * c.qk_rope * sizeof(float));
+    k3_kv_bf16 = 1;                                    /* the larger scratch of the two */
+    scr = (float *)malloc(k3_mla_scratch_cached(&c, 64, N, 1) * sizeof(float));
+    int ok = scr && kvc && ropec && buf[7];
+    for (int v = 0; v < 10; v++) ok = ok && y[v];
+    /* AMX is latched per process from the environment: its variants run only under it */
+    const int nv = getenv("K3_PREFILL_AMX") && strcmp(getenv("K3_PREFILL_AMX"), "0") ? 10 : 8;
+#ifdef _OPENMP
+    const int nth = omp_get_max_threads();
+#endif
+    /* 0 fp64 loop, 1 split, 2 split on one thread, 3 split four tokens per call,
+     * 4 split with a bf16 cache, 5 the same four tokens per call, 6 and 7 seven per call,
+     * 8 and 9 64-token AMX prefill chunks */
+    for (int v = 0; ok && v < nv; v++) {
+        k3_mla_split = v != 0;
+        k3_kv_bf16 = v == 4 || v == 5 || v == 7 || v == 9;
+#ifdef _OPENMP
+        omp_set_num_threads(v == 2 ? 1 : nth);
+#endif
+        memset(kvc, 0, (size_t)N * H * kvd * sizeof(float));
+        memset(ropec, 0, (size_t)N * c.qk_rope * sizeof(float));
+        const int step = v == 3 || v == 5 ? 4 : v >= 8 ? 64 : v >= 6 ? 7 : 1;
+        for (int p = 0; p < N; p += step) {
+            const int T = N - p < step ? N - p : step;
+            k3_mla_cached(y[v] + (size_t)p * E, x + (size_t)p * E, &w, &c, T, scr, kvc, ropec, p, N);
+        }
+    }
+#ifdef _OPENMP
+    omp_set_num_threads(nth);
+#endif
+    k3_mla_split = -1;
+    k3_kv_bf16 = -1;
+    double md = 0, ny = 0, mb = 0;
+    for (size_t i = 0; ok && i < (size_t)N * E; i++) {
+        md = fmax(md, fabs((double)y[1][i] - y[0][i]));
+        mb = fmax(mb, fabs((double)y[4][i] - y[1][i]));
+        ny = fmax(ny, fabs((double)y[0][i]));
+    }
+    const size_t ny_b = (size_t)N * E * sizeof(float);
+    const int close = ok && md <= 1e-4 * ny;
+    const int threads = ok && !memcmp(y[1], y[2], ny_b);
+    const int batched = ok && !memcmp(y[1], y[3], ny_b) && !memcmp(y[1], y[6], ny_b);
+    const int bfsame = ok && !memcmp(y[4], y[5], ny_b) && !memcmp(y[4], y[7], ny_b);
+    const int bfok = ok && mb <= 2e-2 * ny && mb > 0 && bfsame;
+    ok = ok && close && threads && batched && bfok;
+    printf("  %s  mla_split     %d positions: rel diff %.1e to the fp64 loop; team sizes %s, "
+           "T=1 vs T=4,7 %s; bf16 cache %.1e, T=1 vs T=4,7 %s\n", ok ? "PASS" : "FAIL", N,
+           ny > 0 ? md / ny : 0.0, threads ? "identical" : "DIFFER", batched ? "identical" : "DIFFER",
+           ny > 0 ? mb / ny : 0.0, bfsame ? "identical" : "DIFFER");
+    if (ok) g_pass++; else g_fail++;
+    if (nv == 10 && scr && kvc && ropec) {
+        double ma = 0, mab = 0;
+        for (size_t i = 0; i < (size_t)N * E; i++) {
+            ma = fmax(ma, fabs((double)y[8][i] - y[0][i]));
+            mab = fmax(mab, fabs((double)y[9][i] - y[0][i]));
+        }
+        /* the bound is the bf16 GEMMs' own error on these random weights */
+        const int aok = ma <= 1e-1 * ny && mab <= 1e-1 * ny;
+        printf("  %s  mla_amx       %d positions, 64-token chunks: rel diff %.4e (fp32 cache), "
+               "%.4e (bf16 cache) to the fp64 loop\n", aok ? "PASS" : "FAIL", N,
+               ny > 0 ? ma / ny : 0.0, ny > 0 ? mab / ny : 0.0);
+        if (aok) g_pass++; else g_fail++;
+    }
+    for (int i = 0; i < 8; i++) free(buf[i]);
+    for (int v = 0; v < 10; v++) free(y[v]);
+    free(kvc); free(ropec); free(scr);
+}
+
 int main(int argc, char **argv)
 {
     const char *dir = (argc > 1) ? argv[1] : "../fixtures/ops";
@@ -1088,6 +1193,7 @@ int main(int argc, char **argv)
     t_recur(dir, "kda_recur8");
     t_router(dir);
     t_mla(dir);
+    t_mla_split();
     t_moe(dir);
     t_moe_streamed();
     t_mxfp4(dir);

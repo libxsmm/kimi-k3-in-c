@@ -377,6 +377,15 @@ void   k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c
                      float *kvc, float *ropec, int cached, int cap);
 void   k3_mla(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
               int T, float *scratch);
+/* Per-token attention kernel (AVX-512 builds): 1 splits every head's positions over the
+ * whole team in fp32 SIMD, 0 is the per-head fp64 loop; -1 reads K3_MLA_SPLIT (default 1). */
+extern int k3_mla_split;
+/* KV cache in bf16, head-major over this rank's heads only: [heads][cap][qk_nope+v_head]
+ * instead of fp32 [cap][n_heads][...]. -1 reads K3_KV_BF16 (default 0); AVX-512 builds
+ * only. Size every layer's slice with k3_kv_layer_floats (units of float). */
+extern int k3_kv_bf16;
+int    k3_kv_bf16_on(void);
+size_t k3_kv_layer_floats(const K3Cfg *c, int cap);
 
 /* MoE routing, one token. modeling_kimi_linear.py:703-759.
  *

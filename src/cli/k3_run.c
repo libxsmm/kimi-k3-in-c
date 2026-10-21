@@ -663,7 +663,7 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
             memset(layer_state, 0, kper * sizeof(float));
         const long drops_before = k3_expert_drops;
         if (w->kvc && w->mla_slot[L] >= 0) {
-            const size_t kvper = (size_t)w->kv_cap * c->n_heads * (c->qk_nope + c->v_head);
+            const size_t kvper = k3_kv_layer_floats(c, w->kv_cap);
             const size_t rpper = (size_t)w->kv_cap * c->qk_rope;
             const int mi = w->mla_slot[L];
             k3_decoder_layer_inc(h, br, &nb, &w->lay[L].lay, c, L, T,
@@ -816,6 +816,14 @@ static int chat_render_ids(Tok *tok, const K3ChatHistory *history, const K3ChatO
     *ids_out = ids; *n_out = n; return 0;
 }
 
+/* KV-cache bytes per position on this rank: every MLA layer's keys/values and rope slot */
+static double kv_bytes_per_pos(const K3Cfg *c)
+{
+    int n_mla = 0;
+    for (int L = 0; L < c->n_layers; L++) n_mla += k3_is_mla(c, L);
+    return (double)n_mla * ((double)k3_kv_layer_floats(c, 1) + c->qk_rope) * sizeof(float);
+}
+
 static int chat_resize(int want, int *tmax, int nl, int maxb, size_t kper,
                        Weights *w, const K3Cfg *c,
                        float **h, float **br, float **sc, int **seq)
@@ -831,7 +839,7 @@ static int chat_resize(int want, int *tmax, int nl, int maxb, size_t kper,
     int *nq = (int *)malloc((size_t)(want + 8) * sizeof(*nq));
     float *nk = NULL, *nr = NULL;
     if (w->kvc) {
-        const size_t kvper = (size_t)want * c->n_heads * (c->qk_nope + c->v_head);
+        const size_t kvper = k3_kv_layer_floats(c, want);
         const size_t rpper = (size_t)want * c->qk_rope;
         nk = (float *)calloc(kvper * (size_t)w->n_mla, sizeof(*nk));
         nr = (float *)calloc(rpper * (size_t)w->n_mla, sizeof(*nr));
@@ -865,7 +873,7 @@ static int chat_run(Tok *tok, const K3ChatTemplate *tmpl, K3ChatHistory *history
             return 1;
         }
         if (incremental) {
-            const double kv_need = (double)need * K3_KV_BYTES_PER_POS;
+            const double kv_need = (double)need * kv_bytes_per_pos(c);
             const double avail = mem_available_bytes();
             if (avail > 0.0 && kv_need > avail * 0.9) {
                 char kb[32], ab[32];
@@ -878,7 +886,7 @@ static int chat_run(Tok *tok, const K3ChatTemplate *tmpl, K3ChatHistory *history
         memcpy(*seq, prompt, (size_t)np * sizeof(**seq));
         memset(ks, 0, kper * (size_t)nl * sizeof(*ks));
         if (incremental) {
-            const size_t kvper = (size_t)w->kv_cap * c->n_heads * (c->qk_nope + c->v_head);
+            const size_t kvper = k3_kv_layer_floats(c, w->kv_cap);
             const size_t rpper = (size_t)w->kv_cap * c->qk_rope;
             memset(w->kvc, 0, kvper * (size_t)w->n_mla * sizeof(*w->kvc));
             memset(w->ropec, 0, rpper * (size_t)w->n_mla * sizeof(*w->ropec));
@@ -1549,6 +1557,10 @@ static int k3_main(int argc, char **argv)
                         "--spec, --draft-trunk, --chat or state files\n", k3_tp.size);
         return 2;
     }
+    if (k3_kv_bf16_on() && (load_state || save_state)) {
+        fprintf(stderr, "state files hold an fp32 KV cache; unset K3_KV_BF16 to use them\n");
+        return 2;
+    }
     /* Each rank then binds only its own rows of every sharded matrix. A packed trunk holds
      * whole layers, so streaming it keeps full matrices on every rank. */
     k3_tp.local = k3_tp.size > 1 && !trunk_dir;
@@ -1882,21 +1894,22 @@ static int k3_main(int argc, char **argv)
      * than letting a long prompt get 40 minutes into a run and then be OOM-killed. Only
      * incremental decode allocates the KV cache; full recompute carries no cache. */
     if (incremental) {
-        const double kv_need = (double)(np + gen + 1) * K3_KV_BYTES_PER_POS;
+        const double kv_need = (double)(np + gen + 1) * kv_bytes_per_pos(&c);
         const double avail   = mem_available_bytes();
         char kb[32], ab[32];
         human(kv_need, kb, sizeof kb);
         human(avail, ab, sizeof ab);
-        printf("  KV cache : %s for %d positions (%.2f MB/position)\n",
-               kb, np + gen + 1, K3_KV_BYTES_PER_POS / 1e6);
+        printf("  KV cache : %s for %d positions (%.2f MB/position%s)\n",
+               kb, np + gen + 1, kv_bytes_per_pos(&c) / 1e6,
+               k3_kv_bf16_on() ? ", bf16, this rank's heads" : "");
         if (avail > 0.0 && kv_need > avail * 0.9) {
             fprintf(stderr,
                 "\nREFUSING: the KV cache for %d positions needs %s but only %s is\n"
                 "available. This is a MEMORY limit, not an engine ceiling: MLA caches\n"
-                "expanded k and v in fp32 across 24 layers, so context costs ~2.37 MB per\n"
-                "position regardless of budget. Shorten the request, or use full\n"
-                "recompute (drop --incremental), which carries no KV cache at all.\n",
-                np + gen + 1, kb, ab);
+                "expanded k and v across 24 layers, %.2f MB per position. Shorten the\n"
+                "request, set K3_KV_BF16=1, or use full recompute (drop --incremental),\n"
+                "which carries no KV cache at all.\n",
+                np + gen + 1, kb, ab, kv_bytes_per_pos(&c) / 1e6);
             return 2;
         }
     }
@@ -1976,12 +1989,7 @@ static int k3_main(int argc, char **argv)
          * catch. k3_mla_cached stores expanded per-head k and v plus the shared rope
          * slot, in fp32, across all 24 MLA layers -- 2.37 MB per position, so a
          * 4096-token prompt alone is 9.7 GB. */
-        int n_mla = 0;
-        for (int L = 0; L < c.n_layers; L++) if (k3_is_mla(&c, L)) n_mla++;
-        const double w_kv = incremental
-            ? (double)Tm * n_mla
-              * ((double)c.n_heads * (c.qk_nope + c.v_head) + c.qk_rope) * 4
-            : 0.0;
+        const double w_kv = incremental ? (double)Tm * kv_bytes_per_pos(&c) : 0.0;
         const double need_b = w_trunk + w_model + w_cache + w_state + w_buf + w_kv;
         const double have = mem_available_bytes();
 
@@ -2177,7 +2185,7 @@ static int k3_main(int argc, char **argv)
         for (int L = 0; L < NL; L++)
             w.mla_slot[L] = k3_is_mla(&c, L) ? w.n_mla++ : -1;
         w.kv_cap = Tmax;
-        const size_t kvper = (size_t)w.kv_cap * c.n_heads * (c.qk_nope + c.v_head);
+        const size_t kvper = k3_kv_layer_floats(&c, w.kv_cap);
         const size_t rpper = (size_t)w.kv_cap * c.qk_rope;
         const double kvb = (double)(kvper + rpper) * w.n_mla * sizeof(float);
         human(kvb, b1, sizeof b1);
@@ -2286,7 +2294,7 @@ static int k3_main(int argc, char **argv)
             dw.lay = (K3LayerBind *)calloc((size_t)NL, sizeof(K3LayerBind));
             dks   = (float *)calloc(kper_f * (size_t)w.n_bound, sizeof(float));
             dsnap = (float *)malloc(kper_f * (size_t)w.n_bound * sizeof(float));
-            const size_t kvperd = (size_t)w.kv_cap * c.n_heads * (c.qk_nope + c.v_head);
+            const size_t kvperd = k3_kv_layer_floats(&c, w.kv_cap);
             const size_t rpperd = (size_t)w.kv_cap * c.qk_rope;
             dw.kvc   = (float *)calloc(kvperd * (size_t)w.n_mla, sizeof(float));
             dw.ropec = (float *)calloc(rpperd * (size_t)w.n_mla, sizeof(float));

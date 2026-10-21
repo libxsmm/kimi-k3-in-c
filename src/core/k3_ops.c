@@ -45,6 +45,7 @@
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
 #define K3_AVX512 1
 #include <immintrin.h>
+#include "k3_simd.h"
 
 /* The fp32 GEMV row scheme shared by the fp32, bf16 and MXFP4 kernels: element i goes
  * to lane i%16 of accumulator (i/16)%4, the tail is a masked chunk that leaves the
@@ -1312,6 +1313,156 @@ void k3_matmul(float *y, const float *x, const float *W, int in, int out)
                matmul_f32_rows(y, x, W, in, lo, hi));
 }
 
+/* Decode attention partials: per (head, chunk of K3_MLA_CH positions) a max, a sum and
+ * vh outputs. Chunk boundaries depend on the position only, never on the team size. */
+#define K3_MLA_CH 256
+int k3_mla_split = -1;
+int k3_kv_bf16 = -1;
+static size_t mla_part_floats(int H, int vh, int n, int T)
+{
+    const size_t nt = (size_t)(T < K3_MT_MAX ? T : K3_MT_MAX);   /* tokens per split call */
+    return nt * (size_t)H * (size_t)((n + K3_MLA_CH - 1) / K3_MLA_CH) * (size_t)(vh + 2);
+}
+/* the scores region of the MLA scratch: the scalar path's scores or the split partials */
+static size_t mla_sc_floats(int H, int vh, int n, int T)
+{
+    const size_t p = mla_part_floats(H, vh, n, T);
+    return p > (size_t)n ? p : (size_t)n;
+}
+
+int k3_kv_bf16_on(void)
+{
+    if (k3_kv_bf16 < 0) k3_kv_bf16 = getenv("K3_KV_BF16") && atoi(getenv("K3_KV_BF16")) > 0;
+#if defined(K3_AVX512)
+    return k3_kv_bf16;
+#else
+    return 0;                                  /* read only by the AVX-512 decode kernel */
+#endif
+}
+
+size_t k3_kv_layer_floats(const K3Cfg *c, int cap)
+{
+    const size_t kvd = (size_t)(c->qk_nope + c->v_head);
+    if (!k3_kv_bf16_on()) return (size_t)cap * c->n_heads * kvd;
+    int h0, h1;
+    k3_tp_part(c->n_heads, &h0, &h1);
+    return ((size_t)cap * (size_t)(h1 - h0) * kvd + 1) / 2;
+}
+
+#if defined(K3_AVX512)
+/* K3_MLA_SPLIT=0 off: attention of one query over positions [0, p], split over the whole
+ * team as (head, chunk) tasks with fp32 SIMD dots, then each head's chunks merged in
+ * chunk order. Bits do not depend on the thread count, the rank count or T. */
+static int mla_split_on(int qn, int qr, int vh)
+{
+    if (k3_mla_split < 0)
+        k3_mla_split = !(getenv("K3_MLA_SPLIT") && !strcmp(getenv("K3_MLA_SPLIT"), "0"));
+    return k3_mla_split && qn % 16 == 0 && qr % 16 == 0 && vh % 16 == 0 && qn + qr <= 256 &&
+           vh <= 256;
+}
+
+/* One (head, chunk) task. bf: the cache is bf16, head-major over this rank's heads (row s
+ * of local head hl at kv16 + (hl * cap + s) * kvd); else fp32 position-major over all H.
+ * Scores, max, exp and sum run 16 positions per vector. */
+static inline __attribute__((always_inline)) void mla_task(
+    float *pp, const float *qh_, int hl, int h, int s0, int s1, const float *kvb,
+    const uint16_t *kv16, int cap, const float *rpb, int H, int qn, int qr, int vh,
+    float scale, const int bf)
+{
+    const int kvd = qn + vh, nqn = qn / 16, nq = (qn + qr) / 16, nv = vh / 16, n = s1 - s0;
+    float sc[K3_MLA_CH];
+    __m512 qv[16], o[16], mv = _mm512_set1_ps(-INFINITY);
+    for (int i = 0; i < nq; i++) qv[i] = _mm512_loadu_ps(qh_ + 16 * i);
+    for (int b = 0; b < n; b += 16) {
+        const int nb = n - b < 16 ? n - b : 16;
+        __m512 a[16];
+        for (int j = 0; j < 16; j++) a[j] = _mm512_setzero_ps();
+        for (int j = 0; j < nb; j++) {
+            const int s = s0 + b + j;
+            const float *ks = bf ? NULL : kvb + ((size_t)s * H + h) * kvd, *kr = rpb + (size_t)s * qr;
+            const uint16_t *k16 = bf ? kv16 + ((size_t)hl * cap + s) * kvd : NULL;
+            __m512 d = _mm512_setzero_ps();
+            for (int i = 0; i < nqn; i++)
+                d = _mm512_fmadd_ps(qv[i], bf ? bf16x16(k16 + 16 * i) : _mm512_loadu_ps(ks + 16 * i), d);
+            /* the shared, unrotated rope slot is scored too */
+            for (int i = nqn; i < nq; i++)
+                d = _mm512_fmadd_ps(qv[i], _mm512_loadu_ps(kr + 16 * (i - nqn)), d);
+            a[j] = d;
+        }
+        const __mmask16 mk = v512_tail(nb);
+        const __m512 d = _mm512_mul_ps(v512_sum16(a), _mm512_set1_ps(scale));
+        _mm512_mask_storeu_ps(sc + b, mk, d);
+        mv = _mm512_mask_max_ps(mv, mk, mv, d);
+    }
+    const float m = _mm512_reduce_max_ps(mv);
+    __m512 zv = _mm512_setzero_ps();
+    for (int j = 0; j < nv; j++) o[j] = _mm512_setzero_ps();
+    for (int b = 0; b < n; b += 16) {
+        const int nb = n - b < 16 ? n - b : 16;
+        const __mmask16 mk = v512_tail(nb);
+        const __m512 e = exp512(_mm512_sub_ps(_mm512_maskz_loadu_ps(mk, sc + b), _mm512_set1_ps(m)));
+        zv = _mm512_mask_add_ps(zv, mk, zv, e);
+        _mm512_mask_storeu_ps(sc + b, mk, e);
+        for (int j = 0; j < nb; j++) {
+            const int s = s0 + b + j;
+            const __m512 ev = _mm512_set1_ps(sc[b + j]);
+            if (bf) {
+                const uint16_t *v16 = kv16 + ((size_t)hl * cap + s) * kvd + qn;
+                for (int k = 0; k < nv; k++) o[k] = _mm512_fmadd_ps(ev, bf16x16(v16 + 16 * k), o[k]);
+            } else {
+                const float *vs = kvb + ((size_t)s * H + h) * kvd + qn;
+                for (int k = 0; k < nv; k++) o[k] = _mm512_fmadd_ps(ev, _mm512_loadu_ps(vs + 16 * k), o[k]);
+            }
+        }
+    }
+    pp[0] = m;
+    pp[1] = _mm512_reduce_add_ps(zv);
+    for (int j = 0; j < nv; j++) _mm512_storeu_ps(pp + 2 + 16 * j, o[j]);
+}
+
+/* T <= K3_MT_MAX tokens at positions p0 + t, token t over [0, p0 + t]. A (head, chunk) task
+ * computes every token's partial while the chunk is in cache, so a verify sweep streams the
+ * KV cache once rather than T times; each token's bits are those of a T = 1 call. */
+static void mla_attend_split(float *outb, size_t ostr, const float *qb, size_t qstr, float *part,
+                             int h0, int h1, int p0, int T, const float *kvb, const uint16_t *kv16,
+                             int cap, const float *rpb, int H, int qn, int qr, int vh, float scale)
+{
+    const int qh = qn + qr, nh = h1 - h0, pw = vh + 2, nv = vh / 16;
+    const int nch = (p0 + T + K3_MLA_CH - 1) / K3_MLA_CH;
+    int lo, hi;
+    k3_split(nh * nch, &lo, &hi);
+    for (int task = lo; task < hi; task++) {
+        const int hl = task / nch, ch = task % nch, h = h0 + hl, s0 = ch * K3_MLA_CH;
+        for (int t = 0; t < T; t++) {
+            const int n = p0 + t + 1;
+            if (s0 >= n) continue;
+            const int s1 = s0 + K3_MLA_CH < n ? s0 + K3_MLA_CH : n;
+            float *pp = part + (((size_t)t * nh + hl) * nch + ch) * pw;
+            const float *qt = qb + (size_t)t * qstr + (size_t)h * qh;
+            if (kv16) mla_task(pp, qt, hl, h, s0, s1, kvb, kv16, cap, rpb, H, qn, qr, vh, scale, 1);
+            else      mla_task(pp, qt, hl, h, s0, s1, kvb, kv16, cap, rpb, H, qn, qr, vh, scale, 0);
+        }
+    }
+    k3_sync();
+    k3_split(T * nh * nv, &lo, &hi);
+    for (int task = lo; task < hi; task++) {
+        const int t = task / (nh * nv), hl = task / nv % nh, jb = task % nv;
+        const int nc = (p0 + t + K3_MLA_CH) / K3_MLA_CH;          /* chunks of [0, p0 + t] */
+        const float *pp = part + ((size_t)t * nh + hl) * nch * pw;
+        float m = -INFINITY, z = 0.0f;
+        for (int c = 0; c < nc; c++) if (pp[(size_t)c * pw] > m) m = pp[(size_t)c * pw];
+        __m512 o = _mm512_setzero_ps();
+        for (int c = 0; c < nc; c++) {
+            const float wc = expf(pp[(size_t)c * pw] - m);
+            z += wc * pp[(size_t)c * pw + 1];
+            o = _mm512_fmadd_ps(_mm512_set1_ps(wc), _mm512_loadu_ps(pp + (size_t)c * pw + 2 + 16 * jb), o);
+        }
+        _mm512_storeu_ps(outb + (size_t)t * ostr + (size_t)(h0 + hl) * vh + 16 * jb,
+                         _mm512_mul_ps(o, _mm512_set1_ps(1.0f / z)));
+    }
+}
+#endif
+
 /* ------------------------------------------------------------- Gated MLA ---- */
 /* MLA with an optional KV cache, which is what makes incremental decode possible.
  *
@@ -1365,13 +1516,18 @@ static void mla_team(float *out, const float *x, const K3MlaW *w, const K3Cfg *c
     float *ql   = ct   + (size_t)kvw;               /* [q_lora]       */
     float *acc  = ql   + (size_t)c->q_lora;         /* [H][vh]        */
     float *gbuf = acc  + (size_t)H * vh;            /* [H][vh] gate   */
-    float *sc   = gbuf + (size_t)H * vh;            /* [last+1] scores */
+    float *sc   = gbuf + (size_t)H * vh;            /* [last+1] scores, or split partials */
     /* Without a cache the keys/values live in scratch and cover only this call. */
-    float *kvs  = sc   + (size_t)(last + 1);        /* [T][H][kvd]    */
+    float *kvs  = sc   + mla_sc_floats(H, vh, last + 1, T);   /* [T][H][kvd] */
     float *rps  = kvs  + (kvc ? 0 : (size_t)T * H * kvd);   /* [T][qr] */
 
     #define K3_KV_AT(p)   (kvc   ? kvc   + (size_t)(p) * H * kvd : kvs + (size_t)(p) * H * kvd)
     #define K3_ROPE_AT(p) (ropec ? ropec + (size_t)(p) * qr      : rps + (size_t)(p) * qr)
+    /* K3_KV_BF16: the cache is bf16, [this rank's heads][cap][kvd]; this call's keys and
+     * values are projected into kvs in fp32 first and rounded into it once */
+    const int bf = kvc && k3_kv_bf16_on();
+    uint16_t *kv16 = bf ? (uint16_t *)kvc : NULL;
+    #define K3_KV_W(p)    (bf ? kvs + (size_t)((p) - cached) * H * kvd : K3_KV_AT(p))
 
     /* Tensor parallel: rows of q_a/kv_a are split and gathered (their outputs are
      * normalised as a whole); heads [h0, h1) own q_b, kv_b, their KV slots, attention and
@@ -1421,7 +1577,7 @@ static void mla_team(float *out, const float *x, const K3MlaW *w, const K3Cfg *c
         }
         k3_sync();
         mmw_rows_T(q, H * qh, QL, c->q_lora, T, w->q_b, w->wdt, c->q_lora, h0 * qh, h1 * qh);
-        mmw_rows_T(K3_KV_AT(cached), H * kvd, CT, kvw, T, w->kv_b, w->kv_b_wdt, c->kv_lora,
+        mmw_rows_T(K3_KV_W(cached), H * kvd, CT, kvw, T, w->kv_b, w->kv_b_wdt, c->kv_lora,
                    h0 * kvd, h1 * kvd);
         k3_sync();
     } else
@@ -1448,7 +1604,7 @@ static void mla_team(float *out, const float *x, const K3MlaW *w, const K3Cfg *c
         const uint16_t *qv = amx_pack(1, QL, c->q_lora, T, c->q_lora);
         amx_rows(q, H * qh, qv, T, w->q_b, w->wdt, c->q_lora, h0 * qh, h1 * qh);
         const uint16_t *cv = amx_pack(0, CT, kvw, T, c->kv_lora);
-        amx_rows(K3_KV_AT(cached), H * kvd, cv, T, w->kv_b, w->kv_b_wdt, c->kv_lora, h0 * kvd, h1 * kvd);
+        amx_rows(K3_KV_W(cached), H * kvd, cv, T, w->kv_b, w->kv_b_wdt, c->kv_lora, h0 * kvd, h1 * kvd);
         k3_sync();
     } else
     for (int t = 0; t < T; t++) {
@@ -1474,8 +1630,20 @@ static void mla_team(float *out, const float *x, const K3MlaW *w, const K3Cfg *c
         if (k3_tid() == 0) memcpy(K3_ROPE_AT(p), ct + c->kv_lora, (size_t)qr * sizeof(float));
         k3_sync();
         mmw_rows(q + (size_t)t * H * qh, ql, w->q_b, w->wdt, c->q_lora, h0 * qh, h1 * qh);
-        mmw_rows(K3_KV_AT(p), ct, w->kv_b, w->kv_b_wdt, c->kv_lora, h0 * kvd, h1 * kvd);
+        mmw_rows(K3_KV_W(p), ct, w->kv_b, w->kv_b_wdt, c->kv_lora, h0 * kvd, h1 * kvd);
         k3_sync();                          /* ql/ct are rewritten by the next token */
+    }
+    if (bf) {
+        const int nhl = h1 - h0;
+        int lo, hi;
+        k3_split(T * nhl, &lo, &hi);
+        for (int r = lo; r < hi; r++) {
+            const int t = r / nhl, hl = r % nhl;
+            const float *src = kvs + (size_t)t * H * kvd + (size_t)(h0 + hl) * kvd;
+            uint16_t *dst = kv16 + ((size_t)hl * cap + cached + t) * kvd;
+            for (int i = 0; i < kvd; i++) dst[i] = k3_f2bf(src[i]);
+        }
+        k3_sync();
     }
     k3_prof_add(K3P_MLA_PROJ, tp);
 
@@ -1490,11 +1658,49 @@ static void mla_team(float *out, const float *x, const K3MlaW *w, const K3Cfg *c
                                                sizeof(float), "AMX MLA attention");
         k3_sync();
         float *KH = amx_attn_buf, *VT = KH + (size_t)S * qh, *SP = VT + (size_t)vh * Sp;
+#if defined(K3_AVX512)
+        const int vec = qn % 16 == 0 && vh % 16 == 0;
+#endif
         for (int h = h0; h < h1; h++) {
             int lo, hi;
+#if defined(K3_AVX512)
+            if (vec) {
+                /* 16 positions per task: K rows converted, V moved by 16x16 transposes */
+                k3_split(Sp / 16, &lo, &hi);
+                for (int blk = lo; blk < hi; blk++) {
+                    const int p0 = 16 * blk;
+                    for (int s = p0; s < p0 + 16 && s < S; s++) {
+                        if (bf) {
+                            const uint16_t *kv = kv16 + ((size_t)(h - h0) * cap + s) * kvd;
+                            for (int i = 0; i < qn; i += 16) _mm512_storeu_ps(KH + (size_t)s * qh + i, bf16x16(kv + i));
+                        } else {
+                            memcpy(KH + (size_t)s * qh, K3_KV_AT(s) + (size_t)h * kvd, (size_t)qn * sizeof(float));
+                        }
+                        memcpy(KH + (size_t)s * qh + qn, K3_ROPE_AT(s), (size_t)qr * sizeof(float));
+                    }
+                    for (int jb = 0; jb < vh; jb += 16) {
+                        __m512 r[16];
+                        for (int i = 0; i < 16; i++) {
+                            const int s = p0 + i;
+                            r[i] = s >= S ? _mm512_setzero_ps()
+                                 : bf ? bf16x16(kv16 + ((size_t)(h - h0) * cap + s) * kvd + qn + jb)
+                                      : _mm512_loadu_ps(K3_KV_AT(s) + (size_t)h * kvd + qn + jb);
+                        }
+                        v512_tr16(r);
+                        for (int j = 0; j < 16; j++) _mm512_storeu_ps(VT + (size_t)(jb + j) * Sp + p0, r[j]);
+                    }
+                }
+            } else
+#endif
+            {
             k3_split(Sp, &lo, &hi);
             for (int s = lo; s < hi; s++) {
-                if (s < S) {
+                if (s < S && bf) {
+                    const uint16_t *kv = kv16 + ((size_t)(h - h0) * cap + s) * kvd;
+                    for (int i = 0; i < qn; i++) KH[(size_t)s * qh + i] = k3_bf16f(kv[i]);
+                    memcpy(KH + (size_t)s * qh + qn, K3_ROPE_AT(s), (size_t)qr * sizeof(float));
+                    for (int j = 0; j < vh; j++) VT[(size_t)j * Sp + s] = k3_bf16f(kv[qn + j]);
+                } else if (s < S) {
                     const float *kv = K3_KV_AT(s) + (size_t)h * kvd;
                     memcpy(KH + (size_t)s * qh, kv, (size_t)qn * sizeof(float));
                     memcpy(KH + (size_t)s * qh + qn, K3_ROPE_AT(s), (size_t)qr * sizeof(float));
@@ -1503,6 +1709,7 @@ static void mla_team(float *out, const float *x, const K3MlaW *w, const K3Cfg *c
                     for (int j = 0; j < vh; j++) VT[(size_t)j * Sp + s] = 0.0f;
                 }
             }
+            }
             const uint16_t *qv = amx_pack(0, q + (size_t)h * qh, H * qh, T, qh);
             k3_amx_gemm(SP, Sp, qv, T, KH, K3_GG_F32, qh, 0, 0, S);
             k3_sync();
@@ -1510,6 +1717,33 @@ static void mla_team(float *out, const float *x, const K3MlaW *w, const K3Cfg *c
             for (int t = lo; t < hi; t++) {
                 float *r = SP + (size_t)t * Sp;
                 const int p = cached + t;                /* causal: s <= p */
+#if defined(K3_AVX512)
+                {
+                    const int n = p + 1;
+                    const __m512 sv = _mm512_set1_ps(scale);
+                    __m512 mv = _mm512_set1_ps(-INFINITY), zv = _mm512_setzero_ps();
+                    for (int s = 0; s < n; s += 16) {
+                        const __mmask16 mk = v512_tail(n - s);
+                        const __m512 d = _mm512_mul_ps(_mm512_maskz_loadu_ps(mk, r + s), sv);
+                        _mm512_mask_storeu_ps(r + s, mk, d);
+                        mv = _mm512_mask_max_ps(mv, mk, mv, d);
+                    }
+                    const __m512 m = _mm512_set1_ps(_mm512_reduce_max_ps(mv));
+                    for (int s = 0; s < n; s += 16) {
+                        const __mmask16 mk = v512_tail(n - s);
+                        const __m512 e = exp512(_mm512_sub_ps(_mm512_maskz_loadu_ps(mk, r + s), m));
+                        _mm512_mask_storeu_ps(r + s, mk, e);
+                        zv = _mm512_mask_add_ps(zv, mk, zv, e);
+                    }
+                    const __m512 iz = _mm512_set1_ps(1.0f / _mm512_reduce_add_ps(zv));
+                    for (int s = 0; s < n; s += 16) {
+                        const __mmask16 mk = v512_tail(n - s);
+                        _mm512_mask_storeu_ps(r + s, mk, _mm512_mul_ps(_mm512_maskz_loadu_ps(mk, r + s), iz));
+                    }
+                    for (int s = n; s < Sp; s++) r[s] = 0.0f;
+                    continue;
+                }
+#endif
                 float m = -INFINITY;
                 for (int s = 0; s <= p; s++) { r[s] *= scale; if (r[s] > m) m = r[s]; }
                 double z = 0.0;
@@ -1524,9 +1758,29 @@ static void mla_team(float *out, const float *x, const K3MlaW *w, const K3Cfg *c
         }
         k3_prof_add(K3P_MLA_CORE, tp);
     } else
+#if defined(K3_AVX512)
+    if (mt && mla_split_on(qn, qr, vh)) {
+        tp = k3_prof_t0();
+        mla_attend_split(AC, (size_t)H * vh, q, (size_t)H * qh, sc, h0, h1, cached, T,
+                         kvc ? kvc : kvs, kv16, cap, ropec ? ropec : rps, H, qn, qr, vh, scale);
+        k3_prof_add(K3P_MLA_CORE, tp);
+    } else
+#endif
     for (int t = 0; t < T; t++) {
         const int p = cached + t;
         tp = k3_prof_t0();
+#if defined(K3_AVX512)
+        if (mla_split_on(qn, qr, vh)) {
+            mla_attend_split(acc, 0, q + (size_t)t * H * qh, 0, sc, h0, h1, p, 1, kvc ? kvc : kvs,
+                             kv16, cap, ropec ? ropec : rps, H, qn, qr, vh, scale);
+            k3_prof_add(K3P_MLA_CORE, tp);
+        } else
+#endif
+        {
+        if (bf) {
+            fprintf(stderr, "K3_KV_BF16 needs the split attention kernel (unset K3_MLA_SPLIT=0)\n");
+            abort();
+        }
         int hl, hh;
         k3_split(h1 - h0, &hl, &hh);
         float *scp = sc;
@@ -1559,6 +1813,7 @@ static void mla_team(float *out, const float *x, const K3MlaW *w, const K3Cfg *c
         }
         k3_prof_add(K3P_MLA_CORE, tp);
         if (amx || mt) continue;
+        }
 
         /* ---- output gate then projection. Gate BEFORE o_proj, and no norm on it,
          * unlike KDA which norms first. :470-473 ---- */
@@ -1613,6 +1868,7 @@ static void mla_team(float *out, const float *x, const K3MlaW *w, const K3Cfg *c
     }
     #undef K3_KV_AT
     #undef K3_ROPE_AT
+    #undef K3_KV_W
 }
 
 void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
@@ -1927,8 +2183,9 @@ size_t k3_mla_scratch_cached(const K3Cfg *c, int T, int cap, int cached_mode)
              + (size_t)(c->kv_lora + c->qk_rope)       /* ct transient */
              + (size_t)c->q_lora
              + (size_t)2 * H * vh                      /* acc, gbuf    */
-             + (size_t)(cap > T ? cap : T);            /* scores       */
+             + mla_sc_floats(H, vh, cap > T ? cap : T, T); /* scores or partials */
     if (!cached_mode) n += (size_t)T * H * kvd + (size_t)T * c->qk_rope;
+    else if (k3_kv_bf16_on()) n += (size_t)T * H * kvd;     /* fp32 k|v before rounding */
     return n;
 }
 
