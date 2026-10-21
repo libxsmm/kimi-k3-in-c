@@ -1,6 +1,7 @@
 /* test_gguf.c - GGUF reader and the GGUF weight-format kernels, with no model weights.
  *
- *   1. k3_q80/iq2xs/iq3xxs rows == dequantise + k3_matmul, to the bit
+ *   1. k3_q80/iq2xs/iq3xxs rows == dequantise + k3_matmul, to the bit; k3_gq_to_bf16 ==
+ *      dequantise rounded to bf16
  *   2. the int8-activation kernels (when built) stay within int8 quantisation error
  *   3. a two-shard GGUF written here parses back: metadata, tensor index, offsets, bytes;
  *      and truncated or out-of-range headers are refused
@@ -60,6 +61,20 @@ static void test_kernels(void)
             else { k3_iq3xxs_rows(y1, x, W, in, 0, rows); memcpy(y2, y1, 4 * rows); }
             CHECK(!memcmp(y0, y1, 4 * (size_t)rows), "%s in=%d: fused rows differ from dequantise + k3_matmul", names[ti], in);
             CHECK(!memcmp(y0, y2, 4 * (size_t)rows), "%s in=%d: team matmul differs", names[ti], in);
+            {   /* bf16 panels: 32-wide rows at a padded stride == dequantise, rounded to nearest even */
+                const int64_t n = (int64_t)in * rows;
+                const size_t st = 40;
+                uint16_t *P = (uint16_t *)malloc(2 * st * (size_t)(n / 32));
+                k3_gq_to_bf16(t, W, n, P, st);
+                int bad = 0;
+                for (int64_t k = 0; k < n; k++) {
+                    uint32_t u;
+                    memcpy(&u, Wd + k, 4);
+                    bad += P[(size_t)(k / 32) * st + (k & 31)] != (uint16_t)((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
+                }
+                CHECK(!bad, "%s in=%d: %d bf16 panel values differ from dequantise", names[ti], in, bad);
+                free(P);
+            }
             if (t == K3_GG_Q8_0)
                 for (int T = 1; T <= 8; T++) {
                     float *X = (float *)malloc(sizeof(float) * (size_t)T * in);
@@ -125,7 +140,7 @@ static void test_kernels(void)
             }
             free(W); free(Wd); free(x); free(y0); free(y1); free(y2); free(xq); free(dx);
         }
-    printf("  kernels: q8_0, iq2_xs, iq3_xxs fused == dequantise + k3_matmul%s%s\n",
+    printf("  kernels: q8_0, iq2_xs, iq3_xxs fused == dequantise + k3_matmul; bf16 panels == dequantise%s%s\n",
            k3_gq_have_q8() ? "; int8 paths within tolerance" : " (no int8 kernels in this build)",
            k3_amx_q8_ok() ? "; AMX-INT8 q8_0 batch == one token" : "");
 }
