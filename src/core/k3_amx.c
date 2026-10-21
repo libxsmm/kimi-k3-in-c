@@ -44,6 +44,8 @@ void k3_amx_pack_rows(uint16_t *Xv, const float *X, int ldx, const int *map, int
 { (void)Xv; (void)X; (void)ldx; (void)map; (void)N; (void)in; }
 void k3_amx_pack_cols(uint16_t *Xv, const float *X, int ldx, const int *map, int N, int in)
 { (void)Xv; (void)X; (void)ldx; (void)map; (void)N; (void)in; }
+void k3_amx_pack_cols_bf16(uint16_t *Xv, const uint16_t *X, int ldx, const int *map, int N, int in)
+{ (void)Xv; (void)X; (void)ldx; (void)map; (void)N; (void)in; }
 #else
 
 #define ARCH_REQ_XCOMP_PERM 0x1023
@@ -399,6 +401,31 @@ void k3_amx_pack_cols(uint16_t *Xv, const float *X, int ldx, const int *map, int
             const __m512 b = _mm512_maskz_loadu_ps(m, x + (size_t)(kt * 32 + 2 * j + 1) * ldx);
             _mm512_storeu_si512((void *)(tile + j * 32),
                                 _mm512_permutexvar_epi16(ilv, (__m512i)_mm512_cvtne2ps_pbh(b, a)));
+        }
+    }
+}
+
+void k3_amx_pack_cols_bf16(uint16_t *Xv, const uint16_t *X, int ldx, const int *map, int N, int in)
+{
+    const int KT = in / 32, MT = N / 16;
+    static const uint16_t ilv16[32] __attribute__((aligned(64))) = {
+        0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23,
+        8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31 };
+    const __m512i ilv = _mm512_load_si512((const void *)ilv16);
+    int lo, hi;
+    k3_split(MT * KT, &lo, &hi);
+    for (int i = lo; i < hi; i++) {
+        const int mt = i / KT, kt = i % KT;
+        uint16_t *tile = Xv + (size_t)i * 512;
+        int nv = 0;
+        while (nv < 16 && map[mt * 16 + nv] >= 0) nv++;
+        const __mmask16 m = (__mmask16)((1u << nv) - 1);
+        const uint16_t *x = nv ? X + map[mt * 16] : X;
+        for (int j = 0; j < 16; j++) {
+            const __m256i a = _mm256_maskz_loadu_epi16(m, x + (size_t)(kt * 32 + 2 * j) * ldx);
+            const __m256i b = _mm256_maskz_loadu_epi16(m, x + (size_t)(kt * 32 + 2 * j + 1) * ldx);
+            _mm512_storeu_si512((void *)(tile + j * 32),
+                                _mm512_permutexvar_epi16(ilv, _mm512_inserti64x4(_mm512_castsi256_si512(a), b, 1)));
         }
     }
 }

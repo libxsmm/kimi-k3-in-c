@@ -2974,10 +2974,22 @@ static struct {
     int *sel, *pos, *mapz, *mapa, ng, npad, np, ok;
     float *wq;
     K3AmxGroup *gu, *dn;
-    float *g1, *g3, *actT, *edn;
+    float *g1, *g3, *edn;
+    uint16_t *actT;
 } mx;
 #define K3_AMX_SITU_MAX 512
-#define K3_AMX_MOE_CHUNK 1024
+
+/* tokens per expert pass (K3_AMX_MOE_CHUNK): each pass decodes every selected expert's
+ * weights once, so long passes amortise the decode; the buffers grow with it */
+static int moe_amx_chunk(void)
+{
+    static int n = 0;
+    if (!n) {
+        const char *e = getenv("K3_AMX_MOE_CHUNK");
+        n = e && atoi(e) >= 16 ? atoi(e) : 4096;
+    }
+    return n;
+}
 
 static int moe_experts_amx(float *AC, const float *Z, const float *SC, int T,
                            const K3MoeW *w, const K3Cfg *c)
@@ -2988,12 +3000,13 @@ static int moe_experts_amx(float *AC, const float *Z, const float *SC, int T,
     k3_tp_part(L, &l0, &l1);
     const int ni = i1 - i0, nl = l1 - l0;
     const int sliced = w->src && w->src->sliced;
+    const int have = w->src && w->src->get && !w->cache_only;
 
+    static int *cnt, *gstart;
+    static K3ExpertQ *eq;
     if (k3_tid() == 0) {
         mx.ok = 0;
-        static int *cnt, *gstart;
         static size_t cap_i;
-        static K3ExpertQ *eq;
         const size_t NP = (size_t)T * K, NPAD = NP + (size_t)NE * 15;
         if (cap_i < NPAD) {
             free(mx.sel); free(mx.pos); free(mx.mapz); free(mx.mapa); free(mx.wq);
@@ -3008,13 +3021,20 @@ static int moe_experts_amx(float *AC, const float *Z, const float *SC, int T,
                 k3_fatal_oom("AMX expert plan", NPAD * 16);
             cap_i = NPAD;
         }
-        if (w->src && w->src->get && !w->cache_only) {
+    }
+    k3_sync();
+    if (have) {                                   /* every token's top-k, tokens split */
+        int lo, hi;
+        k3_split(T, &lo, &hi);
+        for (int t = lo; t < hi; t++)
+            router_select(mx.sel + (size_t)t * K, mx.wq + (size_t)t * K, SC + (size_t)t * NE, w->bias,
+                          NE, K, c->moe_renorm, c->routed_scale);
+    }
+    k3_sync();
+    if (k3_tid() == 0) {
+        if (have) {
             memset(cnt, 0, (size_t)NE * sizeof(int));
-            for (int t = 0; t < T; t++) {
-                router_select(mx.sel + (size_t)t * K, mx.wq + (size_t)t * K, SC + (size_t)t * NE, w->bias,
-                              NE, K, c->moe_renorm, c->routed_scale);
-                for (int j = 0; j < K; j++) cnt[mx.sel[(size_t)t * K + j]]++;
-            }
+            for (size_t p = 0; p < (size_t)T * K; p++) cnt[mx.sel[p]]++;
             int ok = 1, pad = 0, ng = 0;
             for (int e = 0; e < NE && ok; e++) {
                 gstart[e] = -1;
@@ -3052,12 +3072,13 @@ static int moe_experts_amx(float *AC, const float *Z, const float *SC, int T,
     k3_sync();
     if (!mx.ok) return 0;
 
-    /* buffers: g1, g3 [npad][ni], actT [I][np], edn [npad][nl] */
+    /* buffers: g1, g3 [npad][ni], edn [npad][nl], actT [I][npe] bf16 (npe even: gathered as floats) */
+    const int npe = (mx.np + 1) & ~1;
     if (k3_tid() == 0) {
-        float *b = (float *)k3_scratch(K3S_AMXE, ((size_t)mx.npad * (2 * ni + nl) + (size_t)I * mx.np) *
+        float *b = (float *)k3_scratch(K3S_AMXE, ((size_t)mx.npad * (2 * ni + nl) + (size_t)I * npe / 2) *
                                        sizeof(float), "AMX experts");
         mx.g1 = b; mx.g3 = b + (size_t)mx.npad * ni; mx.edn = mx.g3 + (size_t)mx.npad * ni;
-        mx.actT = mx.edn + (size_t)mx.npad * nl;
+        mx.actT = (uint16_t *)(mx.edn + (size_t)mx.npad * nl);
         for (int g = 0; g < mx.ng; g++) {
             mx.gu[2 * g].Y = mx.g1; mx.gu[2 * g + 1].Y = mx.g3; mx.dn[g].Y = mx.edn;
         }
@@ -3070,6 +3091,41 @@ static int moe_experts_amx(float *AC, const float *Z, const float *SC, int T,
     k3_amx_pack_rows(amx_xv[0], Z, L, mx.mapz, mx.npad, L);
     k3_amx_gemm_groups(mx.gu, 2 * mx.ng, amx_xv[0], L, i0, i1);
     k3_sync();
+#if defined(K3_AVX512) && defined(__AVX512BF16__)
+    if (ni % 16 == 0) {
+        /* a 16-position tile is one expert's, its valid pairs consecutive columns: 16 pairs
+         * x 16 rows per task, transposed so each row of actT is written contiguously, in
+         * bf16 with the packer's own rounding */
+        const int nrb = ni / 16;
+        int lo, hi;
+        k3_split(mx.npad / 16 * nrb, &lo, &hi);
+        for (int task = lo; task < hi; task++) {
+            const int p0 = task / nrb * 16, r = task % nrb * 16, col0 = mx.mapa[p0];
+            if (col0 < 0) continue;
+            int nv = 1;
+            while (nv < 16 && mx.mapa[p0 + nv] >= 0) nv++;
+            __m512 v[16];
+            const __m512 b1 = _mm512_set1_ps(c->situ_b1), b2 = _mm512_set1_ps(c->situ_b2);
+            const __m512 ib1 = _mm512_set1_ps(1.0f / c->situ_b1), ib2 = _mm512_set1_ps(1.0f / c->situ_b2);
+            for (int j = 0; j < 16; j++) {
+                if (j < nv) {
+                    /* situ_range in SIMD: b1 tanh(g / b1) sigmoid(g) * b2 tanh(u / b2) */
+                    const __m512 g = _mm512_loadu_ps(mx.g1 + (size_t)(p0 + j) * ni + r);
+                    const __m512 u = _mm512_loadu_ps(mx.g3 + (size_t)(p0 + j) * ni + r);
+                    const __m512 sg = _mm512_div_ps(_mm512_set1_ps(1.0f), _mm512_add_ps(_mm512_set1_ps(1.0f),
+                                                    exp512(_mm512_sub_ps(_mm512_setzero_ps(), g))));
+                    const __m512 a = _mm512_mul_ps(_mm512_mul_ps(b1, tanh512(_mm512_mul_ps(g, ib1))), sg);
+                    v[j] = _mm512_mul_ps(a, _mm512_mul_ps(b2, tanh512(_mm512_mul_ps(u, ib2))));
+                } else v[j] = _mm512_setzero_ps();
+            }
+            v512_tr16(v);
+            const __mmask16 m = v512_tail(nv);
+            for (int i = 0; i < 16; i++)
+                _mm256_mask_storeu_epi16(mx.actT + (size_t)(i0 + r + i) * npe + col0, m,
+                                         (__m256i)_mm512_cvtneps_pbh(v[i]));
+        }
+    } else
+#endif
     {
         int lo, hi;
         k3_split(mx.npad, &lo, &hi);
@@ -3081,17 +3137,18 @@ static int moe_experts_amx(float *AC, const float *Z, const float *SC, int T,
                 const int n = ni - r0 < K3_AMX_SITU_MAX ? ni - r0 : K3_AMX_SITU_MAX;
                 situ_range(tmp, mx.g1 + (size_t)p * ni + r0, mx.g3 + (size_t)p * ni + r0, n,
                            c->situ_b1, c->situ_b2);
-                for (int i = 0; i < n; i++) mx.actT[(size_t)(i0 + r0 + i) * mx.np + col] = tmp[i];
+                for (int i = 0; i < n; i++) mx.actT[(size_t)(i0 + r0 + i) * npe + col] = k3_f2bf(tmp[i]);
             }
         }
     }
     {
-        const K3Seg sa = { mx.actT, I * mx.np, mx.np, 0 };   /* rank r owns act rows [i0, i1) */
+        /* rank r owns act rows [i0, i1); bf16 bits travel as floats, exact */
+        const K3Seg sa = { (float *)mx.actT, I * npe / 2, npe / 2, 1 };
         k3_tp_gather(&sa, 1);
     }
 
     /* down: every expert's act through its rows [l0, l1) */
-    k3_amx_pack_cols(amx_xv[1], mx.actT, mx.np, mx.mapa, mx.npad, I);
+    k3_amx_pack_cols_bf16(amx_xv[1], mx.actT, npe, mx.mapa, mx.npad, I);
     k3_amx_gemm_groups(mx.dn, mx.ng, amx_xv[1], I, l0, l1);
     k3_sync();
     {
@@ -3169,8 +3226,8 @@ static void moe_team_amx(float *out, const float *x, const K3MoeW *w, const K3Cf
 
     tp = k3_prof_t0();
     int batched = 1;
-    for (int t0 = 0; t0 < T && batched; t0 += K3_AMX_MOE_CHUNK) {   /* bounds the act gather */
-        const int tc = T - t0 < K3_AMX_MOE_CHUNK ? T - t0 : K3_AMX_MOE_CHUNK;
+    for (int t0 = 0; t0 < T && batched; t0 += moe_amx_chunk()) {   /* bounds the act gather */
+        const int tc = T - t0 < moe_amx_chunk() ? T - t0 : moe_amx_chunk();
         batched = moe_experts_amx(AC + (size_t)t0 * L, Z + (size_t)t0 * L, SC + (size_t)t0 * NE, tc, w, c);
     }
     k3_prof_add(K3P_EXPERTS, tp);

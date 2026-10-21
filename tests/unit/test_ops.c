@@ -21,6 +21,7 @@
 
 #include "json.h"
 #include "k3.h"
+#include "k3_simd.h"
 
 /* FALLBACKS ONLY. The authority is the tolerance block in MANIFEST.json, loaded by main
  * and applied to every comparison. These values are used only if the manifest cannot be
@@ -1159,6 +1160,37 @@ static void t_mla_split(void)
     free(kvc); free(ropec); free(scr);
 }
 
+/* exp512 and tanh512 (k3_simd.h) against double libm: relative error over [-87, 88] and
+ * [-30, 30] on a dense grid plus tiny magnitudes, where tanh must stay relative-exact. */
+static void t_simd_math(void)
+{
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+    double ee = 0, et = 0;
+    float x[16], y[16];
+    for (int k = 0; k < 2; k++) {
+        const double lo = k ? -30.0 : -87.0, hi = k ? 30.0 : 88.0;
+        const int n = 1 << 21;
+        for (int i = 0; i < n; i += 16) {
+            for (int j = 0; j < 16; j++) {
+                x[j] = (float)(lo + (hi - lo) * (i + j) / n);
+                if (k && (i / 16) % 4 == 0) x[j] = ldexpf(x[j], -12 - (j % 12));   /* tiny */
+            }
+            if (k == 0) {
+                _mm512_storeu_ps(y, exp512(_mm512_loadu_ps(x)));
+                for (int j = 0; j < 16; j++) ee = fmax(ee, fabs(y[j] - exp((double)x[j])) / exp((double)x[j]));
+            } else {
+                _mm512_storeu_ps(y, tanh512(_mm512_loadu_ps(x)));
+                for (int j = 0; j < 16; j++)
+                    if (x[j] != 0.0f) et = fmax(et, fabs(y[j] - tanh((double)x[j])) / fabs(tanh((double)x[j])));
+            }
+        }
+    }
+    const int ok = ee < 4e-7 && et < 4e-7;
+    printf("  %s  simd_math     exp512 max rel err %.2e, tanh512 %.2e\n", ok ? "PASS" : "FAIL", ee, et);
+    if (ok) g_pass++; else g_fail++;
+#endif
+}
+
 int main(int argc, char **argv)
 {
     const char *dir = (argc > 1) ? argv[1] : "../fixtures/ops";
@@ -1194,6 +1226,7 @@ int main(int argc, char **argv)
     t_router(dir);
     t_mla(dir);
     t_mla_split();
+    t_simd_math();
     t_moe(dir);
     t_moe_streamed();
     t_mxfp4(dir);

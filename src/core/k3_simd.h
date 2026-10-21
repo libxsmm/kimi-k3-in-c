@@ -31,6 +31,25 @@ static inline __m512 exp512(__m512 x)
     return _mm512_scalef_ps(_mm512_add_ps(p, _mm512_set1_ps(1.0f)), n);
 }
 
+/* tanh to a few ulp: the [7/6] Pade (Lambert continued fraction) in x^2 below 0.625 in
+ * magnitude, 1 - 2 / (e^(2|x|) + 1) with x's sign above, where it has no cancellation */
+static inline __m512 tanh512(__m512 x)
+{
+    const __m512 ax = _mm512_abs_ps(x), x2 = _mm512_mul_ps(x, x);
+    __m512 nu = _mm512_add_ps(x2, _mm512_set1_ps(378.0f));
+    nu = _mm512_fmadd_ps(nu, x2, _mm512_set1_ps(17325.0f));
+    nu = _mm512_mul_ps(_mm512_fmadd_ps(nu, x2, _mm512_set1_ps(135135.0f)), x);
+    __m512 de = _mm512_fmadd_ps(x2, _mm512_set1_ps(28.0f), _mm512_set1_ps(3150.0f));
+    de = _mm512_fmadd_ps(de, x2, _mm512_set1_ps(62370.0f));
+    de = _mm512_fmadd_ps(de, x2, _mm512_set1_ps(135135.0f));
+    const __m512 small = _mm512_div_ps(nu, de);
+    const __m512 e = exp512(_mm512_add_ps(ax, ax));
+    __m512 big = _mm512_sub_ps(_mm512_set1_ps(1.0f),
+                               _mm512_div_ps(_mm512_set1_ps(2.0f), _mm512_add_ps(e, _mm512_set1_ps(1.0f))));
+    big = _mm512_or_ps(big, _mm512_and_ps(x, _mm512_set1_ps(-0.0f)));
+    return _mm512_mask_blend_ps(_mm512_cmp_ps_mask(ax, _mm512_set1_ps(0.625f), _CMP_LT_OQ), big, small);
+}
+
 /* lane j = the horizontal sum of a[j], by a fixed tree */
 static inline __m512 v512_sum16(const __m512 a[16])
 {
