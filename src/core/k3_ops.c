@@ -1036,9 +1036,87 @@ void k3_mmw_tp_T(float *Y, int ldy, const float *X, int ldx, int T, const void *
 }
 
 /* Gather `rows` consecutive vectors of n floats, each partitioned in blocks of unit. */
+/* Long gathers over node shared memory as one exchange of whole row slices (rows >= 32;
+ * returns 0 when the regions are absent or too small). bf: peers receive each value as
+ * the bf16 that VCVTNEPS2BF16 makes of it, the owner keeps fp32; for vectors whose only
+ * reader is the AMX packer, which rounds the same way, every rank then packs the same
+ * tiles. */
+static int tp_big_rows(float *p, int rows, int n, int unit, int exact, int bf)
+{
+    const int P = k3_tp.size, me = k3_tp.rank, nu = n / unit;
+    if (P <= 1 || rows < 32 || !tp_big(1, 0)) return 0;
+#if !(defined(K3_AVX512) && defined(__AVX512BF16__))
+    bf = 0;
+#endif
+    int wmax = 0;
+    for (int r = 0; r < P; r++) {
+        const int w = (int)((long)nu * (r + 1) / P - (long)nu * r / P) * unit;
+        if (w > wmax) wmax = w;
+    }
+    const long half = k3_tp.big_cap / 2;
+    const long rc = half / (bf ? ((wmax + 31) & ~31) / 2 : wmax);
+    if (rc < 1) return 0;
+    const int lp = (k3_act_bf16 & K3_BF16_TP) && !exact;
+    const int lo_me = (int)((long)nu * me / P) * unit, w_me = (int)((long)nu * (me + 1) / P) * unit - lo_me;
+    for (int g = 0; g < rows; g += (int)rc) {
+        const int nr = rows - g < rc ? rows - g : (int)rc;
+        k3_sync();                               /* every thread's rows are written */
+        const double t0 = k3_prof_on && k3_tid() == 0 ? k3_prof_now() : 0.0;
+        const long base = (long)(tp_big_turn & 1) * half;
+        int a, b;
+        k3_split(nr, &a, &b);
+        for (int r = a; r < b; r++) {
+            float *s = p + (size_t)(g + r) * n + lo_me;
+            if (lp) for (int i = 0; i < w_me; i++) s[i] = k3_bf16f(k3_f2bf(s[i]));
+#if defined(K3_AVX512) && defined(__AVX512BF16__)
+            if (bf) {
+                uint16_t *d = (uint16_t *)(k3_tp.big[me] + base) + (size_t)r * ((w_me + 31) & ~31);
+                for (int i = 0; i < w_me; i += 16) {
+                    const __mmask16 m = v512_tail(w_me - i);
+                    _mm256_mask_storeu_epi16(d + i, m, (__m256i)_mm512_cvtneps_pbh(_mm512_maskz_loadu_ps(m, s + i)));
+                }
+                continue;
+            }
+#endif
+            memcpy(k3_tp.big[me] + base + (size_t)r * w_me, s, (size_t)w_me * sizeof(float));
+        }
+        k3_sync();
+        if (k3_tid() == 0) k3_tp.barrier(k3_tp.ctx);
+        k3_sync();
+        for (int q = 0; q < P; q++) {
+            if (q == me) continue;
+            const int lo = (int)((long)nu * q / P) * unit, w = (int)((long)nu * (q + 1) / P) * unit - lo;
+            for (int r = a; r < b; r++) {
+                float *d = p + (size_t)(g + r) * n + lo;
+#if defined(K3_AVX512) && defined(__AVX512BF16__)
+                if (bf) {
+                    const uint16_t *s = (const uint16_t *)(k3_tp.big[q] + base) + (size_t)r * ((w + 31) & ~31);
+                    for (int i = 0; i < w; i += 16) {
+                        const __mmask16 m = v512_tail(w - i);
+                        _mm512_mask_storeu_ps(d + i, m, _mm512_castsi512_ps(_mm512_slli_epi32(
+                            _mm512_cvtepu16_epi32(_mm256_maskz_loadu_epi16(m, s + i)), 16)));
+                    }
+                    continue;
+                }
+#endif
+                memcpy(d, k3_tp.big[q] + base + (size_t)r * w, (size_t)w * sizeof(float));
+            }
+        }
+        k3_sync();
+        if (k3_tid() == 0) {
+            tp_big_turn++;                       /* read only after the next gather's first sync */
+            k3_tp.calls++;
+            k3_tp.floats += (double)nr * n;
+            if (k3_prof_on) k3_prof_s[K3P_COMM] += k3_prof_now() - t0;
+        }
+    }
+    return 1;
+}
+
 static void tp_gather_rows_ex(float *p, int rows, int n, int unit, int exact)
 {
     if ((k3_tp.size <= 1 && !(k3_act_bf16 & K3_BF16_TP)) || rows <= 0) { k3_sync(); return; }
+    if (tp_big_rows(p, rows, n, unit, exact, 0)) return;
     K3Seg *s = (K3Seg *)k3_scratch(K3S_SEGS, (size_t)TP_MAXSEG * sizeof(K3Seg), "TP gather segments");
     /* at most TP_MAXSEG segments per gather: a long prompt is gathered in groups of rows */
     for (int g = 0; g < rows; g += TP_MAXSEG) {
@@ -1052,6 +1130,13 @@ static void tp_gather_rows_ex(float *p, int rows, int n, int unit, int exact)
 
 static void tp_gather_rows(float *p, int rows, int n, int unit)
 {
+    tp_gather_rows_ex(p, rows, n, unit, 0);
+}
+
+/* for vectors read only by amx_pack: bf16 transport where tp_big_rows applies */
+static void tp_gather_rows_bf(float *p, int rows, int n, int unit)
+{
+    if (k3_tp.size > 1 && !(k3_act_bf16 & K3_BF16_TP) && tp_big_rows(p, rows, n, unit, 0, 1)) return;
     tp_gather_rows_ex(p, rows, n, unit, 0);
 }
 
@@ -1892,7 +1977,7 @@ static void mla_team(float *out, const float *x, const K3MlaW *w, const K3Cfg *c
                 for (int i = h0 * vh; i < h1 * vh; i++)
                     AC[(size_t)t * H * vh + i] *= 1.0f / (1.0f + expf(-GB[(size_t)t * H * vh + i]));
         }
-        tp_gather_rows(AC, T, H * vh, vh);
+        tp_gather_rows_bf(AC, T, H * vh, vh);
         const uint16_t *av = amx_pack(1, AC, H * vh, T, H * vh);
         amx_rows(out, E, av, T, w->o, w->wdt, H * vh, e0, e1);
         tp_gather_rows(out, T, E, 1);
@@ -3314,7 +3399,7 @@ static void moe_team_amx(float *out, const float *x, const K3MoeW *w, const K3Cf
     k3_prof_add(K3P_EXPERTS, tp);
     if (batched) {
         tp = k3_prof_t0();
-        tp_gather_rows(SA, T, SI, 1);
+        tp_gather_rows_bf(SA, T, SI, 1);
         k3_prof_add(K3P_SHARED, tp);
     } else
     for (int t = 0; t < T; t++) {
@@ -3826,7 +3911,7 @@ static void kda_layer_team(float *out, const float *x, const K3KdaW *w, const K3
             rmsnorm_serial(o + off, o + off, w->o_norm, D, c->rms_eps);
             for (int i = 0; i < D; i++) o[off + i] *= sigmoidf_(z[off + i]);
         }
-        tp_gather_rows(o, T, P, D);
+        tp_gather_rows_bf(o, T, P, D);
         const uint16_t *ov = amx_pack(1, o, P, T, P);
         amx_rows(out, E, ov, T, w->o, w->wdt, P, e0, e1);
         tp_gather_rows(out, T, E, 1);
@@ -4108,7 +4193,7 @@ static void layer_team(float *h, float *block_residual, int *n_blocks,
                 for (int t = tl; t < th; t++)
                     situ_range(A + (size_t)t * DI + d0, G + (size_t)t * DI + d0, U + (size_t)t * DI + d0,
                                d1 - d0, c->situ_b1, c->situ_b2);
-                tp_gather_rows(A, tc, DI, 1);
+                tp_gather_rows_bf(A, tc, DI, 1);
                 const uint16_t *av = amx_pack(1, A, DI, tc, DI);
                 amx_rows(tmp + (size_t)t0 * E, E, av, tc, w->dense_down, w->wdt, DI, e0, e1);
                 k3_sync();                      /* G, U, A are rewritten by the next chunk */
