@@ -44,6 +44,9 @@ typedef struct {
     /* work buffers */
     float *wk;
     size_t wk_floats;
+    float *att;                  /* batched attention: queries, scores, P x latent */
+    size_t att_floats;
+    int    att_ref;              /* K3_DSPARK_ATT=0: the per-(token, head) reference path */
     /* stats */
     long   steps, drafted;
     double t_ctx, t_draft;

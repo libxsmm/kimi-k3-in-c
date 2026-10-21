@@ -12,9 +12,10 @@
 #ifdef _OPENMP
 #include <omp.h>
 #endif
-#if defined(__AVX512F__) && defined(__AVX512BW__)
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
 #define K3D_AVX512 1
 #include <immintrin.h>
+#include "k3_simd.h"
 #endif
 
 #include "k3.h"
@@ -94,12 +95,6 @@ static char *read_text(const char *path)
 /* ------------------------------------------------------------------ kernels */
 /* Y[t][o] = W[o] . X[t] for o in [0, out), t < T; W bf16 [out][in], X fp32 [T][in]. */
 #if defined(K3D_AVX512)
-static inline __m512 bf16x16(const uint16_t *p)
-{
-    return _mm512_castsi512_ps(_mm512_slli_epi32(
-        _mm512_cvtepu16_epi32(_mm256_loadu_si256((const __m256i *)p)), 16));
-}
-
 #define K3D_GEMM_BF16_T(TT)                                                              \
 static void gemm_bf16_##TT(float *Y, int ldy, const float *X, int ldx,                   \
                            const uint16_t *W, int in, int o0, int o1)                    \
@@ -414,6 +409,15 @@ int k3_dspark_open(K3DSpark *d, const char *dir, int vocab, int hidden, int cap)
                    (size_t)vocab + 64;
     d->wk = (float *)malloc(d->wk_floats * sizeof(float));
     if (!d->lat || !d->kpe || !d->wk) { k3_dspark_close(d); return -1; }
+    d->att_ref = getenv("K3_DSPARK_ATT") && !strcmp(getenv("K3_DSPARK_ATT"), "0");
+#if defined(K3D_AVX512)
+    if (d->kv_lora % 16 == 0 && d->rope % 16 == 0) {
+        const size_t Mp = (T * NH + 15) / 16 * 16, np = ((size_t)cap + T + 15) / 16 * 16;
+        d->att_floats = Mp * ((size_t)d->kv_lora + d->rope) + Mp * np + Mp * d->kv_lora;
+        d->att = (float *)malloc(d->att_floats * sizeof(float));
+        if (!d->att) { k3_dspark_close(d); return -1; }
+    }
+#endif
     if (k3_tp.rank == 0)
         printf("dspark: %d layers, %d heads, target layers", d->nl, d->nh);
     for (int j = 0; j < d->ntgt && k3_tp.rank == 0; j++) printf(" %d", d->tgt[j]);
@@ -426,7 +430,7 @@ int k3_dspark_open(K3DSpark *d, const char *dir, int vocab, int hidden, int cap)
 void k3_dspark_close(K3DSpark *d)
 {
     if (d->blob) munmap(d->blob, d->blob_bytes);
-    free(d->lat); free(d->kpe); free(d->wk);
+    free(d->lat); free(d->kpe); free(d->wk); free(d->att);
     memset(d, 0, sizeof *d);
 }
 
@@ -507,6 +511,125 @@ static void attend(const K3DSpark *d, int l, const uint16_t *kvb, const float *q
     }
 }
 
+#if defined(K3D_AVX512)
+/* attend() for all nq x NH (token, head) queries at once. Every head reads the same
+ * latent rows, so with the queries absorbed into the latent space the scores and the
+ * value sum are two GEMMs over the context, in 16x16 register tiles: each latent row is
+ * read once per 16 queries rather than once per query. ao is [nq][NH * vh]. */
+static void attend_batched(const K3DSpark *d, int l, const uint16_t *kv_b, const float *q,
+                           const float *blat, const float *bkpe, int nq, int pos, float *ao)
+{
+    const int KL = d->kv_lora, R = d->rope, NP = d->nope, NH = d->nh, vh = d->vh;
+    const int KQ = KL + R, QH = NP + R, M = nq * NH, Mp = (M + 15) / 16 * 16;
+    const int ns = pos + nq, nsp = (ns + 15) / 16 * 16, nmb = Mp / 16, nsb = nsp / 16;
+    float *QT = d->att;                              /* [KQ][Mp] absorbed queries, transposed */
+    float *P  = QT + (size_t)KQ * Mp;                /* [Mp][nsp] scores, then probabilities */
+    float *OL = P + (size_t)Mp * nsp;                /* [Mp][KL] P x latent */
+    const float *lat = d->lat + (size_t)l * d->cap * KL, *kpe = d->kpe + (size_t)l * d->cap * R;
+    #define LROW(s) ((s) < pos ? lat + (size_t)(s) * KL : blat + (size_t)((s) - pos) * KL)
+    #define KROW(s) ((s) < pos ? kpe + (size_t)(s) * R : bkpe + (size_t)((s) - pos) * R)
+    #pragma omp parallel
+    {
+        /* 1. absorb: ql = q_nope . k_b[h], both parts pre-scaled */
+        float ql[512] __attribute__((aligned(64)));
+        #pragma omp for schedule(static)
+        for (int th = 0; th < Mp; th++) {
+            if (th >= M) {
+                for (int k = 0; k < KQ; k++) QT[(size_t)k * Mp + th] = 0.0f;
+                continue;
+            }
+            const int t = th / NH, h = th % NH;
+            const float *qt = q + (size_t)t * NH * QH + (size_t)h * QH;
+            const uint16_t *kb = kv_b + (size_t)h * (NP + vh) * KL;
+            for (int k = 0; k < KL; k += 16) _mm512_store_ps(ql + k, _mm512_setzero_ps());
+            for (int i = 0; i < NP; i++) {
+                const __m512 qi = _mm512_set1_ps(qt[i]);
+                for (int k = 0; k < KL; k += 16)
+                    _mm512_store_ps(ql + k, _mm512_fmadd_ps(qi, bf16x16(kb + (size_t)i * KL + k),
+                                                            _mm512_load_ps(ql + k)));
+            }
+            for (int k = 0; k < KL; k++) QT[(size_t)k * Mp + th] = ql[k] * d->scale;
+            for (int k = 0; k < R; k++) QT[(size_t)(KL + k) * Mp + th] = qt[NP + k] * d->scale;
+        }
+        /* 2. scores, 16 positions x 16 queries per tile */
+        #pragma omp for schedule(static)
+        for (int tile = 0; tile < nsb * nmb; tile++) {
+            const int s0 = tile / nmb * 16, m0 = tile % nmb * 16;
+            const float *lr[16], *kr[16];
+            for (int p = 0; p < 16; p++) {
+                const int s = s0 + p < ns ? s0 + p : ns - 1;   /* padding: masked in step 3 */
+                lr[p] = LROW(s);
+                kr[p] = KROW(s);
+            }
+            __m512 acc[16];
+            for (int p = 0; p < 16; p++) acc[p] = _mm512_setzero_ps();
+            for (int k = 0; k < KL; k++) {
+                const __m512 b = _mm512_loadu_ps(QT + (size_t)k * Mp + m0);
+                for (int p = 0; p < 16; p++) acc[p] = _mm512_fmadd_ps(_mm512_set1_ps(lr[p][k]), b, acc[p]);
+            }
+            for (int k = 0; k < R; k++) {
+                const __m512 b = _mm512_loadu_ps(QT + (size_t)(KL + k) * Mp + m0);
+                for (int p = 0; p < 16; p++) acc[p] = _mm512_fmadd_ps(_mm512_set1_ps(kr[p][k]), b, acc[p]);
+            }
+            v512_tr16(acc);                          /* acc[i] lane p = score(m0 + i, s0 + p) */
+            for (int i = 0; i < 16; i++) _mm512_storeu_ps(P + (size_t)(m0 + i) * nsp + s0, acc[i]);
+        }
+        /* 3. softmax over [0, ns), non-causal within the block */
+        #pragma omp for schedule(static)
+        for (int th = 0; th < M; th++) {
+            float *r = P + (size_t)th * nsp;
+            __m512 mv = _mm512_set1_ps(-INFINITY), zv = _mm512_setzero_ps();
+            for (int s = 0; s < ns; s += 16) {
+                const __mmask16 mk = ns - s >= 16 ? 0xFFFF : (__mmask16)((1u << (ns - s)) - 1);
+                mv = _mm512_mask_max_ps(mv, mk, mv, _mm512_loadu_ps(r + s));
+            }
+            const __m512 m = _mm512_set1_ps(_mm512_reduce_max_ps(mv));
+            for (int s = 0; s < ns; s += 16) {
+                const __mmask16 mk = ns - s >= 16 ? 0xFFFF : (__mmask16)((1u << (ns - s)) - 1);
+                const __m512 e = exp512(_mm512_sub_ps(_mm512_maskz_loadu_ps(mk, r + s), m));
+                _mm512_mask_storeu_ps(r + s, mk, e);
+                zv = _mm512_mask_add_ps(zv, mk, zv, e);
+            }
+            const __m512 iz = _mm512_set1_ps(1.0f / _mm512_reduce_add_ps(zv));
+            for (int s = 0; s < ns; s += 16) {
+                const __mmask16 mk = ns - s >= 16 ? 0xFFFF : (__mmask16)((1u << (ns - s)) - 1);
+                _mm512_mask_storeu_ps(r + s, mk, _mm512_mul_ps(_mm512_maskz_loadu_ps(mk, r + s), iz));
+            }
+        }
+        /* 4. P x latent, 16 queries x 16 latent columns per tile */
+        const int nkb = KL / 16, mm = (M + 15) / 16;
+        #pragma omp for schedule(static)
+        for (int tile = 0; tile < mm * nkb; tile++) {
+            const int m0 = tile / nkb * 16, k0 = tile % nkb * 16, mi = M - m0 < 16 ? M - m0 : 16;
+            __m512 acc[16];
+            for (int i = 0; i < 16; i++) acc[i] = _mm512_setzero_ps();
+            for (int s = 0; s < ns; s++) {
+                const __m512 b = _mm512_loadu_ps(LROW(s) + k0);
+                for (int i = 0; i < mi; i++)
+                    acc[i] = _mm512_fmadd_ps(_mm512_set1_ps(P[(size_t)(m0 + i) * nsp + s]), b, acc[i]);
+            }
+            for (int i = 0; i < mi; i++) _mm512_storeu_ps(OL + (size_t)(m0 + i) * KL + k0, acc[i]);
+        }
+        /* 5. out = v_b[h] . (P x latent) */
+        #pragma omp for schedule(static)
+        for (int th = 0; th < M; th++) {
+            const int t = th / NH, h = th % NH;
+            const float *ol = OL + (size_t)th * KL;
+            const uint16_t *vb = kv_b + ((size_t)h * (NP + vh) + NP) * KL;
+            float *out = ao + (size_t)t * NH * vh + (size_t)h * vh;
+            for (int j = 0; j < vh; j++) {
+                __m512 a = _mm512_setzero_ps();
+                for (int k = 0; k < KL; k += 16)
+                    a = _mm512_fmadd_ps(bf16x16(vb + (size_t)j * KL + k), _mm512_loadu_ps(ol + k), a);
+                out[j] = _mm512_reduce_add_ps(a);
+            }
+        }
+    }
+    #undef LROW
+    #undef KROW
+}
+#endif
+
 static int argmax_f(const float *v, int n)
 {
     int b = 0;
@@ -565,6 +688,15 @@ int k3_dspark_propose(K3DSpark *d, int anchor, int pos, int nq, const void *lm_h
             rope_apply(d, bkpe + (size_t)t * d->rope, pos + t);
             for (int h = 0; h < NH; h++) rope_apply(d, q + (size_t)t * MQ + (size_t)h * QH + d->nope, pos + t);
         }
+        const int batched = d->att && !d->att_ref;
+#if defined(K3D_AVX512)
+        if (batched)
+            attend_batched(d, l, L->kv_b, q, blat, bkpe, nq, pos, ao);
+#endif
+        const int check = batched && d->dump && d->steps == 0 && k3_tp.rank == 0;
+        float *ref = check ? (float *)malloc((size_t)nq * AO * sizeof(float)) : NULL;
+        if (!batched || ref) {
+        float *dst = batched ? ref : ao;
         #pragma omp parallel
         {
             float *sc = (float *)malloc((size_t)(pos + nq) * sizeof(float));
@@ -574,9 +706,19 @@ int k3_dspark_propose(K3DSpark *d, int anchor, int pos, int nq, const void *lm_h
                 const int t = th / NH, h = th % NH;
                 attend(d, l, L->kv_b + (size_t)h * (d->nope + d->vh) * d->kv_lora,
                        q + (size_t)t * MQ + (size_t)h * QH, blat, bkpe, nq, pos,
-                       ao + (size_t)t * AO + (size_t)h * d->vh, sc, ql, ol);
+                       dst + (size_t)t * AO + (size_t)h * d->vh, sc, ql, ol);
             }
             free(sc);
+        }
+        }
+        if (ref) {
+            double md = 0, mx = 0;
+            for (size_t i = 0; i < (size_t)nq * AO; i++) {
+                md = fmax(md, fabs((double)ref[i] - ao[i]));
+                mx = fmax(mx, fabs((double)ref[i]));
+            }
+            printf("dspark check: layer %d batched attention max|diff| %.3g (max|out| %.3g)\n", l, md, mx);
+            free(ref);
         }
         gemm_bf16(a, ao, nq, L->o, AO, H);
         for (size_t i = 0; i < (size_t)nq * H; i++) R[i] += a[i];
