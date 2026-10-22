@@ -265,6 +265,40 @@ srun -p <partition> -N1 --ntasks-per-node=6 --exclusive bash -c 'source <mpi-env
     --ids "$(cat kimi-k3-in-c/benchmarks/serve/ids_chat.txt)" --gen 128 --incremental' | grep -A20 "^profile:"
 ```
 
+### 9. Prefill/decode shmoo over prompt length
+
+```bash
+sbatch -p <partition> --export=ALL,MPI_ENV=<mpi-env.sh> kimi-k3-in-c/benchmarks/serve/shmoo.sbatch
+```
+
+What the job does:
+
+- Runs [shmoo.sh](../benchmarks/serve/shmoo.sh) with the recommended settings: AMX
+  prefill, int8 activations and a bf16 KV cache, without (`plain`) and with DSpark
+  (`ds3`).
+- Sends exact-length prompts with no prompt caching, built from this repository's
+  sources and docs by [shmoo.py](../benchmarks/serve/shmoo.py), and generates 256 tokens
+  for each.
+- Writes one TSV row per request and saves every answer (`<cfg>.text.jsonl`), so the output
+  can be checked as well as timed.
+- Ends with a table of median prefill and decode tok/s per prompt length.
+- Results land in `results/shmoo-<jobid>/`.
+
+Settings, all optional, added to `--export`:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `LENS` | `1024 4096 8192 16384 32512` | prompt lengths in tokens |
+| `CFGS` | `plain ds3` | `plain`, `dsN` (DSpark drafting N tokens) |
+| `WORKLOADS` | `code,chat` | also `code_direct`, `copy`, `count` (thinking off) |
+| `REPEATS`, `GEN` | `2`, `256` | repeats per length, generated tokens |
+| `NP`, `THREADS`, `MAP`, `BIND` | `6`, `42`, `ppr:1:numa`, `numa` | one rank per SNC domain |
+| `KV_BF16` | `1` | `0` keeps the KV cache in fp32 |
+
+On another layout, set the rank mapping to match it: one rank per L3 domain, with that
+domain's cores as its threads, e.g. `NP=<domains> THREADS=<cores per domain>
+MAP=ppr:1:l3cache:PE=<cores per domain> BIND=core`.
+
 ## Pitfalls
 
 - **Leftover ranks.** Killing `mpirun` can leave engine ranks running, each holding about
