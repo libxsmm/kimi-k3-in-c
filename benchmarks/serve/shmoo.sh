@@ -18,6 +18,9 @@
 #   NP=6 THREADS=42 MAP=ppr:1:numa BIND=numa KV_BF16=1 PORT=18080 OUT=./shmoo-<date>
 #   CTX       default: the longest prompt plus GEN, rounded up to 1024
 #
+# System settings (root, not changed here; the run prints them): transparent huge pages
+# "always" and automatic NUMA balancing off (kernel.numa_balancing=0).
+#
 # Ends with a summary: median prefill and decode tok/s per length and configuration.
 set -uo pipefail
 : "${K3:?set K3}" "${MODEL:?set MODEL}" "${LLAMA_BIN:?set LLAMA_BIN}"
@@ -34,6 +37,8 @@ unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY no_proxy
 hostname; date
 echo "ranks $NP x $THREADS threads, map $MAP, bind $BIND, context $CTX, lengths $LENS"
 echo "workloads $WORKLOADS, $REPEATS repeats, $GEN generated tokens, bf16 KV cache: $KV_BF16"
+echo "transparent huge pages: $(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null)" \
+     "| NUMA balancing: $(cat /proc/sys/kernel/numa_balancing 2>/dev/null)   (recommended: [always], 0)"
 
 cleanup() {   # mpirun can leave ranks behind (~150 GB each); never start an engine on top of them
     pkill -9 -f "$K3 " 2>/dev/null; sleep 5

@@ -299,6 +299,16 @@ On another layout, set the rank mapping to match it: one rank per L3 domain, wit
 domain's cores as its threads, e.g. `NP=<domains> THREADS=<cores per domain>
 MAP=ppr:1:l3cache:PE=<cores per domain> BIND=core`.
 
+Recommended setup, in full:
+
+- **Engine environment**, exported by `shmoo.sh` to every rank: `K3_PREFILL_AMX=1`,
+  `K3_ACT_Q8=1`, `K3_EXPERT_Q8=1`, `K3_KV_BF16=1`, `OMP_NUM_THREADS=<cores per rank>`,
+  `OMP_PLACES=cores` and `OMP_PROC_BIND=close`. Everything else stays at its default.
+- **System settings** (as root; `shmoo.sh` prints both at the start of a run): transparent
+  huge pages `always` (`/sys/kernel/mm/transparent_hugepage/enabled`) and automatic NUMA
+  balancing off (`sysctl kernel.numa_balancing=0`).
+- **MPI:** the site's Open MPI environment, passed as `MPI_ENV` to the Slurm wrapper.
+
 ## Pitfalls
 
 - **Leftover ranks.** Killing `mpirun` can leave engine ranks running, each holding about
