@@ -716,6 +716,22 @@ void   k3_decoder_layer_inc(float *h, float *block_residual, int *n_blocks,
                             int T, float *state, float *scratch,
                             float *kvc, float *ropec, int cached, int cap);
 
+/* SEQUENCE BATCH: token t of the next k3_decoder_layer_inc call (T = n, 2 <= n <= 8) is
+ * the next token of its own sequence, with that layer's KDA state state[t], or MLA cache
+ * kvc[t] / ropec[t] holding pos[t] earlier positions (capacity cap). The call's own
+ * state/kvc/ropec/cached arguments are then ignored. Each token's result is bit-identical
+ * to decoding its sequence alone. Set per layer; NULL ends it. Returns -1 when this
+ * build or configuration cannot batch sequences (needs the multi-token decode path, the
+ * split attention kernel and no speculative recording). */
+#define K3_SEQ_MAX 8
+typedef struct {
+    int    n, cap;
+    float *state[K3_SEQ_MAX];
+    float *kvc[K3_SEQ_MAX], *ropec[K3_SEQ_MAX];
+    int    pos[K3_SEQ_MAX];
+} K3SeqTok;
+int    k3_seq_set(const K3SeqTok *s);
+
 /* ---------------------------------------------------------------- MXFP4 ---- */
 /* Dequantise OCP MX FP4, the format Kimi K3 ships its routed experts in.
  *

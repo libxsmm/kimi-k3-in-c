@@ -898,6 +898,10 @@ static int mt_on(int T)
     return env && T > 1 && T <= K3_MT_MAX && !amx_prefill(T);
 }
 
+/* the sequence batch of this layer call (k3_seq_set), when it covers these T tokens */
+static const K3SeqTok *seq_tok;
+static inline const K3SeqTok *seq_on(int T) { return seq_tok && seq_tok->n == T ? seq_tok : NULL; }
+
 static void matmul_f32_rows_T(float *Y, int ldy, const float *X, int ldx, int T,
                               const float *W, int in, int o0, int o1);
 
@@ -1634,8 +1638,16 @@ static void mla_team(float *out, const float *x, const K3MlaW *w, const K3Cfg *c
     const int kvd = qn + vh;                      /* 256: cached width per head    */
     const float scale = 1.0f / sqrtf((float)qh);  /* :359, over qh not qn           */
     if (!kvc) cached = 0;
-    const int last = cached + T - 1;              /* highest absolute position      */
-    if (kvc && last >= cap)
+    /* a sequence batch: token t at position sq->pos[t] of its own cache */
+    const K3SeqTok *sq = kvc ? seq_on(T) : NULL;
+    int last = cached + T - 1;                    /* highest absolute position      */
+    if (sq) {
+        last = 0;
+        for (int t = 0; t < T; t++) {
+            if (sq->pos[t] >= cap) k3_fatal_bound("MLA KV cache position", (long)sq->pos[t], (long)cap - 1);
+            if (sq->pos[t] > last) last = sq->pos[t];
+        }
+    } else if (kvc && last >= cap)
         k3_fatal_bound("MLA KV cache position", (long)last, (long)cap - 1);
 
     /* Scratch layout. Every region below is DISJOINT and must stay so. Overlapping
@@ -1653,8 +1665,9 @@ static void mla_team(float *out, const float *x, const K3MlaW *w, const K3Cfg *c
     float *kvs  = sc   + mla_sc_floats(H, vh, last + 1, T);   /* [T][H][kvd] */
     float *rps  = kvs  + (kvc ? 0 : (size_t)T * H * kvd);   /* [T][qr] */
 
-    #define K3_KV_AT(p)   (kvc   ? kvc   + (size_t)(p) * H * kvd : kvs + (size_t)(p) * H * kvd)
-    #define K3_ROPE_AT(p) (ropec ? ropec + (size_t)(p) * qr      : rps + (size_t)(p) * qr)
+    #define K3_KV_AT(p)   (kvt   ? kvt   + (size_t)(p) * H * kvd : kvs + (size_t)(p) * H * kvd)
+    #define K3_ROPE_AT(p) (rpt   ? rpt   + (size_t)(p) * qr      : rps + (size_t)(p) * qr)
+    float *kvt = kvc, *rpt = ropec;               /* the cache attended over: a batch rebinds it per token */
     /* K3_KV_BF16: the cache is bf16, [this rank's heads][cap][kvd]; this call's keys and
      * values are projected into kvs in fp32 first and rounded into it once */
     const int bf = kvc && k3_kv_bf16_on();
@@ -1705,11 +1718,12 @@ static void mla_team(float *out, const float *x, const K3MlaW *w, const K3Cfg *c
             rms_scale(qlt, qlt, w->q_a_norm, c->q_lora, rms_inv(qp + (size_t)t * nq, c->q_lora, c->rms_eps));
             rms_scale(ctt, ctt, w->kv_a_norm, c->kv_lora, rms_inv(kp + (size_t)t * nk, c->kv_lora, c->rms_eps));
             if (k3_tid() == 0)
-                memcpy(K3_ROPE_AT(cached + t), ctt + c->kv_lora, (size_t)qr * sizeof(float));
+                memcpy(sq ? sq->ropec[t] + (size_t)sq->pos[t] * qr : K3_ROPE_AT(cached + t),
+                       ctt + c->kv_lora, (size_t)qr * sizeof(float));
         }
         k3_sync();
         mmw_rows_T(q, H * qh, QL, c->q_lora, T, w->q_b, w->wdt, c->q_lora, h0 * qh, h1 * qh);
-        mmw_rows_T(K3_KV_W(cached), H * kvd, CT, kvw, T, w->kv_b, w->kv_b_wdt, c->kv_lora,
+        mmw_rows_T(sq ? kvs : K3_KV_W(cached), H * kvd, CT, kvw, T, w->kv_b, w->kv_b_wdt, c->kv_lora,
                    h0 * kvd, h1 * kvd);
         k3_sync();
     } else
@@ -1765,14 +1779,18 @@ static void mla_team(float *out, const float *x, const K3MlaW *w, const K3Cfg *c
         mmw_rows(K3_KV_W(p), ct, w->kv_b, w->kv_b_wdt, c->kv_lora, h0 * kvd, h1 * kvd);
         k3_sync();                          /* ql/ct are rewritten by the next token */
     }
-    if (bf) {
+    if (bf || sq) {
         const int nhl = h1 - h0;
         int lo, hi;
         k3_split(T * nhl, &lo, &hi);
         for (int r = lo; r < hi; r++) {
-            const int t = r / nhl, hl = r % nhl;
+            const int t = r / nhl, hl = r % nhl, p = sq ? sq->pos[t] : cached + t;
             const float *src = kvs + (size_t)t * H * kvd + (size_t)(h0 + hl) * kvd;
-            uint16_t *dst = kv16 + ((size_t)hl * cap + cached + t) * kvd;
+            if (!bf) {
+                memcpy(sq->kvc[t] + ((size_t)p * H + h0 + hl) * kvd, src, (size_t)kvd * sizeof(float));
+                continue;
+            }
+            uint16_t *dst = (sq ? (uint16_t *)sq->kvc[t] : kv16) + ((size_t)hl * cap + p) * kvd;
             for (int i = 0; i < kvd; i++) dst[i] = k3_f2bf(src[i]);
         }
         k3_sync();
@@ -1893,13 +1911,22 @@ static void mla_team(float *out, const float *x, const K3MlaW *w, const K3Cfg *c
 #if defined(K3_AVX512)
     if (mt && mla_split_on(qn, qr, vh)) {
         tp = k3_prof_t0();
-        mla_attend_split(AC, (size_t)H * vh, q, (size_t)H * qh, sc, h0, h1, cached, T,
-                         kvc ? kvc : kvs, kv16, cap, ropec ? ropec : rps, H, qn, qr, vh, scale);
+        if (sq)                              /* each token over its own cache, as alone */
+            for (int t = 0; t < T; t++) {
+                mla_attend_split(AC + (size_t)t * H * vh, 0, q + (size_t)t * H * qh, 0, sc, h0, h1,
+                                 sq->pos[t], 1, sq->kvc[t], bf ? (const uint16_t *)sq->kvc[t] : NULL,
+                                 cap, sq->ropec[t], H, qn, qr, vh, scale);
+                k3_sync();                   /* the partials are rewritten by the next token */
+            }
+        else
+            mla_attend_split(AC, (size_t)H * vh, q, (size_t)H * qh, sc, h0, h1, cached, T,
+                             kvc ? kvc : kvs, kv16, cap, ropec ? ropec : rps, H, qn, qr, vh, scale);
         k3_prof_add(K3P_MLA_CORE, tp);
     } else
 #endif
     for (int t = 0; t < T; t++) {
-        const int p = cached + t;
+        const int p = sq ? sq->pos[t] : cached + t;
+        if (sq) { kvt = sq->kvc[t]; rpt = sq->ropec[t]; }
         tp = k3_prof_t0();
 #if defined(K3_AVX512)
         if (mla_split_on(qn, qr, vh)) {
@@ -2343,6 +2370,7 @@ size_t k3_mla_scratch_cached(const K3Cfg *c, int T, int cap, int cached_mode)
              + mla_sc_floats(H, vh, cap > T ? cap : T, T); /* scores or partials */
     if (!cached_mode) n += (size_t)T * H * kvd + (size_t)T * c->qk_rope;
     else if (k3_kv_bf16_on()) n += (size_t)T * H * kvd;     /* fp32 k|v before rounding */
+    else n += (size_t)(T < K3_MT_MAX ? T : K3_MT_MAX) * H * kvd;   /* a sequence batch's k|v */
     return n;
 }
 
@@ -3765,6 +3793,21 @@ void k3_kda_record_arm(int T)
     kda_rec_bad = 0;
 }
 
+int k3_seq_set(const K3SeqTok *s)
+{
+#if defined(K3_AVX512)
+    if (s && (s->n < 2 || s->n > K3_MT_MAX || !mt_on(s->n) || kda_rec_T > 0 ||
+              !mla_split_on(16, 16, 16)))
+        return -1;
+    seq_tok = s;
+    return 0;
+#else
+    if (s) return -1;
+    seq_tok = NULL;
+    return 0;
+#endif
+}
+
 /* thread 0: this layer's record of T tokens, [t][3P pre | q | k | v | al (P each) | bt (nh)] */
 static float *kda_rec_slot(float *state, size_t per_t, int T)
 {
@@ -3907,9 +3950,20 @@ static void kda_layer_team(float *out, const float *x, const K3KdaW *w, const K3
             }
     }
     float *cs = state ? state + (size_t)H * D * D : NULL;
-    shortconv_range(q, q, w->q_conv, cs, c0, c1, P, K, T);
-    shortconv_range(k, k, w->k_conv, cs ? cs + (size_t)P * hist : NULL, c0, c1, P, K, T);
-    shortconv_range(v, v, w->v_conv, cs ? cs + (size_t)2 * P * hist : NULL, c0, c1, P, K, T);
+    const K3SeqTok *sq = state ? seq_on(T) : NULL;
+    if (sq)                                  /* each token's own history, as alone */
+        for (int t = 0; t < T; t++) {
+            float *cst = sq->state[t] + (size_t)H * D * D;
+            float *qt = q + (size_t)t * P, *kt = k + (size_t)t * P, *vt = v + (size_t)t * P;
+            shortconv_range(qt, qt, w->q_conv, cst, c0, c1, P, K, 1);
+            shortconv_range(kt, kt, w->k_conv, cst + (size_t)P * hist, c0, c1, P, K, 1);
+            shortconv_range(vt, vt, w->v_conv, cst + (size_t)2 * P * hist, c0, c1, P, K, 1);
+        }
+    else {
+        shortconv_range(q, q, w->q_conv, cs, c0, c1, P, K, T);
+        shortconv_range(k, k, w->k_conv, cs ? cs + (size_t)P * hist : NULL, c0, c1, P, K, T);
+        shortconv_range(v, v, w->v_conv, cs ? cs + (size_t)2 * P * hist : NULL, c0, c1, P, K, T);
+    }
     for (int t = 0; t < T; t++) {
         if (k3_tid() == 0)
             for (int h = h0; h < h1; h++) bt[(size_t)t * H + h] = sigmoidf_(bt[(size_t)t * H + h]);
@@ -3973,7 +4027,9 @@ static void kda_layer_team(float *out, const float *x, const K3KdaW *w, const K3
     if (cb_env < 0) cb_env = getenv("K3_KDA_CB") ? atoi(getenv("K3_KDA_CB")) : 0;
     int CB = cb_env > 0 ? (cb_env < D ? cb_env : D) : (D >= 64 ? 32 : D);
     if (CB > K3_KDA_STEP_DV) CB = K3_KDA_STEP_DV;
-    if (((uintptr_t)S | (size_t)D * sizeof(float) | (size_t)CB * sizeof(float)) % 64)
+    uintptr_t sbits = (uintptr_t)S;
+    for (int t = 0; sq && t < T; t++) sbits |= (uintptr_t)sq->state[t];
+    if ((sbits | (size_t)D * sizeof(float) | (size_t)CB * sizeof(float)) % 64)
         CB = D <= K3_KDA_STEP_DV ? D : CB;
     const int nbc = (D + CB - 1) / CB;
     K3_TEAM_IF(1, int lo, hi; k3_split(nh * nbc, &lo, &hi);
@@ -3983,7 +4039,7 @@ static void kda_layer_team(float *out, const float *x, const K3KdaW *w, const K3
         const int j1 = (D - j0 < CB) ? D : j0 + CB;
         for (int t = 0; t < T; t++) {
             const size_t off = (size_t)t * P + (size_t)h * D;
-            kda_step_cols(S + (size_t)h * D * D, o + off, q + off, k + off, v + off,
+            kda_step_cols((sq ? sq->state[t] : S) + (size_t)h * D * D, o + off, q + off, k + off, v + off,
                           al + off, bt[(size_t)t * H + h], D, D, j0, j1);
         }
     });

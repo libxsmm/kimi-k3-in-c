@@ -233,6 +233,108 @@ static void forward(Model *m, const K3Cfg *c, const int *ids, int T, float *logi
 static int argmax_(const float *v, int n)
 { int b = 0; for (int i = 1; i < n; i++) if (v[i] > v[b]) b = i; return b; }
 
+/* the model-level aggregator, final norm and lm_head for row t of an incremental call */
+static void inc_head(Model *m, const K3Cfg *c, float *h, const float *br, int nb, int t,
+                     float *sc, float *lg)
+{
+    const int E = c->hidden, maxb = c->n_layers / c->attn_res_block + 2;
+    if (m->out_res_norm && m->out_res_proj) {
+        float *fold = sc, *src = fold + E;
+        for (int i = 0; i < E; i++) fold[i] = m->out_res_norm[i] * m->out_res_proj[i];
+        for (int b = 0; b < nb; b++)
+            memcpy(src + (size_t)b * E, br + ((size_t)t * maxb + b) * E, (size_t)E * sizeof(float));
+        memcpy(src + (size_t)nb * E, h + (size_t)t * E, (size_t)E * sizeof(float));
+        k3_attn_res(h + (size_t)t * E, src, fold, nb + 1, E, c->rms_eps);
+    }
+    k3_rmsnorm(sc, h + (size_t)t * E, m->final_norm, E, c->rms_eps);
+    k3_mmw_tp(lg, sc, m->lm_head, K3_WF32, E, c->vocab);
+}
+
+/* GATE 4: SEQUENCE BATCH. NS sequences with different prompts, so at different
+ * positions, are prefilled alone, then decoded G steps two ways: each alone, one token
+ * per call, and together, one call of NS tokens per step (k3_seq_set). Every logit of
+ * every step must be bit-identical. 1 pass, 0 fail, -1 not available in this build. */
+static int gate_seq_batch(Model *m, const K3Cfg *c, const int *full, int T, int np, size_t kper)
+{
+    enum { NS = 3, G = 6 };
+    const int E = c->hidden, NL = c->n_layers, maxb = NL / c->attn_res_block + 2, V = c->vocab;
+    if (np < NS || np + G > T) return -1;
+    const size_t kvper = (size_t)T * c->n_heads * (c->qk_nope + c->v_head), rpper = (size_t)T * c->qk_rope;
+    size_t need = k3_layer_scratch(c, T), ic = k3_mla_scratch_cached(c, T, T, 1);
+    if (ic > need) need = ic;
+    if ((size_t)(maxb + 2) * E > need) need = (size_t)(maxb + 2) * E;
+    float *sc = (float *)malloc(need * sizeof(float));
+    float *h = (float *)malloc((size_t)T * E * sizeof(float));
+    float *br = (float *)malloc((size_t)T * maxb * E * sizeof(float));
+    float *lgA = (float *)malloc((size_t)NS * V * sizeof(float)), *lgB = (float *)malloc((size_t)V * sizeof(float));
+    int *ids = (int *)malloc((size_t)np * sizeof(int));
+    float *ks[2][NS], *kv[2][NS], *rp[2][NS];
+    int ok = sc && h && br && lgA && lgB && ids, pos[NS], tok[NS], res = 1;
+    for (int a = 0; a < 2; a++)
+        for (int s = 0; s < NS; s++) {
+            ks[a][s] = (float *)calloc(kper * NL, sizeof(float));
+            kv[a][s] = (float *)calloc(kvper * NL, sizeof(float));
+            rp[a][s] = (float *)calloc(rpper * NL, sizeof(float));
+            ok = ok && ks[a][s] && kv[a][s] && rp[a][s];
+        }
+    for (int s = 0; ok && s < NS; s++) {             /* prefill alone into copy 0 */
+        const int n = np - s;
+        for (int i = 0; i < n; i++) ids[i] = (full[i] + 7 * s) % V;
+        for (int t = 0; t < n; t++)
+            memcpy(h + (size_t)t * E, m->embed + (size_t)ids[t] * E, (size_t)E * sizeof(float));
+        memset(br, 0, (size_t)n * maxb * E * sizeof(float));
+        int nb = 0;
+        for (int L = 0; L < NL; L++)
+            k3_decoder_layer_inc(h, br, &nb, &m->lay[L], c, L, n, ks[0][s] + kper * L, sc,
+                                 kv[0][s] + kvper * L, rp[0][s] + rpper * L, 0, T);
+        inc_head(m, c, h, br, nb, n - 1, sc, lgB);
+        tok[s] = argmax_(lgB, V);
+        pos[s] = n;
+        memcpy(ks[1][s], ks[0][s], kper * NL * sizeof(float));
+        memcpy(kv[1][s], kv[0][s], kvper * NL * sizeof(float));
+        memcpy(rp[1][s], rp[0][s], rpper * NL * sizeof(float));
+    }
+    for (int g = 0; ok && res == 1 && g < G; g++) {
+        for (int s = 0; s < NS; s++) {               /* copy 0: each sequence alone */
+            memcpy(h, m->embed + (size_t)tok[s] * E, (size_t)E * sizeof(float));
+            memset(br, 0, (size_t)maxb * E * sizeof(float));
+            int nb = 0;
+            for (int L = 0; L < NL; L++)
+                k3_decoder_layer_inc(h, br, &nb, &m->lay[L], c, L, 1, ks[0][s] + kper * L, sc,
+                                     kv[0][s] + kvper * L, rp[0][s] + rpper * L, pos[s], T);
+            inc_head(m, c, h, br, nb, 0, sc, lgA + (size_t)s * V);
+        }
+        for (int s = 0; s < NS; s++)                 /* copy 1: all at once */
+            memcpy(h + (size_t)s * E, m->embed + (size_t)tok[s] * E, (size_t)E * sizeof(float));
+        memset(br, 0, (size_t)NS * maxb * E * sizeof(float));
+        int nb = 0;
+        for (int L = 0; L < NL && res == 1; L++) {
+            K3SeqTok q;
+            memset(&q, 0, sizeof q);
+            q.n = NS; q.cap = T;
+            for (int s = 0; s < NS; s++) {
+                q.state[s] = ks[1][s] + kper * L;
+                q.kvc[s] = kv[1][s] + kvper * L;
+                q.ropec[s] = rp[1][s] + rpper * L;
+                q.pos[s] = pos[s];
+            }
+            if (k3_seq_set(&q) != 0) { res = -1; break; }
+            k3_decoder_layer_inc(h, br, &nb, &m->lay[L], c, L, NS, q.state[0], sc, q.kvc[0], q.ropec[0], 0, T);
+            k3_seq_set(NULL);
+        }
+        for (int s = 0; s < NS && res == 1; s++) {
+            inc_head(m, c, h, br, nb, s, sc, lgB);
+            if (memcmp(lgB, lgA + (size_t)s * V, (size_t)V * sizeof(float))) res = 0;
+            tok[s] = argmax_(lgA + (size_t)s * V, V);
+            pos[s]++;
+        }
+    }
+    for (int a = 0; a < 2; a++)
+        for (int s = 0; s < NS; s++) { free(ks[a][s]); free(kv[a][s]); free(rp[a][s]); }
+    free(sc); free(h); free(br); free(lgA); free(lgB); free(ids);
+    return ok ? res : 0;
+}
+
 /* Config is read through k3_cfg.h, which never substitutes a default for a missing
  * field: it collects every absent key and refuses the load. Do not reintroduce a
  * defaulting reader here. A default turns "this program cannot understand this config"
@@ -437,6 +539,12 @@ int main(int argc, char **argv)
         gok = (iok == T - np) ? gok : -1;   /* fail the verdict if incremental diverged */
         free(kvc); free(rpc); free(sc_i); free(h_i); free(br_i); free(ks_i); free(lg_i); free(gi);
     }
+
+    const int sb = gate_seq_batch(m, &c, full, T, np, kper);
+    printf("GATE 4  sequence batch : %s\n", sb > 0 ? "PASS  <- 3 sequences decoded together == alone, "
+                                                     "every logit bit-identical"
+                                       : sb < 0 ? "SKIP  (no multi-token decode in this build)" : "FAIL");
+    if (sb == 0) gok = -1;
 
     const int pass = !k3_mpi_max_int(!((tf_gen_ok == tf_gen) && reuse_ok && (gok == T - np)));
     if (k3_tp.size > 1) printf("\ntensor parallel: %d ranks\n", k3_tp.size);
