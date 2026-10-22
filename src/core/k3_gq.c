@@ -793,7 +793,63 @@ void k3_iq3xxs_rows_q8(float *y, const int8_t *xq, const float *dx, const void *
         y[o] = _mm512_reduce_add_ps(facc);
     }
 }
+
+/* G tokens against one row, the block decoded once; per token the single-token order */
+static inline __attribute__((always_inline)) void iq3xxs_row_q8_g(float *const *Y,
+    const int8_t *const *XQ, const float *const *DX, const BIQ3XXS *b, int in, int o, const int G)
+{
+    __m512 facc[4];
+    for (int g = 0; g < G; g++) facc[g] = _mm512_setzero_ps();
+    for (int i = 0; i < in; i += K3_GQ_QK, b++) {
+        _mm_prefetch((const char *)b + K3_GQ_PF_IQ, _MM_HINT_T0);
+        _mm_prefetch((const char *)b + K3_GQ_PF_IQ + 64, _MM_HINT_T0);
+        const uint8_t *sas = b->qs + K3_GQ_QK / 4;
+        __m512i iacc[4];
+        for (int g = 0; g < G; g++) iacc[g] = _mm512_setzero_si512();
+        for (int j = 0; j < 4; j++) {
+            uint32_t a0, a1;
+            memcpy(&a0, sas + 8 * j, 4);
+            memcpy(&a1, sas + 8 * j + 4, 4);
+            const __mmask64 neg = iq3xxs_neg(a0, a1);
+            const __m512i mag = iq3xxs_mag(b->qs + 16 * j);
+            const int s0 = 2 * (int)(a0 >> 28) + 1, s1 = 2 * (int)(a1 >> 28) + 1;
+            const __m512i sv = _mm512_setr_epi32(s0, s0, s0, s0, s0, s0, s0, s0, s1, s1, s1, s1, s1, s1, s1, s1);
+            for (int g = 0; g < G; g++) {
+                const __m512i xv = _mm512_loadu_si512((const void *)(XQ[g] + i + 64 * j));
+                const __m512i xs = _mm512_mask_sub_epi8(xv, neg, _mm512_setzero_si512(), xv);
+                iacc[g] = _mm512_add_epi32(iacc[g], _mm512_mullo_epi32(
+                    _mm512_dpbusd_epi32(_mm512_setzero_si512(), mag, xs), sv));
+            }
+        }
+        const float d = h2f(b->d);
+        for (int g = 0; g < G; g++)
+            facc[g] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(iacc[g]),
+                                      _mm512_set1_ps(d * DX[g][i / K3_GQ_QK] * 0.25f), facc[g]);
+    }
+    for (int g = 0; g < G; g++) Y[g][o] = _mm512_reduce_add_ps(facc[g]);
+}
+
+void k3_iq3xxs_rows_q8_P(float *const *Y, const int8_t *const *XQ, const float *const *DX, int T,
+                         const void *W, int in, int o0, int o1)
+{
+    const size_t rb = k3_gq_row_bytes(K3_GG_IQ3_XXS, in);
+    for (int o = o0; o < o1; o++) {
+        const BIQ3XXS *b = (const BIQ3XXS *)((const unsigned char *)W + (size_t)o * rb);
+        for (int t = 0; t < T; t += 4) {
+            const int G = T - t < 4 ? T - t : 4;
+            if (G == 4)      iq3xxs_row_q8_g(Y + t, XQ + t, DX + t, b, in, o, 4);
+            else if (G == 3) iq3xxs_row_q8_g(Y + t, XQ + t, DX + t, b, in, o, 3);
+            else if (G == 2) iq3xxs_row_q8_g(Y + t, XQ + t, DX + t, b, in, o, 2);
+            else             iq3xxs_row_q8_g(Y + t, XQ + t, DX + t, b, in, o, 1);
+        }
+    }
+}
 #else
+void k3_iq3xxs_rows_q8_P(float *const *Y, const int8_t *const *XQ, const float *const *DX, int T,
+                         const void *W, int in, int o0, int o1)
+{
+    (void)Y; (void)XQ; (void)DX; (void)T; (void)W; (void)in; (void)o0; (void)o1;
+}
 void k3_iq2xs_rows_q8_P(float *const *Y, const int8_t *const *XQ, const float *const *DX, int T,
                         const void *W, int in, int o0, int o1)
 {

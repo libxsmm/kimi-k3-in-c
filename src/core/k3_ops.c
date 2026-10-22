@@ -2678,11 +2678,13 @@ static void grp_rows(float *const *Y, const int8_t *const *XQ, const float *cons
                      const unsigned char *p, int qt, int in, int r0, int r1, int rbase)
 {
     if (r1 <= r0) return;
-    if (qt == K3_EQ_IQ2XS) {
+    if (qt == K3_EQ_IQ2XS || qt == K3_EQ_IQ3XXS) {
+        const int gt = qt == K3_EQ_IQ2XS ? K3_GG_IQ2_XS : K3_GG_IQ3_XXS;
+        const unsigned char *W = p + (size_t)(r0 - rbase) * k3_gq_row_bytes(gt, in);
         float *Yr[K3_MT_MAX];
         for (int g = 0; g < G; g++) Yr[g] = Y[g] + r0;
-        k3_iq2xs_rows_q8_P(Yr, XQ, DX, G, p + (size_t)(r0 - rbase) * k3_gq_row_bytes(K3_GG_IQ2_XS, in),
-                           in, 0, r1 - r0);
+        if (qt == K3_EQ_IQ2XS) k3_iq2xs_rows_q8_P(Yr, XQ, DX, G, W, in, 0, r1 - r0);
+        else                   k3_iq3xxs_rows_q8_P(Yr, XQ, DX, G, W, in, 0, r1 - r0);
         return;
     }
     for (int g = 0; g < G; g++)
@@ -4290,6 +4292,30 @@ static void layer_team(float *h, float *block_residual, int *n_blocks,
                 amx_rows(tmp + (size_t)t0 * E, E, av, tc, w->dense_down, w->wdt, DI, e0, e1);
                 k3_sync();                      /* G, U, A are rewritten by the next chunk */
             }
+            tp_gather_rows(tmp, T, E, 1);
+            k3_prof_add(K3P_DENSE, tp);
+        } else if (mt_on(T)) {
+            double tp = k3_prof_t0();
+            const int DI = c->dense_inter;
+            int d0, d1, e0, e1;
+            k3_tp_part(DI, &d0, &d1);
+            k3_tp_part(E, &e0, &e1);
+            if (k3_tid() == 0)
+                mt_buf = (float *)k3_scratch(K3S_MT, (size_t)T * 3 * DI * sizeof(float), "batched decode dense MLP");
+            k3_sync();
+            float *G = mt_buf, *U = G + (size_t)T * DI, *A = U + (size_t)T * DI;
+            int dl, dh;
+            k3_split(d1 - d0, &dl, &dh);
+            const int r0 = d0 + dl, r1 = d0 + dh;
+            mmw_part_T(G, DI, hin, E, T, w->dense_gate, w->wdt, E, d0, r0, r1);
+            mmw_part_T(U, DI, hin, E, T, w->dense_up, w->wdt, E, d0, r0, r1);
+            for (int t = 0; t < T; t++)
+                situ_range(A + (size_t)t * DI + r0, G + (size_t)t * DI + r0, U + (size_t)t * DI + r0,
+                           r1 - r0, c->situ_b1, c->situ_b2);
+            K3Seg sa[K3_MT_MAX];
+            for (int t = 0; t < T; t++) sa[t] = (K3Seg){ A + (size_t)t * DI, DI, 1, 0 };
+            k3_tp_gather(sa, T);
+            mmw_rows_T(tmp, E, A, DI, T, w->dense_down, w->wdt, DI, e0, e1);
             tp_gather_rows(tmp, T, E, 1);
             k3_prof_add(K3P_DENSE, tp);
         } else {

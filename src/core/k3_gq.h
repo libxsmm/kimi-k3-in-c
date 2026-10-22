@@ -75,5 +75,8 @@ void k3_iq2xs_rows_q8_P(float *const *Y, const int8_t *const *XQ, const float *c
                         const void *W, int in, int o0, int o1);
 void k3_iq3xxs_rows_q8(float *y, const int8_t *xq, const float *dx, const void *W, int in,
                        int o0, int o1);
+/* As k3_iq2xs_rows_q8_P for IQ3_XXS: per token bit-identical to k3_iq3xxs_rows_q8. */
+void k3_iq3xxs_rows_q8_P(float *const *Y, const int8_t *const *XQ, const float *const *DX, int T,
+                         const void *W, int in, int o0, int o1);
 
 #endif /* K3_GQ_H */
