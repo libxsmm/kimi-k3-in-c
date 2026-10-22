@@ -38,17 +38,17 @@ void k3_amx_pack_x(uint16_t *Xv, const float *X, int ldx, int T, int in)
 void k3_amx_gemm(float *Y, int ldy, const uint16_t *Xv, int T, const void *W, int wt,
                  int in, int wbase, int r0, int r1)
 { (void)Y; (void)ldy; (void)Xv; (void)T; (void)W; (void)wt; (void)in; (void)wbase; (void)r0; (void)r1; }
-void k3_amx_gemm_groups(const K3AmxGroup *g, int ng, const uint16_t *Xv, int in, int r0, int r1)
-{ (void)g; (void)ng; (void)Xv; (void)in; (void)r0; (void)r1; }
-void k3_amx_pack_rows(uint16_t *Xv, const float *X, int ldx, const int *map, int N, int in)
-{ (void)Xv; (void)X; (void)ldx; (void)map; (void)N; (void)in; }
+void k3_amx_gemm_groups(const K3AmxGroup *g, int ng, const K3AmxB *xb, int in, int r0, int r1)
+{ (void)g; (void)ng; (void)xb; (void)in; (void)r0; (void)r1; }
+void k3_amx_pack_rows(uint16_t *Xv, const float *X, int ldx, const int *map, int N, int kt0, int kt1)
+{ (void)Xv; (void)X; (void)ldx; (void)map; (void)N; (void)kt0; (void)kt1; }
 void k3_amx_pack_cols(uint16_t *Xv, const float *X, int ldx, const int *map, int N, int in)
 { (void)Xv; (void)X; (void)ldx; (void)map; (void)N; (void)in; }
 void k3_amx_pack_cols_bf16(uint16_t *Xv, const uint16_t *X, int ldx, const int *map, int N, int in)
 { (void)Xv; (void)X; (void)ldx; (void)map; (void)N; (void)in; }
-void k3_amx_pack_parts_bf16(uint16_t *Xv, const uint16_t *X, int np, const int *bnd, int nb,
+void k3_amx_pack_parts_bf16(uint16_t *Xv, const uint16_t *const *part, const int *bnd, int nb,
                             const int *map, int N, int in)
-{ (void)Xv; (void)X; (void)np; (void)bnd; (void)nb; (void)map; (void)N; (void)in; }
+{ (void)Xv; (void)part; (void)bnd; (void)nb; (void)map; (void)N; (void)in; }
 #else
 
 #define ARCH_REQ_XCOMP_PERM 0x1023
@@ -273,56 +273,71 @@ void k3_amx_gemm(float *Y, int ldy, const uint16_t *Xv, int T, const void *W, in
 }
 
 /* ------------------------------------------------------------- grouped (MoE) */
-/* One task: rows [n0, n0 + nr) of W against token tiles [mt0, mt0 + nmt) of Xv (any
- * count; an odd last tile runs a 2x1 tile step), into Y[t * ldy + n - ycol0] for t < tend. */
-static void run_block(float *Y, int ldy, int ycol0, const uint16_t *Xv, int KT, int mt0, int nmt,
+#define GRP_RB 128    /* rows per task: an expert's activations are reused over more rows */
+#define GRP_KS 8      /* k tiles per pass of the tile loop: its A and B slices stay in L1 */
+
+/* One task: rows [n0, n0 + nr) of W against token tiles [mt0, mt0 + nmt) of xb (any
+ * count; an odd last tile runs a 2x1 tile step), into Y[t * ldy + n - ycol0] for t < tend.
+ * The panel is decoded in whole rows when it fits the L2 budget (long sequential reads),
+ * then the tile loop walks it in slices of at most GRP_KS within one part of xb; each C
+ * element still sums k in order. */
+static void run_block(float *Y, int ldy, int ycol0, const K3AmxB *xb, int KT, int mt0, int nmt,
                       int tend, const void *W, int wt, int in, size_t rb, int wbase, int n0, int nr)
 {
     pthread_once(&blk_once, blk_init);
-    const int KC = KT < kc_max ? KT : kc_max;
     const int ntp = ((nr + 15) / 16 + 1) & ~1;
+    const int KC = !blk_auto && kc_max < KT ? kc_max
+                 : (size_t)ntp * KT * 1024 <= l2_budget ? KT : (KT < kc_max ? KT : kc_max);
     tl_panel = (uint16_t *)grow(tl_panel, &tl_panel_n, (size_t)ntp * KC * 1024 + 2048);
     tl_c = (float *)grow(tl_c, &tl_c_n, (size_t)ntp * (nmt + 1) * 1024);
+    int part = 0;
     for (int kc0 = 0; kc0 < KT; kc0 += KC) {
         const int kcn = KT - kc0 < KC ? KT - kc0 : KC;
         upconvert(tl_panel, ntp, W, wt, in, rb, wbase, n0, nr, kc0, kcn);
-        for (int mt = 0; mt < nmt; mt += 2) {
-            const int two = mt + 1 < nmt;
-            const uint16_t *b0 = Xv + ((size_t)(mt0 + mt) * KT + kc0) * 512;
-            const uint16_t *b1 = b0 + (size_t)KT * 512;
-            for (int nt = 0; nt < ntp; nt += 2) {
-                const uint16_t *a0 = tl_panel + (size_t)nt * kcn * 512, *a1 = a0 + (size_t)kcn * 512;
-                float *c0 = tl_c + ((size_t)nt * nmt + mt) * 256, *c1 = c0 + 256;
-                float *c2 = c0 + (size_t)nmt * 256, *c3 = c2 + 256;
-                if (two) {
-                    if (kc0 == 0) { _tile_zero(0); _tile_zero(1); _tile_zero(2); _tile_zero(3); }
-                    else {
-                        _tile_loadd(0, c0, 64); _tile_loadd(1, c1, 64);
-                        _tile_loadd(2, c2, 64); _tile_loadd(3, c3, 64);
+        for (int ks0 = 0, ke; ks0 < kcn; ks0 = ke) {
+            while (kc0 + ks0 >= xb->kt[part + 1]) part++;
+            const int pe = xb->kt[part + 1] - kc0, kp = xb->kt[part + 1] - xb->kt[part];
+            ke = ks0 + GRP_KS < kcn ? ks0 + GRP_KS : kcn;
+            if (ke > pe) ke = pe;
+            const int first = kc0 == 0 && ks0 == 0;
+            for (int mt = 0; mt < nmt; mt += 2) {
+                const int two = mt + 1 < nmt;
+                const uint16_t *b0 = xb->p[part] + ((size_t)(mt0 + mt) * kp + kc0 + ks0 - xb->kt[part]) * 512;
+                const uint16_t *b1 = b0 + (size_t)kp * 512;
+                for (int nt = 0; nt < ntp; nt += 2) {
+                    const uint16_t *a0 = tl_panel + (size_t)nt * kcn * 512, *a1 = a0 + (size_t)kcn * 512;
+                    float *c0 = tl_c + ((size_t)nt * nmt + mt) * 256, *c1 = c0 + 256;
+                    float *c2 = c0 + (size_t)nmt * 256, *c3 = c2 + 256;
+                    if (two) {
+                        if (first) { _tile_zero(0); _tile_zero(1); _tile_zero(2); _tile_zero(3); }
+                        else {
+                            _tile_loadd(0, c0, 64); _tile_loadd(1, c1, 64);
+                            _tile_loadd(2, c2, 64); _tile_loadd(3, c3, 64);
+                        }
+                        for (int kt = ks0; kt < ke; kt++) {
+                            _tile_loadd(4, a0 + (size_t)kt * 512, 64);
+                            _tile_loadd(6, b0 + (size_t)(kt - ks0) * 512, 64);
+                            _tile_dpbf16ps(0, 4, 6);
+                            _tile_loadd(7, b1 + (size_t)(kt - ks0) * 512, 64);
+                            _tile_dpbf16ps(1, 4, 7);
+                            _tile_loadd(5, a1 + (size_t)kt * 512, 64);
+                            _tile_dpbf16ps(2, 5, 6);
+                            _tile_dpbf16ps(3, 5, 7);
+                        }
+                        _tile_stored(0, c0, 64); _tile_stored(1, c1, 64);
+                        _tile_stored(2, c2, 64); _tile_stored(3, c3, 64);
+                    } else {
+                        if (first) { _tile_zero(0); _tile_zero(2); }
+                        else { _tile_loadd(0, c0, 64); _tile_loadd(2, c2, 64); }
+                        for (int kt = ks0; kt < ke; kt++) {
+                            _tile_loadd(6, b0 + (size_t)(kt - ks0) * 512, 64);
+                            _tile_loadd(4, a0 + (size_t)kt * 512, 64);
+                            _tile_dpbf16ps(0, 4, 6);
+                            _tile_loadd(5, a1 + (size_t)kt * 512, 64);
+                            _tile_dpbf16ps(2, 5, 6);
+                        }
+                        _tile_stored(0, c0, 64); _tile_stored(2, c2, 64);
                     }
-                    for (int kt = 0; kt < kcn; kt++) {
-                        _tile_loadd(4, a0 + (size_t)kt * 512, 64);
-                        _tile_loadd(6, b0 + (size_t)kt * 512, 64);
-                        _tile_dpbf16ps(0, 4, 6);
-                        _tile_loadd(7, b1 + (size_t)kt * 512, 64);
-                        _tile_dpbf16ps(1, 4, 7);
-                        _tile_loadd(5, a1 + (size_t)kt * 512, 64);
-                        _tile_dpbf16ps(2, 5, 6);
-                        _tile_dpbf16ps(3, 5, 7);
-                    }
-                    _tile_stored(0, c0, 64); _tile_stored(1, c1, 64);
-                    _tile_stored(2, c2, 64); _tile_stored(3, c3, 64);
-                } else {
-                    if (kc0 == 0) { _tile_zero(0); _tile_zero(2); }
-                    else { _tile_loadd(0, c0, 64); _tile_loadd(2, c2, 64); }
-                    for (int kt = 0; kt < kcn; kt++) {
-                        _tile_loadd(6, b0 + (size_t)kt * 512, 64);
-                        _tile_loadd(4, a0 + (size_t)kt * 512, 64);
-                        _tile_dpbf16ps(0, 4, 6);
-                        _tile_loadd(5, a1 + (size_t)kt * 512, 64);
-                        _tile_dpbf16ps(2, 5, 6);
-                    }
-                    _tile_stored(0, c0, 64); _tile_stored(2, c2, 64);
                 }
             }
         }
@@ -343,12 +358,12 @@ static void run_block(float *Y, int ldy, int ycol0, const uint16_t *Xv, int KT, 
 
 static int grp_next;
 
-void k3_amx_gemm_groups(const K3AmxGroup *g, int ng, const uint16_t *Xv, int in, int r0, int r1)
+void k3_amx_gemm_groups(const K3AmxGroup *g, int ng, const K3AmxB *xb, int in, int r0, int r1)
 {
     const int KT = in / 32, rows = r1 - r0;
     if (rows <= 0 || ng <= 0) return;
     pthread_once(&blk_once, blk_init);
-    const int RB = rows < 64 ? (rows + 15) / 16 * 16 : 64;
+    const int RB = rows < GRP_RB ? (rows + 15) / 16 * 16 : GRP_RB;
     const int nrb = (rows + RB - 1) / RB, ntask = ng * nrb;
     k3_sync();                               /* nobody still takes tasks of a previous call */
     if (k3_tid() == 0) __atomic_store_n(&grp_next, 0, __ATOMIC_RELAXED);
@@ -360,19 +375,19 @@ void k3_amx_gemm_groups(const K3AmxGroup *g, int ng, const uint16_t *Xv, int in,
         const K3AmxGroup *q = &g[task / nrb];
         const int n0 = r0 + task % nrb * RB, nr = r1 - n0 < RB ? r1 - n0 : RB;
         if (q->n <= 0 || !q->W) continue;
-        run_block(q->Y, q->ldy, q->ycol0, Xv, KT, q->t0 / 16, (q->n + 15) / 16, q->t0 + q->n,
+        run_block(q->Y, q->ldy, q->ycol0, xb, KT, q->t0 / 16, (q->n + 15) / 16, q->t0 + q->n,
                   q->W, q->wt, in, k3_gq_row_bytes(q->wt, in), q->wbase, n0, nr);
     }
 }
 
 /* tile (mt, kt) row j = k pair (2j, 2j + 1) of 16 tokens */
-void k3_amx_pack_rows(uint16_t *Xv, const float *X, int ldx, const int *map, int N, int in)
+void k3_amx_pack_rows(uint16_t *Xv, const float *X, int ldx, const int *map, int N, int kt0, int kt1)
 {
-    const int KT = in / 32, MT = N / 16;
+    const int KT = kt1 - kt0, MT = N / 16;
     int lo, hi;
     k3_split(MT * KT, &lo, &hi);
     for (int i = lo; i < hi; i++) {
-        const int mt = i / KT, kt = i % KT;
+        const int mt = i / KT, kt = kt0 + i % KT;
         const float *x[16];
         for (int c = 0; c < 16; c++) {
             const int r = map[mt * 16 + c];
@@ -433,7 +448,7 @@ void k3_amx_pack_cols_bf16(uint16_t *Xv, const uint16_t *X, int ldx, const int *
     }
 }
 
-void k3_amx_pack_parts_bf16(uint16_t *Xv, const uint16_t *X, int np, const int *bnd, int nb,
+void k3_amx_pack_parts_bf16(uint16_t *Xv, const uint16_t *const *part, const int *bnd, int nb,
                             const int *map, int N, int in)
 {
     const int KT = in / 32, MT = N / 16;
@@ -444,11 +459,11 @@ void k3_amx_pack_parts_bf16(uint16_t *Xv, const uint16_t *X, int np, const int *
         int r = 0;
         while (r + 1 < nb && bnd[r + 1] <= k0) r++;
         const int w = bnd[r + 1] - bnd[r];
-        const uint16_t *part = X + (size_t)bnd[r] * np + (k0 - bnd[r]);
+        const uint16_t *p = part[r] + (k0 - bnd[r]);
         __m512 v[16];
         for (int c = 0; c < 16; c++) {
             const int col = map[mt * 16 + c];
-            v[c] = col >= 0 ? _mm512_loadu_ps((const float *)(part + (size_t)col * w)) : _mm512_setzero_ps();
+            v[c] = col >= 0 ? _mm512_loadu_ps((const float *)(p + (size_t)col * w)) : _mm512_setzero_ps();
         }
         v512_tr16(v);                         /* bf16 pair j of token c to [j][c] */
         uint16_t *tile = Xv + (size_t)i * 512;

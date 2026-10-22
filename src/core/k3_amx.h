@@ -40,23 +40,32 @@ typedef struct {
     int ldy, ycol0, t0, n;
 } K3AmxGroup;
 
-/* Team: rows [r0, r1) of every group's matrix; (group, 64-row block) tasks handed out
- * dynamically. Starts with a barrier, none at the end. */
-void k3_amx_gemm_groups(const K3AmxGroup *g, int ng, const uint16_t *Xv, int in, int r0, int r1);
+/* Packed activations split by k into n parts (one per rank when they are exchanged in
+ * place): part r holds k tiles [kt[r], kt[r + 1]), tile (mt, k) at
+ * p[r] + (mt * (kt[r + 1] - kt[r]) + k - kt[r]) * 512. One whole Xv: n = 1, kt = {0, in / 32}. */
+typedef struct {
+    const uint16_t *p[64];
+    int kt[65], n;
+} K3AmxB;
 
-/* Team: pack N tokens (N % 16 == 0). rows: token i is row map[i] of X [.][ldx];
+/* Team: rows [r0, r1) of every group's matrix; (group, 128-row block) tasks handed out
+ * dynamically. Starts with a barrier, none at the end. */
+void k3_amx_gemm_groups(const K3AmxGroup *g, int ng, const K3AmxB *xb, int in, int r0, int r1);
+
+/* Team: pack N tokens (N % 16 == 0). rows: token i is row map[i] of X [.][ldx], k tiles
+ * [kt0, kt1) only, laid out as one part of a K3AmxB (all of them: 0, in / 32);
  * cols: token i is column map[i] of X [in][ldx], the valid tokens of every 16-token tile
  * a prefix of consecutive columns. map[i] < 0 is a zero token. The caller syncs after. */
-void k3_amx_pack_rows(uint16_t *Xv, const float *X, int ldx, const int *map, int N, int in);
+void k3_amx_pack_rows(uint16_t *Xv, const float *X, int ldx, const int *map, int N, int kt0, int kt1);
 void k3_amx_pack_cols(uint16_t *Xv, const float *X, int ldx, const int *map, int N, int in);
 
 /* As k3_amx_pack_cols from bf16 X: the same tiles as packing the fp32 values they round. */
 void k3_amx_pack_cols_bf16(uint16_t *Xv, const uint16_t *X, int ldx, const int *map, int N, int in);
 
 /* The same tiles from bf16 X split at k boundaries bnd[0] = 0 < ... < bnd[nb] = in (all
- * multiples of 32): part r starts at X + bnd[r] * np and holds column col's k values
- * contiguously at col * (bnd[r + 1] - bnd[r]). map[p] is p's column or -1 (zero). */
-void k3_amx_pack_parts_bf16(uint16_t *Xv, const uint16_t *X, int np, const int *bnd, int nb,
+ * multiples of 32): part r holds column col's k values contiguously at
+ * part[r] + col * (bnd[r + 1] - bnd[r]). map[p] is p's column or -1 (zero). */
+void k3_amx_pack_parts_bf16(uint16_t *Xv, const uint16_t *const *part, const int *bnd, int nb,
                             const int *map, int N, int in);
 
 /* INT8 ACTIVATIONS (K3_ACT_Q8=1): Q8_0 rows [o0, o1) of W (row o at W + o * row_bytes,

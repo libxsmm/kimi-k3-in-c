@@ -249,6 +249,21 @@ static void tp_big_gather(const K3Seg *seg, int nseg, int total)
     }
 }
 
+/* The cross-rank step of an exchange done in place in this turn's half of the regions:
+ * every rank's writes there are complete and visible after it. */
+static void tp_big_barrier(double floats)
+{
+    k3_sync();
+    if (k3_tid() == 0) {
+        const double t0 = k3_prof_on ? k3_prof_now() : 0.0;
+        k3_tp.barrier(k3_tp.ctx);
+        k3_tp.calls++;
+        k3_tp.floats += floats;
+        if (k3_prof_on) k3_prof_s[K3P_COMM] += k3_prof_now() - t0;
+    }
+    k3_sync();
+}
+
 /* Transport units of a gather, and whether it goes one-sided. */
 static int tp_units(const K3Seg *seg, int nseg, int *ll)
 {
@@ -3108,10 +3123,12 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
 
 /* Routed experts of T tokens at once on AMX: thread 0 selects every token's top-k and
  * groups the (token, slot) pairs by expert; each expert's gate|up then runs as one GEMM
- * over its tokens (its rows decoded once), act is gathered across ranks in one go, and
- * the down projections run the same way. accL[t] sums the slots in top-k order, as
- * moe_routed does. AC [T][L] gets the gathered aggregate. Returns 0 (nothing done) when a
- * selected expert is not in a GEMM format (MXFP4) or there is no source. */
+ * over its tokens (its rows decoded once), act is exchanged across ranks in one go, and
+ * the down projections run the same way. Z [T][L] holds this rank's latent columns; it is
+ * gathered here unless the tiles are exchanged in place. accL[t] sums the slots in top-k
+ * order, as moe_routed does. AC [T][L] gets the gathered aggregate. Returns 0 (nothing
+ * done, Z untouched) when a selected expert is not in a GEMM format (MXFP4) or there is
+ * no source. */
 static struct {
     int *sel, *pos, *mapz, *mapa, ng, npad, np, ok;
     float *wq;
@@ -3120,6 +3137,18 @@ static struct {
     uint16_t *actT;
 } mx;
 #define K3_AMX_SITU_MAX 512
+
+#if defined(K3_AVX512) && defined(__AVX512BF16__)
+/* situ_range in SIMD: b1 tanh(g / b1) sigmoid(g) * b2 tanh(u / b2), 16 values */
+static inline __m512 situ16(const float *gp, const float *up, __m512 b1, __m512 b2, __m512 ib1, __m512 ib2)
+{
+    const __m512 g = _mm512_loadu_ps(gp), u = _mm512_loadu_ps(up);
+    const __m512 sg = _mm512_div_ps(_mm512_set1_ps(1.0f), _mm512_add_ps(_mm512_set1_ps(1.0f),
+                                    exp512(_mm512_sub_ps(_mm512_setzero_ps(), g))));
+    const __m512 a = _mm512_mul_ps(_mm512_mul_ps(b1, tanh512(_mm512_mul_ps(g, ib1))), sg);
+    return _mm512_mul_ps(a, _mm512_mul_ps(b2, tanh512(_mm512_mul_ps(u, ib2))));
+}
+#endif
 
 /* tokens per expert pass (K3_AMX_MOE_CHUNK): each pass decodes every selected expert's
  * weights once, so long passes amortise the decode; the buffers grow with it */
@@ -3133,7 +3162,7 @@ static int moe_amx_chunk(void)
     return n;
 }
 
-static int moe_experts_amx(float *AC, const float *Z, const float *SC, int T,
+static int moe_experts_amx(float *AC, float *Z, const float *SC, int T,
                            const K3MoeW *w, const K3Cfg *c)
 {
     const int L = c->latent, I = c->moe_inter, NE = c->n_experts, K = c->topk;
@@ -3215,64 +3244,116 @@ static int moe_experts_amx(float *AC, const float *Z, const float *SC, int T,
     if (!mx.ok) return 0;
 
     /* buffers: g1, g3 [npad][ni], edn [npad][nl], actT [I][npe] bf16 (npe even: gathered as floats) */
-    const int npe = (mx.np + 1) & ~1;
+    const int npe = (mx.np + 1) & ~1, MT = mx.npad / 16, P = k3_tp.size, me = k3_tp.rank;
+    /* in place (node shared regions, every L and I boundary a multiple of 32): each rank
+     * packs its own k tiles of Z, and SiTU writes its own k tiles of act, into this turn's
+     * half of its region; both GEMMs read every rank's tiles where they lie, so neither Z
+     * nor act is gathered or packed whole. The tiles hold the same bits either way. */
+    K3AmxB zb, ab;
+    int inplace = 0;
+#if defined(K3_AVX512) && defined(__AVX512BF16__)
+    if (P > 1 && P <= 64 && tp_big(1, 0)) {
+        int zmax = 0, amax = 0;
+        inplace = 1;
+        for (int r = 0; r <= P; r++) {
+            const long lb = (long)L * r / P, ib = (long)I * r / P;
+            if (lb % 32 || ib % 32) inplace = 0;
+            zb.kt[r] = (int)(lb / 32);
+            ab.kt[r] = (int)(ib / 32);
+            if (r && zb.kt[r] - zb.kt[r - 1] > zmax) zmax = zb.kt[r] - zb.kt[r - 1];
+            if (r && ab.kt[r] - ab.kt[r - 1] > amax) amax = ab.kt[r] - ab.kt[r - 1];
+        }
+        const size_t zoff = (size_t)zmax * MT * 512;
+        if (zoff + (size_t)amax * MT * 512 > (size_t)k3_tp.big_cap) inplace = 0;   /* half, in bf16 */
+        const long base = (long)(tp_big_turn & 1) * (k3_tp.big_cap / 2);
+        for (int r = 0; r < P; r++) {
+            zb.p[r] = (const uint16_t *)(k3_tp.big[r] + base);
+            ab.p[r] = zb.p[r] + zoff;
+        }
+        zb.n = ab.n = P;
+    }
+#endif
     if (k3_tid() == 0) {
-        float *b = (float *)k3_scratch(K3S_AMXE, ((size_t)mx.npad * (2 * ni + nl) + (size_t)I * npe / 2) *
-                                       sizeof(float), "AMX experts");
+        float *b = (float *)k3_scratch(K3S_AMXE, ((size_t)mx.npad * (2 * ni + nl) +
+                                       (inplace ? 0 : (size_t)I * npe / 2)) * sizeof(float), "AMX experts");
         mx.g1 = b; mx.g3 = b + (size_t)mx.npad * ni; mx.edn = mx.g3 + (size_t)mx.npad * ni;
-        mx.actT = (uint16_t *)(mx.edn + (size_t)mx.npad * nl);
+        mx.actT = inplace ? NULL : (uint16_t *)(mx.edn + (size_t)mx.npad * nl);
         for (int g = 0; g < mx.ng; g++) {
             mx.gu[2 * g].Y = mx.g1; mx.gu[2 * g + 1].Y = mx.g3; mx.dn[g].Y = mx.edn;
         }
-        amx_xv[0] = (uint16_t *)k3_scratch(K3S_AMX0, k3_amx_xv_elems(mx.npad, L) * 2, "AMX activations");
-        amx_xv[1] = (uint16_t *)k3_scratch(K3S_AMX1, k3_amx_xv_elems(mx.npad, I) * 2, "AMX activations");
+        if (!inplace) {
+            amx_xv[0] = (uint16_t *)k3_scratch(K3S_AMX0, k3_amx_xv_elems(mx.npad, L) * 2, "AMX activations");
+            amx_xv[1] = (uint16_t *)k3_scratch(K3S_AMX1, k3_amx_xv_elems(mx.npad, I) * 2, "AMX activations");
+        }
     }
     k3_sync();
+    if (!inplace) {
+        zb = (K3AmxB){ .p = { amx_xv[0] }, .kt = { 0, L / 32 }, .n = 1 };
+        ab = (K3AmxB){ .p = { amx_xv[1] }, .kt = { 0, I / 32 }, .n = 1 };
+    }
 
     /* gate|up: every expert's tokens through its rows [i0, i1) */
-    k3_amx_pack_rows(amx_xv[0], Z, L, mx.mapz, mx.npad, L);
-    k3_amx_gemm_groups(mx.gu, 2 * mx.ng, amx_xv[0], L, i0, i1);
+    if (inplace) {
+        k3_amx_pack_rows((uint16_t *)zb.p[me], Z, L, mx.mapz, mx.npad, zb.kt[me], zb.kt[me + 1]);
+        tp_big_barrier((double)mx.npad * L / 2);
+    } else {
+        tp_gather_rows(Z, T, L, 1);
+        k3_amx_pack_rows(amx_xv[0], Z, L, mx.mapz, mx.npad, 0, L / 32);
+    }
+    k3_amx_gemm_groups(mx.gu, 2 * mx.ng, &zb, L, i0, i1);
     k3_sync();
     /* act parts: rank r's rows [bnd[r], bnd[r+1]) of act form one contiguous region of
      * actT, which the gather copies as is; inside it the layout is pair-major when every
      * boundary is a multiple of 32, so writes and the down packing both run contiguous */
     int bnd[65], parts = 0;
+    const uint16_t *part[64];
 #if defined(K3_AVX512) && defined(__AVX512BF16__)
-    if (ni % 16 == 0 && k3_tp.size <= 64) {
-        parts = k3_tp.size;
-        for (int r = 0; r <= k3_tp.size; r++) {
-            bnd[r] = (int)((long)I * r / k3_tp.size);
+    if (!inplace && ni % 16 == 0 && P <= 64) {
+        parts = P;
+        for (int r = 0; r <= P; r++) {
+            bnd[r] = (int)((long)I * r / P);
             if (bnd[r] % 32) parts = 0;
         }
+        for (int r = 0; r < parts; r++) part[r] = mx.actT + (size_t)bnd[r] * npe;
     }
-#endif
-#if defined(K3_AVX512) && defined(__AVX512BF16__)
-    if (ni % 16 == 0) {
+    const __m512 b1 = _mm512_set1_ps(c->situ_b1), b2 = _mm512_set1_ps(c->situ_b2);
+    const __m512 ib1 = _mm512_set1_ps(1.0f / c->situ_b1), ib2 = _mm512_set1_ps(1.0f / c->situ_b2);
+    if (inplace) {
+        /* one act tile per task: 16 positions x 32 rows, rounded as the packer does */
+        const int KA = ni / 32;
+        uint16_t *own = (uint16_t *)ab.p[me];
+        int lo, hi;
+        k3_split(MT * KA, &lo, &hi);
+        for (int task = lo; task < hi; task++) {
+            const int p0 = task / KA * 16, r = task % KA * 32;
+            __m512 v[16];
+            for (int j = 0; j < 16; j++) {
+                if (mx.mapa[p0 + j] < 0) { v[j] = _mm512_setzero_ps(); continue; }
+                const float *g = mx.g1 + (size_t)(p0 + j) * ni + r, *u = mx.g3 + (size_t)(p0 + j) * ni + r;
+                v[j] = (__m512)_mm512_cvtne2ps_pbh(situ16(g + 16, u + 16, b1, b2, ib1, ib2),
+                                                   situ16(g, u, b1, b2, ib1, ib2));
+            }
+            v512_tr16(v);                     /* bf16 pair j of position c to [j][c] */
+            uint16_t *tile = own + (size_t)task * 512;
+            for (int j = 0; j < 16; j++) _mm512_storeu_ps((float *)(tile + j * 32), v[j]);
+        }
+    } else if (ni % 16 == 0) {
         /* a 16-position tile is one expert's, its valid pairs consecutive columns: 16 pairs
          * x 16 rows per task, transposed so each row of actT is written contiguously, in
          * bf16 with the packer's own rounding */
         const int nrb = ni / 16;
         int lo, hi;
-        k3_split(mx.npad / 16 * nrb, &lo, &hi);
+        k3_split(MT * nrb, &lo, &hi);
         for (int task = lo; task < hi; task++) {
             const int p0 = task / nrb * 16, r = task % nrb * 16, col0 = mx.mapa[p0];
             if (col0 < 0) continue;
             int nv = 1;
             while (nv < 16 && mx.mapa[p0 + nv] >= 0) nv++;
             __m512 v[16];
-            const __m512 b1 = _mm512_set1_ps(c->situ_b1), b2 = _mm512_set1_ps(c->situ_b2);
-            const __m512 ib1 = _mm512_set1_ps(1.0f / c->situ_b1), ib2 = _mm512_set1_ps(1.0f / c->situ_b2);
-            for (int j = 0; j < 16; j++) {
-                if (j < nv) {
-                    /* situ_range in SIMD: b1 tanh(g / b1) sigmoid(g) * b2 tanh(u / b2) */
-                    const __m512 g = _mm512_loadu_ps(mx.g1 + (size_t)(p0 + j) * ni + r);
-                    const __m512 u = _mm512_loadu_ps(mx.g3 + (size_t)(p0 + j) * ni + r);
-                    const __m512 sg = _mm512_div_ps(_mm512_set1_ps(1.0f), _mm512_add_ps(_mm512_set1_ps(1.0f),
-                                                    exp512(_mm512_sub_ps(_mm512_setzero_ps(), g))));
-                    const __m512 a = _mm512_mul_ps(_mm512_mul_ps(b1, tanh512(_mm512_mul_ps(g, ib1))), sg);
-                    v[j] = _mm512_mul_ps(a, _mm512_mul_ps(b2, tanh512(_mm512_mul_ps(u, ib2))));
-                } else v[j] = _mm512_setzero_ps();
-            }
+            for (int j = 0; j < 16; j++)
+                v[j] = j < nv ? situ16(mx.g1 + (size_t)(p0 + j) * ni + r, mx.g3 + (size_t)(p0 + j) * ni + r,
+                                       b1, b2, ib1, ib2)
+                              : _mm512_setzero_ps();
             if (parts) {
                 uint16_t *R = mx.actT + (size_t)i0 * npe + r;
                 for (int j = 0; j < nv; j++)
@@ -3302,17 +3383,24 @@ static int moe_experts_amx(float *AC, const float *Z, const float *SC, int T,
             }
         }
     }
-    {
+    if (inplace) {
+        tp_big_barrier((double)mx.npad * I / 2);
+    } else {
         /* rank r owns act rows [i0, i1); bf16 bits travel as floats, exact */
         const K3Seg sa = { (float *)mx.actT, I * npe / 2, npe / 2, 1 };
         k3_tp_gather(&sa, 1);
     }
 
     /* down: every expert's act through its rows [l0, l1) */
-    if (parts) k3_amx_pack_parts_bf16(amx_xv[1], mx.actT, npe, bnd, parts, mx.mapa, mx.npad, I);
-    else       k3_amx_pack_cols_bf16(amx_xv[1], mx.actT, npe, mx.mapa, mx.npad, I);
-    k3_amx_gemm_groups(mx.dn, mx.ng, amx_xv[1], I, l0, l1);
+    if (!inplace) {
+        if (parts) k3_amx_pack_parts_bf16(amx_xv[1], part, bnd, parts, mx.mapa, mx.npad, I);
+        else       k3_amx_pack_cols_bf16(amx_xv[1], mx.actT, npe, mx.mapa, mx.npad, I);
+    }
+    k3_amx_gemm_groups(mx.dn, mx.ng, &ab, I, l0, l1);
     k3_sync();
+    /* peers read this half until they reach the barrier of the next exchange, which
+     * uses the other one */
+    if (inplace && k3_tid() == 0) tp_big_turn++;
     {
         int lo, hi;
         k3_split(T, &lo, &hi);
@@ -3387,9 +3475,9 @@ static void moe_team_amx(float *out, const float *x, const K3MoeW *w, const K3Cf
     k3_prof_add(K3P_SHARED, tp);
     tp = k3_prof_t0();
     tp_gather_rows_ex(SC, T, NE, 1, 1);       /* scores pick experts: fp32 */
-    tp_gather_rows(Z, T, L, 1);
     k3_prof_add(K3P_MOE_DOWN, tp);
 
+    /* Z (this rank's latent columns) is gathered by moe_experts_amx unless it packs in place */
     tp = k3_prof_t0();
     int batched = 1;
     for (int t0 = 0; t0 < T && batched; t0 += moe_amx_chunk()) {   /* bounds the act gather */
@@ -3401,8 +3489,12 @@ static void moe_team_amx(float *out, const float *x, const K3MoeW *w, const K3Cf
         tp = k3_prof_t0();
         tp_gather_rows_bf(SA, T, SI, 1);
         k3_prof_add(K3P_SHARED, tp);
-    } else
-    for (int t = 0; t < T; t++) {
+    } else {
+        tp = k3_prof_t0();
+        tp_gather_rows(Z, T, L, 1);
+        k3_prof_add(K3P_MOE_DOWN, tp);
+    }
+    for (int t = 0; t < T && !batched; t++) {
         float *accL = AC + (size_t)t * L;
         tp = k3_prof_t0();
         if (k3_tid() == 0) moe_select(idx, wt, SC + (size_t)t * NE, w, c, accL);
