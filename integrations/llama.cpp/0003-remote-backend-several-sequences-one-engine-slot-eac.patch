@@ -1,0 +1,530 @@
+From f18140fa535314e8f24da5ef3e9541a0f1fe3326 Mon Sep 17 00:00:00 2001
+From: egeorgan <evangelos.georganas@intel.com>
+Date: Thu, 22 Oct 2026 01:29:04 -0700
+Subject: [PATCH] remote backend: several sequences, one engine slot each
+ (llama-server -np N)
+
+With n_seq_max > 1 the client asks the engine for its slots (k3 --serve-slots N) and maps
+sequence s to slot s: per-slot lengths and checkpoint positions, seq_rm/seq_pos_* per
+sequence, seq_cp as a whole-sequence COPY, seq_keep and clear reset the other slots.
+decode_remote groups a batch by sequence and sends it as one DECODE_MULTI request, so the
+engine decodes the sequences' single tokens together; long prompt segments still go first
+as a separate head so the engine checkpoints before the assistant header. Logits rows are
+returned in batch order. With one sequence the requests are those of before.
+---
+ src/llama-context.cpp | 120 ++++++++++++++++++++---------
+ src/llama-remote.cpp  | 173 ++++++++++++++++++++++++++++++++++++------
+ src/llama-remote.h    |  62 +++++++++++----
+ 3 files changed, 283 insertions(+), 72 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 1bdeef48c..d4dc39c68 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -391,9 +391,16 @@ llama_context::llama_context(
+             throw std::runtime_error(format("remote backend vocab %d != model vocab %d",
+                     remote->n_vocab, model.vocab.n_tokens()));
+         }
+-        if (cparams.n_ctx > (uint32_t) remote->n_ctx) {
+-            LLAMA_LOG_WARN("%s: n_ctx %u exceeds the remote engine's %d positions\n",
+-                    __func__, cparams.n_ctx, remote->n_ctx);
++        if (cparams.n_seq_max > 1) {
++            remote->open_slots();
++            if ((uint32_t) remote->n_slots < cparams.n_seq_max) {
++                throw std::runtime_error(format("remote backend holds %d sequences, %u requested "
++                        "(start the engine with --serve-slots %u)", remote->n_slots, cparams.n_seq_max, cparams.n_seq_max));
++            }
++        }
++        if (cparams.n_ctx_seq > (uint32_t) remote->n_ctx) {
++            LLAMA_LOG_WARN("%s: n_ctx_seq %u exceeds the remote engine's %d positions\n",
++                    __func__, cparams.n_ctx_seq, remote->n_ctx);
+         }
+         if (output_reserve(params.n_seq_max) < params.n_seq_max) {
+             throw std::runtime_error("failed to reserve initial output buffer");
+@@ -2132,33 +2139,41 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+ // output
+ //
+ 
+-// One sequence, consecutive positions, token ids only: the engine owns every other
+-// detail of the forward, and returns the logits rows the batch asked for.
++// Token ids only, consecutive positions within each sequence: the engine owns every other
++// detail of the forward, and returns the logits rows the batch asked for. Several
++// sequences (one engine slot each) go in one request, so the engine can decode their
++// single tokens together.
+ int llama_context::decode_remote(const llama_batch_ext & batch_inp) {
+     const size_t n = batch_inp.tokens.size();
+     if (n == 0) {
+         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
+         return -1;
+     }
+-    const int32_t pos0 = batch_inp.tokens[0].pos[0];
+-    std::vector<int32_t> ids(n);
+-    std::vector<uint8_t> want(n);
++    // the batch's tokens per sequence, in order
++    std::vector<std::vector<size_t>> by_seq(remote->n_slots);
++    std::vector<llama_seq_id> seq_order;
+     int32_t n_out = 0;
+     for (size_t i = 0; i < n; ++i) {
+         const auto & tok = batch_inp.tokens[i];
+-        if (tok.has_embd || tok.pos[0] != pos0 + (int32_t) i) {
+-            LLAMA_LOG_ERROR("%s: the remote backend takes consecutive token ids only\n", __func__);
++        if (tok.has_embd || tok.seq_ids.size() != 1) {
++            LLAMA_LOG_ERROR("%s: the remote backend takes token ids of one sequence each\n", __func__);
+             return -1;
+         }
+-        for (auto s : tok.seq_ids) {
+-            if (s != 0) {
+-                LLAMA_LOG_ERROR("%s: the remote backend serves sequence 0 only\n", __func__);
+-                return -1;
+-            }
++        const llama_seq_id s = *tok.seq_ids.begin();
++        if (s < 0 || s >= remote->n_slots) {
++            LLAMA_LOG_ERROR("%s: sequence %d is beyond the engine's %d slots\n", __func__, s, remote->n_slots);
++            return -1;
+         }
+-        ids[i]  = tok.id;
+-        want[i] = (cparams.embeddings || tok.output) ? 1 : 0;
+-        n_out  += want[i];
++        auto & v = by_seq[s];
++        if (!v.empty() && tok.pos[0] != batch_inp.tokens[v.back()].pos[0] + 1) {
++            LLAMA_LOG_ERROR("%s: the remote backend takes consecutive positions only\n", __func__);
++            return -1;
++        }
++        if (v.empty()) {
++            seq_order.push_back(s);
++        }
++        v.push_back(i);
++        n_out += (cparams.embeddings || tok.output) ? 1 : 0;
+     }
+     if (t_compute_start_us == 0) {
+         t_compute_start_us = ggml_time_us();
+@@ -2168,35 +2183,70 @@ int llama_context::decode_remote(const llama_batch_ext & batch_inp) {
+         return -2;
+     }
+     output_swaps.clear();
+-    try {
+-        // the engine checkpoints its state after each multi-token batch; send a prompt's
+-        // last few tokens separately so the checkpoint lands before the chat template's
+-        // assistant header, where the next turn's re-rendered prompt diverges
+-        static const size_t tail = getenv("LLAMA_REMOTE_TAIL") ? (size_t) atoi(getenv("LLAMA_REMOTE_TAIL")) : 8;
+-        const size_t split = (tail > 0 && n > 2 * tail) ? n - tail : 0;
++
++    // the engine checkpoints its state after each multi-token batch; send a prompt's
++    // last few tokens separately so the checkpoint lands before the chat template's
++    // assistant header, where the next turn's re-rendered prompt diverges
++    static const size_t tail = getenv("LLAMA_REMOTE_TAIL") ? (size_t) atoi(getenv("LLAMA_REMOTE_TAIL")) : 8;
++    struct part { llama_seq_id seq; size_t beg, end; };   // [beg, end) of by_seq[seq]
++    std::vector<std::vector<part>> phases(2);
++    for (llama_seq_id s : seq_order) {
++        const size_t m = by_seq[s].size();
++        const size_t split = (tail > 0 && m > 2 * tail) ? m - tail : 0;
+         if (split > 0) {
+-            const std::vector<llama_token> ids_a(ids.begin(), ids.begin() + split), ids_b(ids.begin() + split, ids.end());
+-            const std::vector<uint8_t> want_a(want.begin(), want.begin() + split), want_b(want.begin() + split, want.end());
+-            const size_t out_a = std::count(want_a.begin(), want_a.end(), (uint8_t) 1);
+-            if (remote->decode(ids_a, pos0, want_a, logits.data) != 0 ||
+-                remote->decode(ids_b, pos0 + (llama_pos) split, want_b, logits.data + out_a * remote->n_vocab) != 0) {
++            phases[0].push_back({ s, 0, split });
++        }
++        phases[1].push_back({ s, split, m });
++    }
++
++    // rows arrive per phase in segment order; out_row[i] is token i's row there
++    std::vector<float> rows((size_t) n_out * remote->n_vocab);
++    std::vector<int32_t> out_row(n, -1);
++    int32_t k = 0;
++    try {
++        for (const auto & ph : phases) {
++            if (ph.empty()) {
++                continue;
++            }
++            std::vector<llama_remote_seg> segs;
++            std::vector<int32_t> ids;
++            std::vector<uint8_t> want;
++            const int32_t k0 = k;
++            for (const auto & p : ph) {
++                const auto & v = by_seq[p.seq];
++                segs.push_back({ p.seq, batch_inp.tokens[v[p.beg]].pos[0], (int32_t) (p.end - p.beg) });
++                for (size_t j = p.beg; j < p.end; ++j) {
++                    const auto & tok = batch_inp.tokens[v[j]];
++                    const uint8_t w = (cparams.embeddings || tok.output) ? 1 : 0;
++                    ids.push_back(tok.id);
++                    want.push_back(w);
++                    if (w) {
++                        out_row[v[j]] = k++;
++                    }
++                }
++            }
++            float * dst = rows.data() + (size_t) k0 * remote->n_vocab;
++            const int rc = segs.size() == 1 ? remote->decode(segs[0].slot, ids, segs[0].pos0, want, dst)
++                                            : remote->decode_multi(segs, ids, want, dst);
++            if (rc != 0) {
+                 return -3;
+             }
+-        } else if (remote->decode(ids, pos0, want, logits.data) != 0) {
+-            return -3;
+         }
+     } catch (const std::exception & e) {
+         LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
+         return -3;
+     }
++    // logits rows in batch order
+     n_outputs = n_out;
+     std::fill(output_ids.begin(), output_ids.end(), -1);
+-    for (size_t i = 0, k = 0; i < n; ++i) {
+-        if (want[i]) {
+-            output_ids[i] = (int32_t) k++;
++    for (size_t i = 0, j = 0; i < n; ++i) {
++        if (out_row[i] >= 0) {
++            std::memcpy(logits.data + j * remote->n_vocab, rows.data() + (size_t) out_row[i] * remote->n_vocab,
++                        (size_t) remote->n_vocab * sizeof(float));
++            output_ids[i] = (int32_t) j++;
+         }
+     }
+-    if (n == 1) {
++    if (n == seq_order.size()) {
+         n_eval++;
+         t_eval_us += ggml_time_us() - t_compute_start_us;
+     } else {
+diff --git a/src/llama-remote.cpp b/src/llama-remote.cpp
+index 80dbf6d8f..34347f065 100644
+--- a/src/llama-remote.cpp
++++ b/src/llama-remote.cpp
+@@ -30,13 +30,13 @@ llama_remote_client::llama_remote_client(const std::string & path) {
+     request(LLAMA_REMOTE_INFO, 0, 0, 0);
+     int32_t info[5];
+     recv_all(info, sizeof(info));
+-    n_vocab  = info[0];
+-    n_ctx    = info[1];
+-    n_embd   = info[2];
+-    n_cached = info[3];
+-    min_pos  = info[4];
++    n_vocab     = info[0];
++    n_ctx       = info[1];
++    n_embd      = info[2];
++    n_cached[0] = info[3];
++    min_pos[0]  = info[4];
+     LLAMA_LOG_INFO("%s: connected to %s: n_vocab = %d, n_ctx = %d, n_embd = %d, n_cached = %d\n",
+-            __func__, path.c_str(), n_vocab, n_ctx, n_embd, n_cached);
++            __func__, path.c_str(), n_vocab, n_ctx, n_embd, n_cached[0]);
+ }
+ 
+ llama_remote_client::~llama_remote_client() {
+@@ -80,8 +80,46 @@ void llama_remote_client::request(uint32_t op, uint32_t n, int32_t pos0, uint32_
+     send_all(hdr, sizeof(hdr));
+ }
+ 
+-int llama_remote_client::decode(const std::vector<int32_t> & tokens, int32_t pos0,
++void llama_remote_client::open_slots() {
++    request(LLAMA_REMOTE_SLOT, 0, 0, 0);
++    int32_t r[4];
++    recv_all(r, sizeof(r));
++    if (r[0] != 0 || r[1] < 1) {
++        throw std::runtime_error("remote backend: the engine refused SLOT");
++    }
++    n_slots = r[1];
++    n_cached.assign(n_slots, 0);
++    min_pos.assign(n_slots, 0);
++    n_cached[0] = r[2];
++    min_pos[0]  = r[3];
++    cur = 0;
++    for (int32_t s = 1; s < n_slots; ++s) {
++        select(s);
++    }
++    select(0);
++}
++
++void llama_remote_client::select(int32_t slot) {
++    if (slot == cur) {
++        return;
++    }
++    if (slot < 0 || slot >= n_slots) {
++        throw std::runtime_error("remote backend: no engine slot " + std::to_string(slot));
++    }
++    request(LLAMA_REMOTE_SLOT, 0, slot, 0);
++    int32_t r[4];
++    recv_all(r, sizeof(r));
++    if (r[0] != 0) {
++        throw std::runtime_error("remote backend: the engine refused slot " + std::to_string(slot));
++    }
++    cur = slot;
++    n_cached[slot] = r[2];
++    min_pos[slot]  = r[3];
++}
++
++int llama_remote_client::decode(int32_t slot, const std::vector<int32_t> & tokens, int32_t pos0,
+                                 const std::vector<uint8_t> & want, float * logits) {
++    select(slot);
+     uint32_t n_out = 0;
+     for (uint8_t w : want) {
+         n_out += w != 0;
+@@ -93,48 +131,139 @@ int llama_remote_client::decode(const std::vector<int32_t> & tokens, int32_t pos
+     recv_all(r, sizeof(r));
+     const int32_t status = r[0];
+     if (status != 0) {
+-        LLAMA_LOG_ERROR("%s: engine refused a batch of %zu tokens at position %d (status %d, engine holds %d)\n",
+-                __func__, tokens.size(), pos0, status, n_cached);
++        LLAMA_LOG_ERROR("%s: engine refused a batch of %zu tokens at position %d of slot %d (status %d, engine holds %d)\n",
++                __func__, tokens.size(), pos0, slot, status, n_cached[slot]);
++        return status;
++    }
++    min_pos[slot] = r[1];
++    recv_all(logits, (size_t) n_out * n_vocab * sizeof(float));
++    n_cached[slot] = pos0 + (int32_t) tokens.size();
++    return 0;
++}
++
++int llama_remote_client::decode_multi(const std::vector<llama_remote_seg> & segs, const std::vector<int32_t> & tokens,
++                                      const std::vector<uint8_t> & want, float * logits) {
++    uint32_t n_out = 0;
++    for (uint8_t w : want) {
++        n_out += w != 0;
++    }
++    request(LLAMA_REMOTE_DECODE_MULTI, (uint32_t) segs.size(), 0, n_out);
++    send_all(segs.data(), segs.size() * sizeof(llama_remote_seg));
++    send_all(tokens.data(), tokens.size() * sizeof(int32_t));
++    send_all(want.data(), want.size());
++    int32_t status = 0;
++    recv_all(&status, sizeof(status));
++    std::vector<int32_t> mp(segs.size());
++    recv_all(mp.data(), mp.size() * sizeof(int32_t));
++    // the engine leaves the last segment's slot selected
++    cur = segs.back().slot;
++    if (status != 0) {
++        LLAMA_LOG_ERROR("%s: engine refused a batch of %zu segments (status %d)\n", __func__, segs.size(), status);
++        // a failed segment may have reset its slot: ask for every slot's length again
++        for (const auto & g : segs) {
++            cur = -1;
++            select(g.slot);
++        }
+         return status;
+     }
+-    min_pos = r[1];
+     recv_all(logits, (size_t) n_out * n_vocab * sizeof(float));
+-    n_cached = pos0 + (int32_t) tokens.size();
++    for (size_t g = 0; g < segs.size(); ++g) {
++        n_cached[segs[g].slot] = segs[g].pos0 + segs[g].count;
++        min_pos[segs[g].slot]  = mp[g];
++    }
+     return 0;
+ }
+ 
+-bool llama_remote_client::truncate(int32_t pos) {
++bool llama_remote_client::truncate(int32_t slot, int32_t pos) {
++    select(slot);
+     request(LLAMA_REMOTE_TRUNCATE, 0, pos, 0);
+     int32_t r[3];
+     recv_all(r, sizeof(r));
+-    n_cached = r[1];
+-    min_pos  = r[2];
++    n_cached[slot] = r[1];
++    min_pos[slot]  = r[2];
+     return r[0] == 0;
+ }
+ 
+-void llama_remote_client::reset() {
++void llama_remote_client::reset(int32_t slot) {
++    select(slot);
+     request(LLAMA_REMOTE_RESET, 0, 0, 0);
+     int32_t status;
+     recv_all(&status, sizeof(status));
+-    n_cached = 0;
+-    min_pos  = 0;
++    n_cached[slot] = 0;
++    min_pos[slot]  = 0;
++}
++
++bool llama_remote_client::copy(int32_t src, int32_t dst) {
++    if (src < 0 || src >= n_slots || dst < 0 || dst >= n_slots) {
++        return false;
++    }
++    if (src == dst) {
++        return true;
++    }
++    request(LLAMA_REMOTE_COPY, (uint32_t) src, dst, 0);
++    int32_t status;
++    recv_all(&status, sizeof(status));
++    if (status != 0) {
++        return false;
++    }
++    n_cached[dst] = n_cached[src];
++    min_pos[dst]  = min_pos[src];
++    return true;
+ }
+ 
+ void llama_memory_remote::clear(bool /*data*/) {
+-    cl.reset();
++    for (int32_t s = 0; s < cl.n_slots; ++s) {
++        cl.reset(s);
++    }
+ }
+ 
+-bool llama_memory_remote::seq_rm(llama_seq_id /*seq_id*/, llama_pos p0, llama_pos p1) {
++bool llama_memory_remote::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
++    if (seq_id < 0) {
++        bool ok = true;
++        for (int32_t s = 0; s < cl.n_slots; ++s) {
++            ok = seq_rm(s, p0, p1) && ok;
++        }
++        return ok;
++    }
++    if (seq_id >= cl.n_slots) {
++        return false;
++    }
++    const int32_t n = cl.n_cached[seq_id];
+     if (p0 < 0) {
+         p0 = 0;
+     }
+-    if (p1 >= 0 && p1 < cl.n_cached) {
++    if (p1 >= 0 && p1 < n) {
+         return false;   // removing a range in the middle needs positional memory
+     }
+-    if (p0 >= cl.n_cached) {
++    if (p0 >= n) {
+         return true;
+     }
+-    return cl.truncate(p0);
++    return cl.truncate(seq_id, p0);
++}
++
++void llama_memory_remote::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
++    if (seq_id_src == seq_id_dst || seq_id_src < 0 || seq_id_src >= cl.n_slots) {
++        return;
++    }
++    if (p0 > 0) {
++        LLAMA_LOG_WARN("%s: the remote backend copies whole sequences only\n", __func__);
++        return;
++    }
++    if (!cl.copy(seq_id_src, seq_id_dst)) {
++        LLAMA_LOG_WARN("%s: the engine could not copy sequence %d to %d\n", __func__, seq_id_src, seq_id_dst);
++        return;
++    }
++    if (p1 >= 0 && p1 < cl.n_cached[seq_id_dst] && !cl.truncate(seq_id_dst, p1)) {
++        cl.reset(seq_id_dst);
++    }
++}
++
++void llama_memory_remote::seq_keep(llama_seq_id seq_id) {
++    for (int32_t s = 0; s < cl.n_slots; ++s) {
++        if (s != seq_id && cl.n_cached[s] > 0) {
++            cl.reset(s);
++        }
++    }
+ }
+ 
+ void llama_memory_remote::state_write(llama_io_write_i &, llama_seq_id, llama_state_seq_flags) const {
+diff --git a/src/llama-remote.h b/src/llama-remote.h
+index 9b06747a4..10198b996 100644
+--- a/src/llama-remote.h
++++ b/src/llama-remote.h
+@@ -9,7 +9,14 @@
+ //   DECODE    payload i32 tokens[n], u8 want[n] -> i32 status, i32 min_pos, then n_out*vocab floats
+ //   TRUNCATE  pos0 = first position to drop -> i32 status (0 ok), i32 n_cached, i32 min_pos
+ //   RESET     -> i32 status
+-// min_pos is the oldest position the engine can truncate to (it keeps state checkpoints)
++//   SLOT          pos0 = slot -> i32 status, i32 n_slots, i32 n_cached, i32 min_pos; INFO,
++//                 DECODE, TRUNCATE and RESET then apply to that slot
++//   DECODE_MULTI  n segments of i32 slot, i32 pos0, i32 count, then every segment's tokens,
++//                 then every segment's want bytes -> i32 status, i32 min_pos per segment,
++//                 then n_out*vocab floats in segment order
++//   COPY          n = source slot, pos0 = destination slot -> i32 status
++// min_pos is the oldest position the engine can truncate to (it keeps state checkpoints).
++// An engine started with --serve-slots N holds N sequences; sequence s is slot s.
+ 
+ #include "llama-memory.h"
+ 
+@@ -23,6 +30,15 @@ enum llama_remote_op : uint32_t {
+     LLAMA_REMOTE_DECODE   = 2,
+     LLAMA_REMOTE_TRUNCATE = 3,
+     LLAMA_REMOTE_RESET    = 4,
++    LLAMA_REMOTE_SLOT     = 5,
++    LLAMA_REMOTE_DECODE_MULTI = 6,
++    LLAMA_REMOTE_COPY     = 7,
++};
++
++struct llama_remote_seg {
++    int32_t slot;
++    int32_t pos0;
++    int32_t count;
+ };
+ 
+ struct llama_remote_client {
+@@ -30,27 +46,37 @@ struct llama_remote_client {
+     ~llama_remote_client();
+ 
+     int32_t n_vocab  = 0;
+-    int32_t n_ctx    = 0;
++    int32_t n_ctx    = 0;   // positions per slot
+     int32_t n_embd   = 0;
+-    int32_t n_cached = 0;   // positions the engine holds for the (single) sequence
+-    int32_t min_pos  = 0;   // oldest position a truncation can reach
++    int32_t n_slots  = 1;
++    std::vector<int32_t> n_cached = { 0 };   // per slot: positions the engine holds
++    std::vector<int32_t> min_pos  = { 0 };   // per slot: oldest position a truncation can reach
++
++    // asks the engine for its slots (once, for front ends that serve several sequences)
++    void open_slots();
+ 
+     // logits receives one row of n_vocab floats per want[i] != 0, in batch order
+-    int  decode(const std::vector<int32_t> & tokens, int32_t pos0,
++    int  decode(int32_t slot, const std::vector<int32_t> & tokens, int32_t pos0,
+                 const std::vector<uint8_t> & want, float * logits);
+-    bool truncate(int32_t pos);
+-    void reset();
++    // one segment per slot; logits receives the wanted rows in segment order
++    int  decode_multi(const std::vector<llama_remote_seg> & segs, const std::vector<int32_t> & tokens,
++                      const std::vector<uint8_t> & want, float * logits);
++    bool truncate(int32_t slot, int32_t pos);
++    void reset(int32_t slot);
++    bool copy(int32_t src, int32_t dst);
+ 
+ private:
+     int fd = -1;
++    int32_t cur = 0;   // the engine's selected slot
++    void select(int32_t slot);
+     void request(uint32_t op, uint32_t n, int32_t pos0, uint32_t n_out);
+     void send_all(const void * p, size_t n);
+     void recv_all(void * p, size_t n);
+ };
+ 
+-// Memory module for a remote backend: one sequence, appended in order. Truncation is
+-// whatever the engine supports (its current end, 0, or a checkpoint it holds); when it
+-// fails, callers clear and re-process, as they do for recurrent models.
++// Memory module for a remote backend: each sequence (one per engine slot) is appended in
++// order. Truncation is whatever the engine supports (its current end, 0, or a checkpoint
++// it holds); when it fails, callers clear and re-process, as they do for recurrent models.
+ struct llama_memory_remote : public llama_memory_i {
+     explicit llama_memory_remote(llama_remote_client & client) : cl(client) {}
+ 
+@@ -63,17 +89,23 @@ struct llama_memory_remote : public llama_memory_i {
+     void clear(bool data) override;
+ 
+     bool seq_rm  (llama_seq_id seq_id, llama_pos p0, llama_pos p1) override;
+-    void seq_cp  (llama_seq_id, llama_seq_id, llama_pos, llama_pos) override {}
+-    void seq_keep(llama_seq_id) override {}
++    void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
++    void seq_keep(llama_seq_id seq_id) override;
+     void seq_add (llama_seq_id, llama_pos, llama_pos, llama_pos) override {}
+     void seq_div (llama_seq_id, llama_pos, llama_pos, int) override {}
+ 
+     // the state is not positional: report the oldest position the engine can truncate to,
+     // so callers re-process from 0 rather than ask for a cut it cannot make
+-    llama_pos seq_pos_min(llama_seq_id) const override {
+-        return cl.n_cached > 0 ? std::min(cl.min_pos, cl.n_cached - 1) : -1;
++    llama_pos seq_pos_min(llama_seq_id seq_id) const override {
++        if (seq_id < 0 || seq_id >= cl.n_slots) {
++            return -1;
++        }
++        const int32_t n = cl.n_cached[seq_id];
++        return n > 0 ? std::min(cl.min_pos[seq_id], n - 1) : -1;
++    }
++    llama_pos seq_pos_max(llama_seq_id seq_id) const override {
++        return seq_id >= 0 && seq_id < cl.n_slots ? cl.n_cached[seq_id] - 1 : -1;
+     }
+-    llama_pos seq_pos_max(llama_seq_id) const override { return cl.n_cached - 1; }
+ 
+     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override { return {}; }
+ 
+-- 
+2.52.0
+

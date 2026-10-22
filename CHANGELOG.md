@@ -7,6 +7,11 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`--serve-slots N`** (2 to 8): `--serve` holds N independent sequences, and
+  `llama-server -np N` (integration patch 0003) maps one request to each. The engine
+  decodes the single tokens of several sequences in one forward (`k3_seq_set`), reading
+  each weight once for all of them, and every sequence's logits are bit-identical to
+  decoding it alone (oracle gate 4). New serve ops: `SLOT`, `DECODE_MULTI`, `COPY`.
 - **`--chat`**: a terminal REPL implementing K3's official XTML chat format, message
   envelopes, the `thinking_effort` system preamble, and `reasoning_content` on prior
   assistant turns, rendered exactly as the checkpoint's own encoder does, with JSONL

@@ -405,6 +405,8 @@ static void usage(FILE *f)
 "  --serve SOCKET        be the compute backend of an external front end (llama.cpp with\n"
 "                        LLAMA_REMOTE_BACKEND=SOCKET): decode requests over a UNIX socket\n"
 "  --serve-ctx N         positions held for the served sequence (default 8192)\n"
+"  --serve-slots N       hold N independent sequences (1-8, default 1); a client steps\n"
+"                        them together, one token each per forward. Excludes --dspark\n"
 "  --save-state PATH     write the carried state after the run, so the next turn of a\n"
 "                        conversation resumes instead of re-reading the whole prompt\n"
 "  --load-state PATH     resume from a saved state; the prompt given now is treated as\n"
@@ -588,6 +590,14 @@ typedef struct {
     const uint8_t *lg_want;
 } Weights;
 
+/* When set, forward()'s T tokens are the next token of T different sequences, each with
+ * its own KDA state, MLA cache and position (serve slots, decoded together). */
+typedef struct {
+    float *ks[K3_SEQ_MAX], *kvc[K3_SEQ_MAX], *ropec[K3_SEQ_MAX];
+    int pos[K3_SEQ_MAX];
+} FwSeqs;
+static const FwSeqs *fw_seqs;
+
 /* One full forward over T tokens, writing logits for the LAST position only. Every
  * step rebuilds state from scratch, matching the path the oracle validates.
  *
@@ -662,7 +672,29 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
         if (w->ultra && !w->kvc)
             memset(layer_state, 0, kper * sizeof(float));
         const long drops_before = k3_expert_drops;
-        if (w->kvc && w->mla_slot[L] >= 0) {
+        if (fw_seqs) {
+            /* one token per sequence, each over its own state (k3_seq_set) */
+            const size_t kvper = k3_kv_layer_floats(c, w->kv_cap);
+            const size_t rpper = (size_t)w->kv_cap * c->qk_rope;
+            const int mi = w->mla_slot[L];
+            K3SeqTok q;
+            memset(&q, 0, sizeof q);
+            q.n = T;
+            q.cap = w->kv_cap;
+            for (int t = 0; t < T; t++) {
+                q.state[t] = fw_seqs->ks[t] + kper * (size_t)L;
+                q.kvc[t]   = mi >= 0 ? fw_seqs->kvc[t] + kvper * (size_t)mi : NULL;
+                q.ropec[t] = mi >= 0 ? fw_seqs->ropec[t] + rpper * (size_t)mi : NULL;
+                q.pos[t]   = fw_seqs->pos[t];
+            }
+            if (k3_seq_set(&q) != 0) {
+                fprintf(stderr, "this build cannot decode a batch of %d sequences\n", T);
+                return -1;
+            }
+            k3_decoder_layer_inc(h, br, &nb, &w->lay[L].lay, c, L, T, q.state[0], scratch,
+                                 q.kvc[0], q.ropec[0], 0, w->kv_cap);
+            k3_seq_set(NULL);
+        } else if (w->kvc && w->mla_slot[L] >= 0) {
             const size_t kvper = k3_kv_layer_floats(c, w->kv_cap);
             const size_t rpper = (size_t)w->kv_cap * c->qk_rope;
             const int mi = w->mla_slot[L];
@@ -1001,9 +1033,20 @@ static int chat_run(Tok *tok, const K3ChatTemplate *tmpl, K3ChatHistory *history
  * the same sweep; the accepted tokens' logits are held, and a following decode of
  * exactly that token at that position is answered from them without a forward. The
  * client's sampler stays in charge: any other request first rewinds the engine to what
- * the client has seen. */
-enum { SRV_INFO = 1, SRV_DECODE = 2, SRV_TRUNCATE = 3, SRV_RESET = 4, SRV_QUIT = 99 };
+ * the client has seen.
+ * With --serve-slots N the engine holds N independent sequences:
+ *   SLOT          pos0 = slot -> i32 status, i32 n_slots, i32 cached, i32 min_pos;
+ *                 INFO, TRUNCATE, RESET and DECODE then apply to that slot
+ *   DECODE_MULTI  n segments: i32 slot, i32 pos0, i32 count each, then every segment's
+ *                 ids, then every segment's want bytes -> i32 status, i32 min_pos per
+ *                 segment, then n_out * vocab floats in segment order. Single tokens at
+ *                 their slots' ends are decoded together in one forward.
+ *   COPY          n = source slot, pos0 = destination slot -> i32 status: the destination
+ *                 becomes a copy of the source (state, cache, history, checkpoints) */
+enum { SRV_INFO = 1, SRV_DECODE = 2, SRV_TRUNCATE = 3, SRV_RESET = 4, SRV_SLOT = 5,
+       SRV_DECODE_MULTI = 6, SRV_COPY = 7, SRV_QUIT = 99 };
 #define SRV_MAXSNAP 16
+#define SRV_MAXSEG  64
 
 static int srv_io(int fd, void *p, size_t n, int wr)
 {
@@ -1087,6 +1130,108 @@ static int srv_minpos(const Srv *s, int vis)
     return m;
 }
 
+/* SLOTS (--serve-slots N): N independent sequences, each with its own recurrent state,
+ * KV cache, history and checkpoints. The selected slot is the one Srv and Weights point
+ * at; selecting another swaps the pointers, so every single-sequence path is unchanged. */
+typedef struct {
+    float *ks, *kvc, *ropec;
+    int *hist;
+    int cached, vis, nsnap;
+    float *snap[SRV_MAXSNAP];
+    int snap_pos[SRV_MAXSNAP];
+} SrvSlot;
+
+/* write the selected slot's live state back into sl[cur] */
+static void slot_save(const Srv *s, SrvSlot *sl, int cur, int vis)
+{
+    SrvSlot *a = &sl[cur];
+    a->ks = s->ks; a->kvc = s->w->kvc; a->ropec = s->w->ropec; a->hist = s->hist;
+    a->cached = s->w->cached; a->vis = vis; a->nsnap = s->nsnap;
+    memcpy(a->snap, s->snap, sizeof a->snap);
+    memcpy(a->snap_pos, s->snap_pos, sizeof a->snap_pos);
+}
+
+static void slot_select(Srv *s, SrvSlot *sl, int *cur, int k, int *vis)
+{
+    if (k == *cur) return;
+    slot_save(s, sl, *cur, *vis);
+    const SrvSlot *b = &sl[k];
+    s->ks = b->ks; s->w->kvc = b->kvc; s->w->ropec = b->ropec; s->hist = b->hist;
+    s->w->cached = b->cached; *vis = b->vis; s->nsnap = b->nsnap;
+    memcpy(s->snap, b->snap, sizeof s->snap);
+    memcpy(s->snap_pos, b->snap_pos, sizeof s->snap_pos);
+    *cur = k;
+}
+
+/* A decode of the selected slot without speculation: rows get one logits row per want. */
+static int srv_decode_plain(Srv *s, int *vis, const int *ids, const uint8_t *want, int n, int pos0,
+                            float *rows, int tmax)
+{
+    Weights *w = s->w;
+    if (pos0 < 0 || pos0 + n > tmax) return -3;
+    for (int i = 0; i < n; i++) if (ids[i] < 0 || ids[i] >= s->c->vocab) return -4;
+    if (pos0 == 0 && *vis > 0) { srv_clear(s); *vis = 0; }   /* a fresh prompt */
+    if (pos0 != *vis) return -2;
+    if (*vis < w->cached && srv_rewind(s, *vis) != 0) { srv_clear(s); *vis = 0; return -5; }
+    memcpy(s->hist + pos0, ids, (size_t)n * sizeof(int));
+    w->lg_rows = rows;
+    w->lg_want = want;
+    const int frc = srv_feed(s, n);
+    w->lg_rows = NULL;
+    w->lg_want = NULL;
+    if (frc != 0) { srv_clear(s); *vis = 0; return -5; }
+    *vis = w->cached;
+    if (n > 1 && s->nsnap_max > 0) {
+        if (s->nsnap == s->nsnap_max) {              /* drop the oldest */
+            float *f = s->snap[0];
+            memmove(s->snap, s->snap + 1, (size_t)(s->nsnap - 1) * sizeof s->snap[0]);
+            memmove(s->snap_pos, s->snap_pos + 1, (size_t)(s->nsnap - 1) * sizeof s->snap_pos[0]);
+            s->snap[s->nsnap - 1] = f;
+            s->nsnap--;
+        }
+        par_copy(s->snap[s->nsnap], s->ks, s->kst);
+        s->snap_pos[s->nsnap++] = w->cached;
+    }
+    return 0;
+}
+
+/* One token for each of k >= 2 distinct slots, in one forward: slot[j] at its end gets
+ * ids[j], and logits row j goes to out[j]. Every slot must sit at its client's length. */
+static int srv_step_slots(Srv *s, SrvSlot *sl, int *cur, int *vis, const int *slot, const int *ids,
+                          int k, float *const *out, float *rows, int tmax)
+{
+    Weights *w = s->w;
+    FwSeqs fs;
+    uint8_t all[K3_SEQ_MAX];
+    slot_save(s, sl, *cur, *vis);
+    for (int j = 0; j < k; j++) {
+        const SrvSlot *b = &sl[slot[j]];
+        if (b->cached != b->vis || b->cached + 1 > tmax || b->cached + 1 > w->kv_cap) return -2;
+        if (ids[j] < 0 || ids[j] >= s->c->vocab) return -4;
+        fs.ks[j] = b->ks; fs.kvc[j] = b->kvc; fs.ropec[j] = b->ropec; fs.pos[j] = b->cached;
+        all[j] = 1;
+    }
+    w->lg_rows = rows;
+    w->lg_want = all;
+    fw_seqs = &fs;
+    const int frc = forward(w, s->c, s->cache, ids, k, s->lg, s->sc, s->h, s->br, s->ks, NULL);
+    fw_seqs = NULL;
+    w->lg_rows = NULL;
+    w->lg_want = NULL;
+    if (frc != 0) return -5;
+    for (int j = 0; j < k; j++) {
+        SrvSlot *b = &sl[slot[j]];
+        b->hist[b->cached] = ids[j];
+        b->cached++;
+        b->vis = b->cached;
+        memcpy(out[j], rows + (size_t)j * s->c->vocab, (size_t)s->c->vocab * sizeof(float));
+    }
+    /* the selected slot's live view follows its saved copy */
+    w->cached = sl[*cur].cached;
+    *vis = sl[*cur].vis;
+    return 0;
+}
+
 static void srv_segv(int sig, siginfo_t *si, void *uc)
 {
     (void)uc;
@@ -1101,7 +1246,7 @@ static void srv_segv(int sig, siginfo_t *si, void *uc)
 
 static int serve_run(const char *path, Weights *w, const K3Cfg *c, K3Cache *cache, int tmax,
                      float *h, float *br, float *ks, float *sc, float *lg, int *seq, size_t kst,
-                     K3DSpark *dsp, int spec_n, float *spec_snap)
+                     K3DSpark *dsp, int spec_n, float *spec_snap, int nslots)
 {
     Srv s;
     memset(&s, 0, sizeof s);
@@ -1126,6 +1271,31 @@ static int serve_run(const char *path, Weights *w, const K3Cfg *c, K3Cache *cach
     if (s.nsnap_max > SRV_MAXSNAP) s.nsnap_max = SRV_MAXSNAP;
     for (int i = 0; i < s.nsnap_max; i++)
         if (!(s.snap[i] = (float *)malloc(kst * sizeof(float)))) { s.nsnap_max = i; break; }
+    /* slot 0 is the buffers above; every other slot gets its own */
+    if (nslots < 1) nslots = 1;
+    SrvSlot *sl = (SrvSlot *)calloc((size_t)nslots, sizeof(SrvSlot));
+    int cur = 0, can_batch = 0;
+    if (!sl) return 1;
+    slot_save(&s, sl, 0, vis);
+    const size_t kvn = k3_kv_layer_floats(c, w->kv_cap) * (size_t)w->n_mla;
+    const size_t rpn = (size_t)w->kv_cap * c->qk_rope * (size_t)w->n_mla;
+    for (int k = 1; k < nslots; k++) {
+        SrvSlot *b = &sl[k];
+        b->ks = state_alloc(kst);
+        b->kvc = (float *)calloc(kvn, sizeof(float));
+        b->ropec = (float *)calloc(rpn, sizeof(float));
+        b->hist = (int *)calloc((size_t)tmax + 8, sizeof(int));
+        int ok = b->ks && b->kvc && b->ropec && b->hist;
+        for (int i = 0; ok && i < s.nsnap_max; i++) ok = (b->snap[i] = (float *)malloc(kst * sizeof(float))) != NULL;
+        if (!ok) { fprintf(stderr, "serve: out of memory for slot %d\n", k); k3_mpi_abort(1); return 1; }
+    }
+    if (nslots > 1) {
+        K3SeqTok probe;
+        memset(&probe, 0, sizeof probe);
+        probe.n = 2;
+        can_batch = k3_seq_set(&probe) == 0;
+        k3_seq_set(NULL);
+    }
     int lfd = -1;
     if (k3_tp.rank == 0) {
         lfd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -1142,6 +1312,8 @@ static int serve_run(const char *path, Weights *w, const K3Cfg *c, K3Cache *cach
         printf("serving on %s: %d positions, vocab %d, %d ranks, %d state checkpoints",
                path, tmax, c->vocab, k3_tp.size, s.nsnap_max);
         if (spec_n) printf(", DSpark drafts %d per block", spec_n);
+        if (nslots > 1)
+            printf(", %d slots%s", nslots, can_batch ? " decoded together" : " (decoded one at a time)");
         printf("\n");
         fflush(stdout);
     }
@@ -1201,6 +1373,112 @@ static int serve_run(const char *path, Weights *w, const K3Cfg *c, K3Cache *cach
             }
             const int32_t r[3] = { status, vis, srv_minpos(&s, vis) };
             if (k3_tp.rank == 0) srv_io(cfd, (void *)r, sizeof r, 1);
+        } else if (op == SRV_COPY) {
+            const int src = (int)n, dst = pos0;
+            int32_t status = 0;
+            if (src < 0 || src >= nslots || dst < 0 || dst >= nslots) status = -6;
+            else if (src != dst) {
+                la = NULL;
+                const int keep = cur;
+                slot_save(&s, sl, cur, vis);
+                if (dst == cur) slot_select(&s, sl, &cur, src, &vis);   /* dst must not be live */
+                SrvSlot *a = &sl[src], *b = &sl[dst];
+                par_copy(b->ks, a->ks, kst);
+                par_copy(b->kvc, a->kvc, kvn);
+                par_copy(b->ropec, a->ropec, rpn);
+                memcpy(b->hist, a->hist, (size_t)a->cached * sizeof(int));
+                for (int i = 0; i < a->nsnap; i++) par_copy(b->snap[i], a->snap[i], kst);
+                memcpy(b->snap_pos, a->snap_pos, sizeof b->snap_pos);
+                b->cached = a->cached; b->vis = a->vis; b->nsnap = a->nsnap;
+                slot_select(&s, sl, &cur, keep, &vis);
+            }
+            if (k3_tp.rank == 0) srv_io(cfd, &status, sizeof status, 1);
+        } else if (op == SRV_SLOT) {
+            int32_t status = 0;
+            if (pos0 < 0 || pos0 >= nslots) status = -6;
+            else { la = NULL; slot_select(&s, sl, &cur, pos0, &vis); }
+            const int32_t r[4] = { status, nslots, vis, srv_minpos(&s, vis) };
+            if (k3_tp.rank == 0) srv_io(cfd, (void *)r, sizeof r, 1);
+        } else if (op == SRV_DECODE_MULTI) {
+            /* n segments of (slot, pos0, count), then every segment's ids, then its wants */
+            const int nseg = (int)n;
+            if (nseg < 1 || nseg > nslots) { rc = 1; break; }
+            int32_t sh[SRV_MAXSEG][3];
+            uint32_t ok = 1;
+            if (k3_tp.rank == 0 && srv_io(cfd, sh, (size_t)nseg * sizeof sh[0], 0)) ok = 0;
+            k3_mpi_bcast(&ok, sizeof ok);
+            if (!ok) { if (k3_tp.rank == 0) { close(cfd); cfd = -1; } continue; }
+            k3_mpi_bcast(sh, (size_t)nseg * sizeof sh[0]);
+            long ntot = 0;
+            for (int g = 0; g < nseg; g++) {
+                if (sh[g][2] < 1 || sh[g][2] > tmax) ok = 0;
+                ntot += sh[g][2];
+            }
+            if (!ok || ntot > tmax) { rc = 1; break; }
+            if (k3_tp.rank == 0 && (srv_io(cfd, ids, (size_t)ntot * sizeof(int), 0) ||
+                                    srv_io(cfd, want, (size_t)ntot, 0))) ok = 0;
+            k3_mpi_bcast(&ok, sizeof ok);
+            if (!ok) { if (k3_tp.rank == 0) { close(cfd); cfd = -1; } continue; }
+            k3_mpi_bcast(ids, (size_t)ntot * sizeof(int));
+            k3_mpi_bcast(want, (size_t)ntot);
+            int32_t status = 0, mp[SRV_MAXSEG];
+            int off[SRV_MAXSEG], first[SRV_MAXSEG], wsum = 0;
+            uint8_t used[SRV_MAXSEG] = { 0 };
+            for (int g = 0, f = 0; g < nseg; g++) {
+                first[g] = f;
+                off[g] = wsum;
+                for (int i = 0; i < sh[g][2]; i++) wsum += want[f + i] != 0;
+                f += sh[g][2];
+                if (sh[g][0] < 0 || sh[g][0] >= nslots || used[sh[g][0]]) status = -6;
+                else used[sh[g][0]] = 1;
+            }
+            if (wsum != (int)n_out) status = -4;
+            if ((size_t)(wsum + nseg) * c->vocab > rows_cap) {
+                free(rows);
+                rows_cap = (size_t)(wsum + nseg) * c->vocab;
+                rows = (float *)malloc(rows_cap * sizeof(float));
+                if (!rows) { rc = 1; break; }
+            }
+            la = NULL;
+            /* single tokens at their slot's end go through one forward together */
+            int bs[K3_SEQ_MAX], bslot[K3_SEQ_MAX], bid[K3_SEQ_MAX], nb = 0;
+            float *bout[K3_SEQ_MAX];
+            uint8_t done[SRV_MAXSEG] = { 0 };
+            slot_save(&s, sl, cur, vis);
+            for (int g = 0; status == 0 && can_batch && g < nseg && nb < K3_SEQ_MAX; g++) {
+                const SrvSlot *b = &sl[sh[g][0]];
+                if (sh[g][2] == 1 && want[first[g]] && sh[g][1] > 0 && sh[g][1] == b->vis && b->vis == b->cached) {
+                    bs[nb] = g; bslot[nb] = sh[g][0]; bid[nb] = ids[first[g]];
+                    bout[nb] = rows + (size_t)off[g] * c->vocab;
+                    nb++;
+                }
+            }
+            if (status == 0 && nb >= 2) {
+                const double tb = now_s();
+                status = srv_step_slots(&s, sl, &cur, &vis, bslot, bid, nb, bout,
+                                        rows + (size_t)wsum * c->vocab, tmax);
+                for (int j = 0; j < nb; j++) done[bs[j]] = 1;
+                t_batch += now_s() - tb;
+            }
+            for (int g = 0; status == 0 && g < nseg; g++) {
+                if (done[g]) continue;
+                slot_select(&s, sl, &cur, sh[g][0], &vis);
+                status = srv_decode_plain(&s, &vis, ids + first[g], want + first[g], sh[g][2], sh[g][1],
+                                          rows + (size_t)off[g] * c->vocab, tmax);
+            }
+            for (int g = 0; g < nseg; g++) {
+                mp[g] = 0;
+                if (sh[g][0] >= 0 && sh[g][0] < nslots) {
+                    slot_select(&s, sl, &cur, sh[g][0], &vis);
+                    mp[g] = srv_minpos(&s, vis);
+                }
+            }
+            if (status == 0) n_tok += ntot;
+            if (k3_tp.rank == 0) {
+                srv_io(cfd, &status, sizeof status, 1);
+                srv_io(cfd, mp, (size_t)nseg * sizeof mp[0], 1);
+                if (status == 0 && wsum) srv_io(cfd, rows, (size_t)wsum * c->vocab * sizeof(float), 1);
+            }
         } else if (op == SRV_DECODE) {
             if (n == 0 || n > (uint32_t)tmax) { rc = 1; break; }
             uint32_t ok = 1;
@@ -1338,6 +1616,12 @@ static int serve_run(const char *path, Weights *w, const K3Cfg *c, K3Cache *cach
         n_req++;
     }
     if (k3_tp.rank == 0) { if (cfd >= 0) close(cfd); close(lfd); unlink(path); }
+    slot_select(&s, sl, &cur, 0, &vis);          /* the caller frees slot 0's buffers */
+    for (int k = 1; k < nslots; k++) {
+        k3_aligned_free(sl[k].ks); free(sl[k].kvc); free(sl[k].ropec); free(sl[k].hist);
+        for (int i = 0; i < s.nsnap_max; i++) free(sl[k].snap[i]);
+    }
+    free(sl);
     for (int i = 0; i < s.nsnap_max; i++) free(s.snap[i]);
     free(ids); free(want); free(rows);
     return rc;
@@ -1403,7 +1687,7 @@ static int k3_main(int argc, char **argv)
     const char *dspark_dir = NULL;
     int dspark_n = 7;
     const char *serve_path = NULL;
-    int serve_ctx = 8192;
+    int serve_ctx = 8192, serve_slots = 1;
     const char *load_state = NULL, *save_state = NULL;
     const char *preset_name = NULL;
     int incremental = 0, ultra = 0, chat = 0, greedy = 0;
@@ -1473,6 +1757,7 @@ static int k3_main(int argc, char **argv)
         else if (!strcmp(argv[i], "--incremental")) incremental = 1;
         else if (!strcmp(argv[i], "--serve") && i + 1 < argc) serve_path = argv[++i];
         else if (!strcmp(argv[i], "--serve-ctx") && i + 1 < argc) serve_ctx = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--serve-slots") && i + 1 < argc) serve_slots = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--ultra-low-memory")) ultra = 1;
         else if (!strcmp(argv[i], "--chat")) chat = 1;
         else if (!strcmp(argv[i], "--system") && i + 1 < argc) system_text = argv[++i];
@@ -1529,6 +1814,14 @@ static int k3_main(int argc, char **argv)
             return 2;
         }
         if (serve_ctx < 16) { fprintf(stderr, "--serve-ctx must be at least 16\n"); return 2; }
+        if (serve_slots < 1 || serve_slots > K3_SEQ_MAX) {
+            fprintf(stderr, "--serve-slots must be 1 to %d\n", K3_SEQ_MAX);
+            return 2;
+        }
+        if (serve_slots > 1 && dspark_dir) {
+            fprintf(stderr, "--serve-slots above 1 excludes --dspark\n");
+            return 2;
+        }
         incremental = 1;
         if (!ids_s && !prompt_text && !prompt_file) ids_s = "0";   /* nothing runs before a client */
     }
@@ -2354,7 +2647,7 @@ static int k3_main(int argc, char **argv)
     if (serve_path) {
         const int rc = serve_run(serve_path, &w, &c, &cache, Tmax, h, br, ks, sc, lg, seq,
                                  kper_f * (size_t)w.n_bound, dsp_on ? &dsp : NULL, spec_n,
-                                 spec_snap);
+                                 spec_snap, serve_slots);
         if (dsp_on) k3_dspark_close(&dsp);
         free(w.taps); k3_aligned_free(spec_snap);
         free(w.kvc); free(w.ropec); free(w.mla_slot);

@@ -129,7 +129,7 @@ Open MPI on your `PATH`; on the measured system that is
 
 ```bash
 mkdir k3ws && cd k3ws
-git clone --branch feauture_run_2bit_llamacpp_frontend_mtp https://github.com/libxsmm/kimi-k3-in-c
+git clone --branch feauture_run_2bit_llamacpp_frontend_mtp_batching https://github.com/libxsmm/kimi-k3-in-c
 git clone --branch iq1-narrow https://github.com/unslothai/llama.cpp
 git -C llama.cpp checkout ef45f21
 git -C llama.cpp -c user.name=k3 -c user.email=k3@localhost am "$PWD"/kimi-k3-in-c/integrations/llama.cpp/*.patch
@@ -220,9 +220,17 @@ The answer is "The capital of France is Paris.", preceded by the model's reasoni
 
 | Flag | Why |
 |---|---|
-| `-np 1` | The engine holds one sequence. |
+| `-np 1` | The engine holds one sequence (see below for `-np N`). |
 | `--cache-ram 0 --ctx-checkpoints 0` | The engine keeps its own state checkpoints. |
 | `--no-warmup` | Avoids a pointless forward pass at start-up. |
+
+**Several requests at once.** Start the engine with `--serve-slots N` (2 to 8) and
+`llama-server` with `-np N` and `-c` equal to N times the engine's `--serve-ctx`. Each
+`llama-server` slot then has its own engine sequence: KDA state, MLA cache and
+checkpoints. When several requests are generating, their next tokens go through one
+forward, so each weight is read once for all of them. Every request's output is the same
+as it would be if it were served alone. `--serve-slots` cannot be combined with
+`--dspark`.
 
 ### 6. The end-to-end table (section 3)
 
