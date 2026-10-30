@@ -1416,20 +1416,34 @@ static void matmul_f32_rows_T(float *Y, int ldy, const float *X, int ldx, int T,
 {
 #if defined(K3_AVX512)
     if (in % 64 == 0) {
-        for (int o = o0; o < o1; o++) {
-            const float *row = W + (size_t)o * in;
+        /* blocks of rows that fit in L2 (K3_F32T_BLOCK_KB, default 512; 0: one row at a
+         * time, the old order), each against every 4-token group in turn: X is streamed
+         * once per block instead of once per row. Every (token, row) sum is still formed in
+         * the same order, so the bits do not change. */
+        static int blk_kb = -1;
+        if (blk_kb < 0) {
+            const char *e = getenv("K3_F32T_BLOCK_KB");
+            blk_kb = e ? atoi(e) : 512;
+        }
+        int RB = blk_kb > 0 ? (int)((size_t)blk_kb * 1024 / ((size_t)in * sizeof(float))) : 1;
+        if (RB < 1) RB = 1;
+        for (int b0 = o0; b0 < o1; b0 += RB) {
+            const int b1 = b0 + RB < o1 ? b0 + RB : o1;
             for (int t0 = 0; t0 < T; t0 += 4) {
                 const int G = T - t0 < 4 ? T - t0 : 4;
-                __m512 a[4][4];
-                for (int g = 0; g < G; g++)
-                    for (int k = 0; k < 4; k++) a[g][k] = _mm512_setzero_ps();
-                for (int i = 0; i < in; i += 64)
-                    for (int k = 0; k < 4; k++) {
-                        const __m512 wv = _mm512_loadu_ps(row + i + 16 * k);
-                        for (int g = 0; g < G; g++)
-                            a[g][k] = _mm512_fmadd_ps(wv, _mm512_loadu_ps(X + (size_t)(t0 + g) * ldx + i + 16 * k), a[g][k]);
-                    }
-                for (int g = 0; g < G; g++) Y[(size_t)(t0 + g) * ldy + o] = v512_sum(a[g]);
+                for (int o = b0; o < b1; o++) {
+                    const float *row = W + (size_t)o * in;
+                    __m512 a[4][4];
+                    for (int g = 0; g < G; g++)
+                        for (int k = 0; k < 4; k++) a[g][k] = _mm512_setzero_ps();
+                    for (int i = 0; i < in; i += 64)
+                        for (int k = 0; k < 4; k++) {
+                            const __m512 wv = _mm512_loadu_ps(row + i + 16 * k);
+                            for (int g = 0; g < G; g++)
+                                a[g][k] = _mm512_fmadd_ps(wv, _mm512_loadu_ps(X + (size_t)(t0 + g) * ldx + i + 16 * k), a[g][k]);
+                        }
+                    for (int g = 0; g < G; g++) Y[(size_t)(t0 + g) * ldy + o] = v512_sum(a[g]);
+                }
             }
         }
         return;

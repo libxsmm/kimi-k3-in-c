@@ -111,7 +111,8 @@ All requests use greedy sampling (`temperature 0`). Prompt speed is reported for
 - **Raw output:** `docs/data/serve-bench-384319.txt`.
 
 **Recommended configuration:**
-`K3_PREFILL_AMX=1 K3_ACT_Q8=1 k3 MODEL --serve SOCKET --dspark DIR --dspark-n 3`.
+`K3_PREFILL_AMX=1 K3_ACT_Q8=1 K3_AMX_STREAM=1 K3_AMX_MOE_CHUNK=8192 K3_TP_BIG_MB=4096 k3 MODEL
+--serve SOCKET --dspark DIR --dspark-n 3`, with `llama-server -b 8192 -ub 8192` (section 9).
 Use `-n 4` when outputs are short and predictable.
 
 ## Reproduce from an empty directory
@@ -196,7 +197,8 @@ SOCK=/tmp/k3-$USER.sock
 # engine: about 3-4 minutes until "serving on" appears in engine.log
 mpirun -np 6 --map-by ppr:1:numa --bind-to numa \
     -x OMP_NUM_THREADS=42 -x OMP_PROC_BIND=close -x OMP_PLACES=cores \
-    -x K3_EXPERT_Q8=1 -x K3_PREFILL_AMX=1 -x K3_ACT_Q8=1 \
+    -x K3_EXPERT_Q8=1 -x K3_PREFILL_AMX=1 -x K3_ACT_Q8=1 -x K3_KV_BF16=1 \
+    -x K3_AMX_STREAM=1 -x K3_AMX_MOE_CHUNK=8192 -x K3_TP_BIG_MB=4096 \
     kimi-k3-in-c/bin-mpi-gnr/k3 "$MODEL" --serve "$SOCK" --serve-ctx 8192 \
     --dspark models/Kimi-K3-DSpark --dspark-n 3 > engine.log 2>&1 &
 until grep -q "serving on" engine.log; do sleep 5; done
@@ -204,7 +206,7 @@ until grep -q "serving on" engine.log; do sleep 5; done
 # front end
 LLAMA_REMOTE_BACKEND=$SOCK llama.cpp/build/bin/llama-server -m "$MODEL" \
     --host 127.0.0.1 --port 18080 -c 8192 -np 1 --jinja \
-    --no-warmup --cache-ram 0 --ctx-checkpoints 0 -t 4 > server.log 2>&1 &
+    --no-warmup --cache-ram 0 --ctx-checkpoints 0 -t 4 -b 8192 -ub 8192 > server.log 2>&1 &
 until curl -s 127.0.0.1:18080/health | grep -q ok; do sleep 1; done
 
 curl -s 127.0.0.1:18080/v1/chat/completions -H 'Content-Type: application/json' -d \
@@ -223,6 +225,7 @@ The answer is "The capital of France is Paris.", preceded by the model's reasoni
 | `-np 1` | The engine holds one sequence. |
 | `--cache-ram 0 --ctx-checkpoints 0` | The engine keeps its own state checkpoints. |
 | `--no-warmup` | Avoids a pointless forward pass at start-up. |
+| `-b 8192 -ub 8192` | Up to 8192 prompt tokens per engine forward instead of 2048: every weight is decoded once per forward, so larger forwards amortize it. |
 
 ### 6. The end-to-end table (section 3)
 
@@ -294,6 +297,7 @@ Settings, all optional, added to `--export`:
 | `REPEATS`, `GEN` | `2`, `256` | repeats per length, generated tokens |
 | `NP`, `THREADS`, `MAP`, `BIND` | `6`, `42`, `ppr:1:numa`, `numa` | one rank per SNC domain |
 | `KV_BF16` | `1` | `0` keeps the KV cache in fp32 |
+| `BATCH`, `BIG_MB` | `8192`, `4096` | prompt tokens per engine forward (`llama-server -b/-ub`, `K3_AMX_MOE_CHUNK`); large-gather window per rank in MB |
 
 On another layout, set the rank mapping to match it: one rank per L3 domain, with that
 domain's cores as its threads, e.g. `NP=<domains> THREADS=<cores per domain>
@@ -302,8 +306,20 @@ MAP=ppr:1:l3cache:PE=<cores per domain> BIND=core`.
 Recommended setup, in full:
 
 - **Engine environment**, exported by `shmoo.sh` to every rank: `K3_PREFILL_AMX=1`,
-  `K3_ACT_Q8=1`, `K3_EXPERT_Q8=1`, `K3_KV_BF16=1`, `OMP_NUM_THREADS=<cores per rank>`,
+  `K3_ACT_Q8=1`, `K3_EXPERT_Q8=1`, `K3_KV_BF16=1`, `K3_AMX_STREAM=1`,
+  `K3_AMX_MOE_CHUNK=8192`, `K3_TP_BIG_MB=4096`, `OMP_NUM_THREADS=<cores per rank>`,
   `OMP_PLACES=cores` and `OMP_PROC_BIND=close`. Everything else stays at its default.
+- **Front end:** `llama-server -b 8192 -ub 8192`, so a long prompt reaches the engine 8192
+  tokens per forward. llama.cpp's default (2048) makes the engine decode every weight once per
+  2048 tokens.
+  - `K3_AMX_MOE_CHUNK` must cover a whole forward, or the experts are decoded once per chunk.
+  - `K3_TP_BIG_MB` must hold the experts' activations for one forward, about 100 KB per
+    token, double-buffered: 4096 MB per rank covers forwards up to 16384 tokens. A larger
+    exchange silently falls back to `MPI_Allgatherv` on one thread while the rest of the team
+    waits, which made 8192-token forwards 35% slower than 4096-token ones.
+  - Forwards of 16384 tokens are slower again than two of 8192 (MLA prefill attention).
+  - Measured on 2S GNR, 8192-token prompt: 170 tok/s with llama.cpp's default batch, 188 at
+    `-b 4096`, 211 at `-b 8192` with these settings (including a router fix of the same date).
 - **System settings** (as root; `shmoo.sh` prints both at the start of a run): transparent
   huge pages `always` (`/sys/kernel/mm/transparent_hugepage/enabled`) and automatic NUMA
   balancing off (`sysctl kernel.numa_balancing=0`).

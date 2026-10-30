@@ -5,7 +5,10 @@
 #
 # Configurations (CFGS): plain (no speculative decoding) and dsN (DSpark drafting N tokens),
 # both with the recommended settings: AMX prefill, int8 activations, int8 expert
-# activations, bf16 KV cache (KV_BF16=0 for fp32).
+# activations, bf16 KV cache (KV_BF16=0 for fp32), streaming AMX weight-tile loads, and
+# prompts sent to the engine BATCH tokens per forward (llama-server -b/-ub) with one MoE
+# expert pass per forward (K3_AMX_MOE_CHUNK=BATCH) and a large-gather window that holds that
+# pass's expert activations (K3_TP_BIG_MB).
 #
 # Required environment:
 #   K3        engine binary built with MPI=1 (bin-mpi-gnr/k3)
@@ -16,6 +19,9 @@
 #   CFGS="plain ds3"  LENS="1024 4096 8192 16384 32512"  REPEATS=2  GEN=256
 #   WORKLOADS=code,chat  (also code_direct, copy, count)
 #   NP=6 THREADS=42 MAP=ppr:1:numa BIND=numa KV_BF16=1 PORT=18080 OUT=./shmoo-<date>
+#   BATCH=8192  tokens per engine forward; BIG_MB=4096 large-gather window per rank (MB),
+#               enough for BATCH up to 16384 (about 100 KB of expert activations per token,
+#               double-buffered)
 #   CTX       default: the longest prompt plus GEN, rounded up to 1024
 #
 # System settings (root, not changed here; the run prints them): transparent huge pages
@@ -27,7 +33,7 @@ set -uo pipefail
 NP=${NP:-6}; THREADS=${THREADS:-42}; MAP=${MAP:-ppr:1:numa}; BIND=${BIND:-numa}
 CFGS=${CFGS:-plain ds3}; LENS=${LENS:-1024 4096 8192 16384 32512}; KV_BF16=${KV_BF16:-1}
 export REPEATS=${REPEATS:-2} GEN=${GEN:-256} WORKLOADS=${WORKLOADS:-code,chat}
-PORT=${PORT:-18080}
+PORT=${PORT:-18080}; BATCH=${BATCH:-8192}; BIG_MB=${BIG_MB:-4096}
 max=0; for n in $LENS; do (( n > max )) && max=$n; done
 CTX=${CTX:-$(( (max + GEN + 1023) / 1024 * 1024 ))}
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -37,6 +43,7 @@ unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY no_proxy
 hostname; date
 echo "ranks $NP x $THREADS threads, map $MAP, bind $BIND, context $CTX, lengths $LENS"
 echo "workloads $WORKLOADS, $REPEATS repeats, $GEN generated tokens, bf16 KV cache: $KV_BF16"
+echo "llama-server batch $BATCH tokens per forward, MoE chunk $BATCH, large-gather window $BIG_MB MB per rank"
 echo "transparent huge pages: $(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null)" \
      "| NUMA balancing: $(cat /proc/sys/kernel/numa_balancing 2>/dev/null)   (recommended: [always], 0)"
 
@@ -49,6 +56,7 @@ run_cfg() {   # name extra-engine-args
     echo; echo "=== $name $extra ($(date +%T))"
     mpirun -np "$NP" --map-by "$MAP" --bind-to "$BIND" -x OMP_NUM_THREADS="$THREADS" -x OMP_PROC_BIND=close \
         -x OMP_PLACES=cores -x K3_EXPERT_Q8=1 -x K3_PREFILL_AMX=1 -x K3_ACT_Q8=1 -x K3_KV_BF16="$KV_BF16" \
+        -x K3_AMX_STREAM=1 -x K3_AMX_MOE_CHUNK="$BATCH" -x K3_TP_BIG_MB="$BIG_MB" \
         "$K3" "$MODEL" --serve "$SOCK" --serve-ctx "$CTX" $extra > "$OUT/engine-$name.log" 2>&1 &
     local EPID=$!
     for i in $(seq 1 900); do
@@ -57,7 +65,8 @@ run_cfg() {   # name extra-engine-args
         sleep 2
     done
     LLAMA_REMOTE_BACKEND=$SOCK "$LLAMA_BIN/llama-server" -m "$MODEL" --host 127.0.0.1 --port "$PORT" -c "$CTX" \
-        -np 1 --jinja --no-warmup --cache-ram 0 --ctx-checkpoints 0 -t 4 > "$OUT/server-$name.log" 2>&1 &
+        -np 1 --jinja --no-warmup --cache-ram 0 --ctx-checkpoints 0 -t 4 -b "$BATCH" -ub "$BATCH" \
+        > "$OUT/server-$name.log" 2>&1 &
     local SPID=$!
     for i in $(seq 1 120); do curl -s 127.0.0.1:$PORT/health 2>/dev/null | grep -q ok && break; sleep 1; done
     python3 "$HERE/shmoo.py" "$PORT" "$OUT/$name.tsv" $LENS

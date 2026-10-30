@@ -152,11 +152,13 @@ static int env_int(const char *name, int def)
     return e && atoi(e) > 0 ? atoi(e) : def;
 }
 
-static int kc_max, rb_max, tb_max, blk_auto;
+static int kc_max, rb_max, tb_max, blk_auto, amx_stream;
 static size_t l2_budget;
 static pthread_once_t blk_once = PTHREAD_ONCE_INIT;
 static void blk_init(void)
 {
+    const char *e = getenv("K3_AMX_STREAM");
+    amx_stream = e && strcmp(e, "0");
     blk_auto = !getenv("K3_AMX_KC") && !getenv("K3_AMX_RB") && !getenv("K3_AMX_TB");
     l2_budget = (size_t)env_int("K3_AMX_L2_KB", 1792) * 1024;
     kc_max = env_int("K3_AMX_KC", 1024) / 256 * 8;
@@ -186,6 +188,29 @@ static int blk_pick(int rows, int Tp, int KT, int nth, int *RB, int *TB, int *KC
         }
     }
     return 0;
+}
+
+/* One K chunk of a 2x2 tile step: accumulators 0..3 += weight tiles 4, 5 x activation
+ * tiles 6, 7. sa (a constant at each call, so each loop is compiled once per value):
+ * K3_AMX_STREAM=1 loads the weight tiles with TILELOADDT1, a hint not to keep them in L1;
+ * each is used for one tile pair per pass, while the activation tiles are reused across
+ * the whole row block. Same bits either way. */
+static inline __attribute__((always_inline)) void kc_tiles(const uint16_t *a0, const uint16_t *a1,
+                                                           const uint16_t *b0, const uint16_t *b1,
+                                                           int kcn, const int sa)
+{
+    for (int kt = 0; kt < kcn; kt++) {
+        if (sa) _tile_stream_loadd(4, a0 + (size_t)kt * 512, 64);
+        else    _tile_loadd(4, a0 + (size_t)kt * 512, 64);
+        _tile_loadd(6, b0 + (size_t)kt * 512, 64);
+        _tile_dpbf16ps(0, 4, 6);
+        _tile_loadd(7, b1 + (size_t)kt * 512, 64);
+        _tile_dpbf16ps(1, 4, 7);
+        if (sa) _tile_stream_loadd(5, a1 + (size_t)kt * 512, 64);
+        else    _tile_loadd(5, a1 + (size_t)kt * 512, 64);
+        _tile_dpbf16ps(2, 5, 6);
+        _tile_dpbf16ps(3, 5, 7);
+    }
 }
 
 void k3_amx_gemm(float *Y, int ldy, const uint16_t *Xv, int T, const void *W, int wt,
@@ -241,16 +266,8 @@ void k3_amx_gemm(float *Y, int ldy, const uint16_t *Xv, int T, const void *W, in
                         _tile_loadd(0, c0, 64); _tile_loadd(1, c1, 64);
                         _tile_loadd(2, c2, 64); _tile_loadd(3, c3, 64);
                     }
-                    for (int kt = 0; kt < kcn; kt++) {
-                        _tile_loadd(4, a0 + (size_t)kt * 512, 64);
-                        _tile_loadd(6, b0 + (size_t)kt * 512, 64);
-                        _tile_dpbf16ps(0, 4, 6);
-                        _tile_loadd(7, b1 + (size_t)kt * 512, 64);
-                        _tile_dpbf16ps(1, 4, 7);
-                        _tile_loadd(5, a1 + (size_t)kt * 512, 64);
-                        _tile_dpbf16ps(2, 5, 6);
-                        _tile_dpbf16ps(3, 5, 7);
-                    }
+                    if (amx_stream) kc_tiles(a0, a1, b0, b1, kcn, 1);
+                    else            kc_tiles(a0, a1, b0, b1, kcn, 0);
                     _tile_stored(0, c0, 64); _tile_stored(1, c1, 64);
                     _tile_stored(2, c2, 64); _tile_stored(3, c3, 64);
                 }

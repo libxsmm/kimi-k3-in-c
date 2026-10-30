@@ -14,10 +14,15 @@
 #   DSPARK    Kimi-K3-DSpark directory (needed for the *_ds* configurations)
 #   CONFIGS   default "base amx amx_ds3 amx_ds4"
 #   NP=6 THREADS=42 MAP=ppr:1:numa BIND=numa CTX=8192 PORT=18080 OUT=./serve-bench-<date>
+#   BATCH=8192 BIG_MB=4096  tokens per engine forward (llama-server -b/-ub) and, for the amx*
+#           configurations, one MoE expert pass per forward with a large-gather window that holds
+#           its expert activations (K3_AMX_MOE_CHUNK, K3_TP_BIG_MB); see shmoo.sh
 set -uo pipefail
 : "${K3:?set K3}" "${MODEL:?set MODEL}" "${LLAMA_BIN:?set LLAMA_BIN}"
 NP=${NP:-6}; THREADS=${THREADS:-42}; MAP=${MAP:-ppr:1:numa}; BIND=${BIND:-numa}
 CTX=${CTX:-8192}; PORT=${PORT:-18080}; CONFIGS=${CONFIGS:-base amx amx_ds3 amx_ds4}
+BATCH=${BATCH:-8192}; BIG_MB=${BIG_MB:-4096}
+AMX="K3_PREFILL_AMX=1 K3_ACT_Q8=1 K3_AMX_STREAM=1 K3_AMX_MOE_CHUNK=$BATCH K3_TP_BIG_MB=$BIG_MB"
 HERE=$(cd "$(dirname "$0")" && pwd)
 OUT=${OUT:-$PWD/serve-bench-$(date +%Y%m%d-%H%M%S)}
 mkdir -p "$OUT"; cd "$OUT"
@@ -63,7 +68,7 @@ srv() {   # name env-vars extra-args
     done
     for e in $envs; do unset "${e%%=*}"; done
     LLAMA_REMOTE_BACKEND=$SOCK "$LLAMA_BIN/llama-server" -m "$MODEL" --host 127.0.0.1 --port "$PORT" -c "$CTX" \
-        -np 1 --jinja --no-warmup --cache-ram 0 --ctx-checkpoints 0 -t 4 > server.log 2>&1 &
+        -np 1 --jinja --no-warmup --cache-ram 0 --ctx-checkpoints 0 -t 4 -b "$BATCH" -ub "$BATCH" > server.log 2>&1 &
     local SPID=$!
     for i in $(seq 1 120); do curl -s 127.0.0.1:$PORT/health 2>/dev/null | grep -q ok && break; sleep 1; done
     req "$OUT/m_t1.json" 192 t1.json; show t1.json turn1
@@ -87,8 +92,8 @@ cleanup
 for c in $CONFIGS; do
     case $c in
         base)    srv base    ""                             "" ;;
-        amx)     srv amx     "K3_PREFILL_AMX=1 K3_ACT_Q8=1" "" ;;
-        amx_ds*) srv "$c"    "K3_PREFILL_AMX=1 K3_ACT_Q8=1" "--dspark ${DSPARK:?set DSPARK} --dspark-n ${c#amx_ds}" ;;
+        amx)     srv amx     "$AMX" "" ;;
+        amx_ds*) srv "$c"    "$AMX" "--dspark ${DSPARK:?set DSPARK} --dspark-n ${c#amx_ds}" ;;
         *)       echo "unknown configuration $c" ;;
     esac
 done
